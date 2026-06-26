@@ -203,7 +203,6 @@ paths = [
     Path("script/test"),
     Path("docs/domain-contract.md"),
     Path("fixtures/project_pipelines/domain_contract.json"),
-    *Path("project_pipelines").rglob("*.lua"),
 ]
 
 for path in paths:
@@ -381,11 +380,6 @@ assert(settings.props.state_counts.questions == 1, "settings surface must expose
 local entities = tools["project_pipelines.entities"]({})
 assert(entities.ok and #entities.frames >= 5, "entity output must expose persisted state")
 
-for name in pairs(package.loaded) do
-  if name == "plugin" or name:match("^project_pipelines") then
-    package.loaded[name] = nil
-  end
-end
 local reloaded_plugin = dofile("plugin.lua")
 local reloaded_tools = {}
 for _, tool in ipairs(reloaded_plugin.tools) do

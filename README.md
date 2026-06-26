@@ -24,9 +24,9 @@ The executable contract fixture is
 [`fixtures/project_pipelines/domain_contract.json`](fixtures/project_pipelines/domain_contract.json).
 `script/test` validates the fixture relationships, standalone mode, optional
 workspace-linked mode, provider capability boundaries, manifest anchors, and
-PII/raw-path absence. It also loads `plugin.lua` with Botster capability stubs,
-creates persisted records, reloads the plugin modules, and proves the app and
-settings surfaces expose the persisted project/ticket state.
+PII/raw-path absence. It also loads the production `plugin.lua` entrypoint with
+Botster capability stubs, creates persisted records, reloads the entrypoint, and
+proves the app and settings surfaces expose the persisted project/ticket state.
 
 Runtime behavior is intentionally minimal in this pass: `plugin.lua` registers
 CRUD tools and app/settings surface handlers, the manifest configuration schema

@@ -143,5 +143,5 @@ example. It uses synthetic IDs only and is validated by `script/test` for JSON
 shape, required relationships, standalone and workspace-linked examples,
 manifest anchors, provider capability boundaries, and PII/raw-path absence.
 `script/test` also runs a headless Lua runtime harness against `plugin.lua` to
-prove CRUD persistence survives a module reload and that app/settings surface
-handlers expose persisted project and ticket state.
+prove CRUD persistence survives an entrypoint reload and that app/settings
+surface handlers expose persisted project and ticket state.
