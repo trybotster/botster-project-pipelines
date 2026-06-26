@@ -1,0 +1,53 @@
+#!/usr/bin/env sh
+set -eu
+
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+manifest_path = Path("botster-package.json")
+manifest = json.loads(manifest_path.read_text())
+
+assert manifest["name"] == "project-pipelines"
+assert manifest["kind"] == "plugin"
+assert manifest["botster"].startswith(">=")
+assert manifest["source"] == {"type": "path", "path": "."}
+assert manifest["entrypoints"] == [
+    {"runtime": "lua", "path": "plugin.lua", "bootstrap": False}
+]
+assert Path("plugin.lua").read_text().strip().endswith("return botster.register({})")
+assert manifest["configuration"] == {"groups": [], "fields": []}
+
+surfaces = {surface["id"]: surface for surface in manifest["surfaces"]}
+assert surfaces["project-pipelines.home"]["kind"] == "app"
+assert surfaces["project-pipelines.settings"]["kind"] == "settings"
+assert {capability["surface"] for capability in manifest["capabilities"]} == {"surfaces"}
+PY
+
+python3 -m json.tool botster-package.json >/dev/null
+
+python3 - <<'PY'
+import re
+from pathlib import Path
+
+patterns = [
+    re.compile("/" + "Users" + "/"),
+    re.compile("jason" + "conigliari", re.IGNORECASE),
+    re.compile(r"[A-Za-z0-9._%+-]+" + "@" + r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
+]
+paths = [
+    Path(".gitignore"),
+    Path("README.md"),
+    Path("botster-package.json"),
+    Path("plugin.lua"),
+    Path("script/test"),
+]
+
+for path in paths:
+    text = path.read_text()
+    for pattern in patterns:
+        if pattern.search(text):
+            raise SystemExit(f"PII-like content found in {path}")
+PY
+
+echo "package scaffold checks passed"
