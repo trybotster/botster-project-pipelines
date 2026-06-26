@@ -15,13 +15,19 @@ assert manifest["source"] == {"type": "path", "path": "."}
 assert manifest["entrypoints"] == [
     {"runtime": "lua", "path": "plugin.lua", "bootstrap": False}
 ]
-assert Path("plugin.lua").read_text().strip().endswith("return botster.register({})")
+plugin_source = Path("plugin.lua").read_text()
+assert "require(" not in plugin_source
+assert "botster.register" in plugin_source
 assert manifest["configuration"] == {"groups": [], "fields": []}
 
 surfaces = {surface["id"]: surface for surface in manifest["surfaces"]}
 assert surfaces["project-pipelines.home"]["kind"] == "app"
 assert surfaces["project-pipelines.settings"]["kind"] == "settings"
-assert {capability["surface"] for capability in manifest["capabilities"]} == {"surfaces"}
+assert {capability["surface"] for capability in manifest["capabilities"]} == {
+    "surfaces",
+    "mcp",
+    "plugin_db",
+}
 PY
 
 python3 -m json.tool botster-package.json >/dev/null
@@ -48,7 +54,7 @@ assert anchors["surfaces"] == {
 }
 assert anchors["surfaces"]["home"] in surfaces
 assert anchors["surfaces"]["settings"] in surfaces
-assert anchors["runtime"] == "scaffold_only_inert_lua"
+assert anchors["runtime"] == "minimal_crud_lua_plugin"
 
 required_domain_objects = {
     "project",
@@ -173,7 +179,8 @@ required_doc_phrases = [
     "plugin-data/project-pipelines",
     "project-pipelines.home",
     "project-pipelines.settings",
-    "scaffold-only",
+    "minimal local CRUD",
+    "plugin database capability",
 ]
 for phrase in required_doc_phrases:
     assert phrase in docs
@@ -234,5 +241,155 @@ for path in runtime_files:
         if marker in text:
             raise SystemExit(f"Provider/workspace implementation marker found in {path}: {marker}")
 PY
+
+lua <<'LUA'
+package.path = "./?.lua;./?/init.lua;" .. package.path
+
+local durable_store = {}
+
+local function deep_copy(value)
+  if type(value) ~= "table" then return value end
+  local result = {}
+  for key, nested in pairs(value) do
+    result[key] = deep_copy(nested)
+  end
+  return result
+end
+
+botster = {
+  capabilities = {
+    plugin_db = {
+      get = function(args)
+        local record = durable_store[args.key]
+        if record == nil then
+          return {}
+        end
+        return { record = deep_copy(record) }
+      end,
+      set = function(args)
+        durable_store[args.key] = {
+          schema_version = args.schema_version,
+          payload = deep_copy(args.payload),
+        }
+        return { ok = true }
+      end,
+    },
+  },
+  register = function(spec)
+    return spec
+  end,
+}
+
+local plugin = dofile("plugin.lua")
+assert(type(plugin) == "table", "plugin.lua must return a registration table")
+assert(type(plugin.tools) == "table" and #plugin.tools >= 13, "plugin must register CRUD/context/entity tools")
+assert(type(plugin.handlers) == "table" and #plugin.handlers == 2, "plugin must register app and settings surface handlers")
+
+local tools = {}
+for _, tool in ipairs(plugin.tools) do
+  tools[tool.name] = tool.call
+end
+local handlers = {}
+for _, handler in ipairs(plugin.handlers) do
+  handlers[handler.descriptor_id] = handler.call
+end
+
+local project = tools["project_pipelines.create_project"]({
+  id = "proj_runtime_standalone",
+  name = "Runtime Standalone",
+  repository = {
+    id = "repo_runtime_standalone",
+    name = "example/runtime-standalone",
+    remote = "https://example.invalid/runtime-standalone.git",
+  },
+  spawn_target_id = "spawn_target_runtime",
+})
+assert(project.ok and project.project.workspace_id == nil, "standalone project create failed")
+
+local linked = tools["project_pipelines.create_project"]({
+  id = "proj_runtime_workspace",
+  name = "Runtime Workspace",
+  repository_id = "repo_runtime_workspace",
+  repository_name = "example/runtime-workspace",
+  repository_remote = "https://example.invalid/runtime-workspace.git",
+  spawn_target_id = "spawn_target_runtime_workspace",
+  workspace_id = "workspace_runtime_alpha",
+})
+assert(linked.ok and linked.project.workspace_id == "workspace_runtime_alpha", "workspace project create failed")
+
+local ticket = tools["project_pipelines.create_ticket"]({
+  id = "ticket_runtime_one",
+  project_id = "proj_runtime_standalone",
+  title = "Runtime ticket",
+})
+assert(ticket.ok and ticket.ticket.project_id == "proj_runtime_standalone", "ticket create failed")
+
+local pipeline = tools["project_pipelines.define_pipeline"]({
+  id = "pipeline_runtime",
+  project_id = "proj_runtime_standalone",
+  name = "Runtime Delivery",
+  steps = {
+    { id = "step_plan", name = "Plan", position = 1, gates = {
+      { id = "gate_plan", kind = "attestation", prompt = "Plan is reviewable." },
+    } },
+    { id = "step_implement", name = "Implement", position = 2, gates = {
+      { id = "gate_tests", kind = "command", prompt = "Run script/test.", command = "script/test" },
+    } },
+  },
+})
+assert(pipeline.ok and #pipeline.pipeline_definition.steps == 2, "pipeline definition failed")
+
+local run = tools["project_pipelines.record_run"]({
+  id = "run_runtime_one",
+  ticket_id = "ticket_runtime_one",
+  pipeline_definition_id = "pipeline_runtime",
+  worktree = { kind = "provider_owned_reference", id = "worktree_runtime_one" },
+})
+assert(run.ok and run.run.current_step_id == "step_plan", "run record failed")
+
+local artifact = tools["project_pipelines.record_artifact"]({
+  id = "artifact_runtime_one",
+  run_id = "run_runtime_one",
+  step_id = "step_plan",
+  kind = "report",
+  summary = "Runtime harness artifact",
+})
+assert(artifact.ok and artifact.artifact.run_id == "run_runtime_one", "artifact record failed")
+
+local question = tools["project_pipelines.record_question"]({
+  id = "question_runtime_one",
+  run_id = "run_runtime_one",
+  ticket_id = "ticket_runtime_one",
+  step_id = "step_plan",
+  question = "Does standalone mode require workspace data?",
+})
+assert(question.ok and question.question.status == "open", "question record failed")
+
+local home = handlers["project-pipelines.home"]({})
+assert(home.props.surface_id == "project-pipelines.home", "home surface id missing")
+assert(home.props.state_counts.projects == 2, "home surface must expose persisted project count")
+assert(home.props.state_counts.tickets == 1, "home surface must expose persisted ticket count")
+assert(#home.props.bindings == 3, "home surface must declare entity bindings")
+
+local settings = handlers["project-pipelines.settings"]({})
+assert(settings.props.surface_id == "project-pipelines.settings", "settings surface id missing")
+assert(settings.props.state_counts.pipeline_definitions == 1, "settings surface must expose pipeline count")
+assert(settings.props.state_counts.artifacts == 1, "settings surface must expose artifact count")
+assert(settings.props.state_counts.questions == 1, "settings surface must expose question count")
+
+local entities = tools["project_pipelines.entities"]({})
+assert(entities.ok and #entities.frames >= 5, "entity output must expose persisted state")
+
+local reloaded_plugin = dofile("plugin.lua")
+local reloaded_tools = {}
+for _, tool in ipairs(reloaded_plugin.tools) do
+  reloaded_tools[tool.name] = tool.call
+end
+local reloaded_context = reloaded_tools["project_pipelines.current_context"]({})
+assert(reloaded_context.ok, "reloaded context failed")
+assert(#reloaded_context.projects == 2, "projects must survive plugin reload")
+assert(#reloaded_context.tickets == 1, "tickets must survive plugin reload")
+assert(#reloaded_context.runs == 1, "runs must survive plugin reload")
+LUA
 
 echo "package scaffold checks passed"

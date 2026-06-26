@@ -6,11 +6,11 @@ This package is intended to own project pipeline state, tickets, runs, gates,
 questions, artifacts, findings, and provider-mediated PR lifecycle behavior as a
 self-contained Botster plugin.
 
-This repository is currently a production-shaped package scaffold. It declares
-the package identity, compatibility, inert Lua entrypoint, configuration schema
-placeholder, and app/settings surface descriptors needed for local package
-install and discovery. It does not port the Project Pipelines workflow engine
-yet.
+This repository is currently a minimal production-shaped Project Pipelines
+plugin. It declares the package identity, compatibility, Lua entrypoint,
+configuration schema placeholder, MCP/plugin database capabilities, and
+app/settings surface descriptors needed for local package install and discovery.
+It does not port the Project Pipelines workflow execution engine yet.
 
 ## Domain Contract
 
@@ -24,11 +24,26 @@ The executable contract fixture is
 [`fixtures/project_pipelines/domain_contract.json`](fixtures/project_pipelines/domain_contract.json).
 `script/test` validates the fixture relationships, standalone mode, optional
 workspace-linked mode, provider capability boundaries, manifest anchors, and
-PII/raw-path absence.
+PII/raw-path absence. It also loads the production `plugin.lua` entrypoint with
+Botster capability stubs, creates persisted records, reloads the entrypoint, and
+proves the app and settings surfaces expose the persisted project/ticket state.
 
-Runtime behavior remains scaffold-only in this pass: `plugin.lua` is inert, the
-manifest configuration schema is intentionally empty, and provider or workspace
-integrations are contract references rather than runtime imports.
+Runtime behavior is intentionally minimal in this pass: `plugin.lua` registers
+CRUD tools and app/settings surface handlers, the manifest configuration schema
+is intentionally empty, and provider or workspace integrations are contract
+references rather than runtime imports.
+
+## UI Contract
+
+Project Pipelines surfaces are Botster shared `ui_contract` trees consumed by
+browser and TUI renderers. Web rendering should stay React/Catalyst-side; this
+plugin emits structured nodes, stable node IDs, and plugin-owned entity families
+such as `project-pipelines.project`, `project-pipelines.ticket`, and
+`project-pipelines.run`.
+
+Dynamic model state belongs in plugin-owned entity output. Surface snapshots
+should stay structural and declare bindings for project, ticket, and run lists
+instead of becoming a raw HTML or provider-specific data transport.
 
 ## Local Development
 
@@ -49,6 +64,5 @@ botster-hub apps list --data-dir "$DATA_DIR"
 ```
 
 The `show` output should include `package name=project-pipelines`, an enabled
-state, `schema_present=true`, and the declared `app` and `settings` surface
-descriptors. The app list may be empty until runnable entrypoints are added in a
-future implementation pass.
+state, `schema_present=true`, the `surfaces`, `mcp`, and `plugin_db`
+capabilities, and the declared `app` and `settings` surface descriptors.

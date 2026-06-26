@@ -1,14 +1,14 @@
 # Project Pipelines Domain Contract
 
-This repository defines the Project Pipelines plugin domain contract. It does
-not implement the workflow engine yet. The runtime package remains the
-installable scaffold declared by `botster-package.json` and the inert
+This repository defines and implements the first minimal Project Pipelines
+plugin domain path. It does not implement the workflow execution engine yet.
+The runtime package is declared by `botster-package.json` and wired through the
 `plugin.lua` entrypoint.
 
 `botster-package.json` is the source of truth for package descriptors:
 
 - package name: `project-pipelines`
-- capability: `surfaces`
+- capabilities: `surfaces`, `mcp`, and `plugin_db`
 - Lua entrypoint: `plugin.lua`
 - configuration schema placeholder: `{ "groups": [], "fields": [] }`
 - app surface: `project-pipelines.home`
@@ -16,10 +16,15 @@ installable scaffold declared by `botster-package.json` and the inert
 
 ## Runtime Disposition
 
-The current production path is scaffold-only package discovery and enablement. The
-changed user path for this ticket is reviewable repo-local documentation,
-fixtures, and `script/test` validation of the domain contract. No provider,
-workspace, MCP, UI workbench, or pipeline engine code is added in this pass.
+The current production path is minimal local CRUD and surface proof. `plugin.lua`
+is self-contained because the installed Lua package runtime does not expose the
+standard module loader. It registers MCP-style tools for project, ticket,
+pipeline definition, run, artifact, question, context, and entity-frame
+operations, and registers app/settings `surface_route` handlers for
+`project-pipelines.home` and `project-pipelines.settings`.
+
+No provider-backed execution, workspace-owned grouping, PR lifecycle mutation,
+agent spawning, merge workflow, or notification policy is added in this pass.
 
 ## Domain Objects
 
@@ -60,7 +65,9 @@ instead of copied into plugin source files.
 
 Plugin-owned durable records belong in Project Pipelines runtime storage, such
 as `plugin-data/project-pipelines/db.sqlite` when the runtime engine is added.
-Mutable runtime records must not be written under the plugin source tree.
+Mutable runtime records must not be written under the plugin source tree. The
+minimal implementation stores one versioned plugin-owned state document through
+the Botster plugin database capability.
 
 Provider-owned facts remain external facts. Project Pipelines may cache stable
 references and lifecycle observations, but provider APIs, OAuth, webhooks, and
@@ -135,3 +142,6 @@ Expected event kinds include:
 example. It uses synthetic IDs only and is validated by `script/test` for JSON
 shape, required relationships, standalone and workspace-linked examples,
 manifest anchors, provider capability boundaries, and PII/raw-path absence.
+`script/test` also runs a headless Lua runtime harness against `plugin.lua` to
+prove CRUD persistence survives an entrypoint reload and that app/settings
+surface handlers expose persisted project and ticket state.
