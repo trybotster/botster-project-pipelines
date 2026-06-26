@@ -1,0 +1,280 @@
+{
+  "contract_version": 1,
+  "manifest_anchors": {
+    "package_name": "project-pipelines",
+    "capabilities": ["surfaces"],
+    "entrypoint": "plugin.lua",
+    "configuration": {
+      "groups": [],
+      "fields": []
+    },
+    "surfaces": {
+      "home": "project-pipelines.home",
+      "settings": "project-pipelines.settings"
+    },
+    "runtime": "scaffold_only_inert_lua"
+  },
+  "domain_objects": [
+    "project",
+    "ticket",
+    "pipeline_definition",
+    "step",
+    "gate",
+    "artifact",
+    "finding",
+    "question",
+    "answer",
+    "run",
+    "pr_link",
+    "provider_lifecycle_boundary",
+    "event"
+  ],
+  "persistence_boundaries": {
+    "plugin_owned": [
+      "projects",
+      "tickets",
+      "pipeline_definitions",
+      "steps",
+      "gates",
+      "runs",
+      "artifacts",
+      "findings",
+      "questions",
+      "answers",
+      "events",
+      "cached_pr_links"
+    ],
+    "provider_owned": [
+      "remote_pr_state",
+      "repository_host_identity",
+      "provider_auth",
+      "webhooks",
+      "api_clients"
+    ],
+    "workspace_owned": [
+      "workspace_repository_grouping",
+      "workspace_session_grouping"
+    ],
+    "runtime_storage_namespace": "plugin-data/project-pipelines"
+  },
+  "provider_capabilities": [
+    {
+      "id": "provider-capability-generic-pr",
+      "required": [
+        "repository_identity",
+        "spawn_target_id",
+        "branch_context",
+        "worktree_context",
+        "agent_session_lifecycle",
+        "pr_link_lifecycle",
+        "artifact_persistence",
+        "finding_persistence",
+        "question_answer_persistence",
+        "gate_evidence_persistence"
+      ],
+      "forbidden_runtime_imports": [
+        "github",
+        "codex",
+        "botster-workspaces"
+      ]
+    }
+  ],
+  "projects": [
+    {
+      "id": "proj_standalone_contract",
+      "mode": "standalone",
+      "name": "Standalone Contract Project",
+      "repository": {
+        "id": "repo_standalone_contract",
+        "name": "example/project-pipelines-standalone",
+        "remote": "https://example.invalid/project-pipelines-standalone.git"
+      },
+      "spawn_target_id": "spawn_target_standalone",
+      "workspace_id": null
+    },
+    {
+      "id": "proj_workspace_contract",
+      "mode": "workspace_linked",
+      "name": "Workspace Linked Contract Project",
+      "repository": {
+        "id": "repo_workspace_contract",
+        "name": "example/project-pipelines-workspace",
+        "remote": "https://example.invalid/project-pipelines-workspace.git"
+      },
+      "spawn_target_id": "spawn_target_workspace",
+      "workspace_id": "workspace_contract_alpha"
+    }
+  ],
+  "tickets": [
+    {
+      "id": "ticket_contract_define_domain",
+      "project_id": "proj_standalone_contract",
+      "workspace_id": null,
+      "title": "Define Project Pipelines domain contract",
+      "status": "open",
+      "dependency_ticket_ids": []
+    },
+    {
+      "id": "ticket_contract_workspace_link",
+      "project_id": "proj_workspace_contract",
+      "workspace_id": "workspace_contract_alpha",
+      "title": "Exercise optional workspace linkage",
+      "status": "open",
+      "dependency_ticket_ids": ["ticket_contract_define_domain"]
+    }
+  ],
+  "pipeline_definitions": [
+    {
+      "id": "pipeline_botster_delivery",
+      "project_id": "proj_standalone_contract",
+      "name": "Botster Delivery",
+      "steps": [
+        {
+          "id": "step_plan",
+          "name": "Plan",
+          "position": 1,
+          "gates": [
+            {
+              "id": "gate_plan_reviewable",
+              "kind": "attestation",
+              "prompt": "Plan names scope, non-scope, risks, and verification."
+            }
+          ]
+        },
+        {
+          "id": "step_implement",
+          "name": "Implement",
+          "position": 2,
+          "gates": [
+            {
+              "id": "gate_implement_tests",
+              "kind": "command",
+              "prompt": "Run script/test and attach exact output.",
+              "command": "script/test"
+            }
+          ]
+        },
+        {
+          "id": "step_review",
+          "name": "Review",
+          "position": 3,
+          "gates": [
+            {
+              "id": "gate_review_clear",
+              "kind": "review_clear",
+              "prompt": "Review has no blocking findings."
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "runs": [
+    {
+      "id": "run_contract_standalone",
+      "ticket_id": "ticket_contract_define_domain",
+      "pipeline_definition_id": "pipeline_botster_delivery",
+      "current_step_id": "step_implement",
+      "status": "active",
+      "workspace_session_group_id": null,
+      "branch": "project-pipelines/contract-domain",
+      "base_ref": "main",
+      "worktree": {
+        "kind": "provider_owned_reference",
+        "id": "worktree_contract_standalone"
+      }
+    },
+    {
+      "id": "run_contract_workspace",
+      "ticket_id": "ticket_contract_workspace_link",
+      "pipeline_definition_id": "pipeline_botster_delivery",
+      "current_step_id": "step_plan",
+      "status": "active",
+      "workspace_session_group_id": "workspace_session_group_alpha",
+      "branch": "project-pipelines/workspace-contract",
+      "base_ref": "main",
+      "worktree": {
+        "kind": "provider_owned_reference",
+        "id": "worktree_contract_workspace"
+      }
+    }
+  ],
+  "gate_results": [
+    {
+      "id": "gate_result_contract_tests",
+      "run_id": "run_contract_standalone",
+      "step_id": "step_implement",
+      "gate_id": "gate_implement_tests",
+      "status": "passed",
+      "evidence_artifact_id": "artifact_contract_test_output"
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "artifact_contract_test_output",
+      "run_id": "run_contract_standalone",
+      "step_id": "step_implement",
+      "kind": "command_result",
+      "summary": "script/test output validates fixture relationships."
+    }
+  ],
+  "findings": [
+    {
+      "id": "finding_contract_missing_docs",
+      "run_id": "run_contract_standalone",
+      "step_id": "step_review",
+      "severity": "medium",
+      "status": "open",
+      "title": "Domain docs must define persistence ownership"
+    }
+  ],
+  "questions": [
+    {
+      "id": "question_contract_workspace_optional",
+      "run_id": "run_contract_workspace",
+      "ticket_id": "ticket_contract_workspace_link",
+      "status": "answered",
+      "question": "Should workspace linkage be required for standalone runs?"
+    }
+  ],
+  "answers": [
+    {
+      "id": "answer_contract_workspace_optional",
+      "question_id": "question_contract_workspace_optional",
+      "status": "answered",
+      "answer": "No. Workspace linkage is optional and additive."
+    }
+  ],
+  "pr_links": [
+    {
+      "id": "pr_link_contract_example",
+      "run_id": "run_contract_standalone",
+      "ticket_id": "ticket_contract_define_domain",
+      "provider": "generic_pr_provider",
+      "provider_pr_id": "pr_contract_001",
+      "url": "https://example.invalid/pulls/1",
+      "status": "draft",
+      "merge_commit": null
+    }
+  ],
+  "events": [
+    {
+      "id": "event_contract_run_started",
+      "run_id": "run_contract_standalone",
+      "kind": "run_started",
+      "subject_id": "run_contract_standalone"
+    },
+    {
+      "id": "event_contract_gate_submitted",
+      "run_id": "run_contract_standalone",
+      "kind": "gate_submitted",
+      "subject_id": "gate_result_contract_tests"
+    },
+    {
+      "id": "event_contract_pr_linked",
+      "run_id": "run_contract_standalone",
+      "kind": "provider_pr_linked",
+      "subject_id": "pr_link_contract_example"
+    }
+  ]
+}

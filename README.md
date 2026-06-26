@@ -12,6 +12,24 @@ placeholder, and app/settings surface descriptors needed for local package
 install and discovery. It does not port the Project Pipelines workflow engine
 yet.
 
+## Domain Contract
+
+The current Project Pipelines domain contract lives in
+[`docs/domain-contract.md`](docs/domain-contract.md). It defines projects,
+tickets, pipeline definitions, steps, gates, artifacts, findings,
+questions/answers, runs, PR links, provider lifecycle boundaries, events, and
+persistence ownership.
+
+The executable contract fixture is
+[`fixtures/project_pipelines/domain_contract.json`](fixtures/project_pipelines/domain_contract.json).
+`script/test` validates the fixture relationships, standalone mode, optional
+workspace-linked mode, provider capability boundaries, manifest anchors, and
+PII/raw-path absence.
+
+Runtime behavior remains scaffold-only in this pass: `plugin.lua` is inert, the
+manifest configuration schema is intentionally empty, and provider or workspace
+integrations are contract references rather than runtime imports.
+
 ## Local Development
 
 Run the package checks:

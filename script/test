@@ -25,6 +25,159 @@ assert {capability["surface"] for capability in manifest["capabilities"]} == {"s
 PY
 
 python3 -m json.tool botster-package.json >/dev/null
+python3 -m json.tool fixtures/project_pipelines/domain_contract.json >/dev/null
+
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+manifest = json.loads(Path("botster-package.json").read_text())
+contract = json.loads(Path("fixtures/project_pipelines/domain_contract.json").read_text())
+docs = Path("docs/domain-contract.md").read_text()
+
+anchors = contract["manifest_anchors"]
+assert anchors["package_name"] == manifest["name"]
+assert anchors["capabilities"] == [capability["surface"] for capability in manifest["capabilities"]]
+assert anchors["entrypoint"] == manifest["entrypoints"][0]["path"]
+assert anchors["configuration"] == manifest["configuration"]
+
+surfaces = {surface["id"]: surface for surface in manifest["surfaces"]}
+assert anchors["surfaces"] == {
+    "home": "project-pipelines.home",
+    "settings": "project-pipelines.settings",
+}
+assert anchors["surfaces"]["home"] in surfaces
+assert anchors["surfaces"]["settings"] in surfaces
+assert anchors["runtime"] == "scaffold_only_inert_lua"
+
+required_domain_objects = {
+    "project",
+    "ticket",
+    "pipeline_definition",
+    "step",
+    "gate",
+    "artifact",
+    "finding",
+    "question",
+    "answer",
+    "run",
+    "pr_link",
+    "provider_lifecycle_boundary",
+    "event",
+}
+assert required_domain_objects <= set(contract["domain_objects"])
+
+projects = {project["id"]: project for project in contract["projects"]}
+tickets = {ticket["id"]: ticket for ticket in contract["tickets"]}
+pipelines = {pipeline["id"]: pipeline for pipeline in contract["pipeline_definitions"]}
+runs = {run["id"]: run for run in contract["runs"]}
+artifacts = {artifact["id"]: artifact for artifact in contract["artifacts"]}
+questions = {question["id"]: question for question in contract["questions"]}
+gate_ids = {
+    gate["id"]
+    for pipeline in pipelines.values()
+    for step in pipeline["steps"]
+    for gate in step["gates"]
+}
+step_ids = {
+    step["id"]
+    for pipeline in pipelines.values()
+    for step in pipeline["steps"]
+}
+
+assert any(project["mode"] == "standalone" and project["workspace_id"] is None for project in projects.values())
+assert any(project["mode"] == "workspace_linked" and project["workspace_id"] for project in projects.values())
+
+for project in projects.values():
+    assert project["repository"]["id"]
+    assert project["repository"]["name"]
+    assert project["repository"]["remote"].startswith("https://example.invalid/")
+    assert project["spawn_target_id"]
+
+for ticket in tickets.values():
+    assert ticket["project_id"] in projects
+    if ticket["workspace_id"] is not None:
+        assert projects[ticket["project_id"]]["workspace_id"] == ticket["workspace_id"]
+    for dependency_id in ticket["dependency_ticket_ids"]:
+        assert dependency_id in tickets
+
+for pipeline in pipelines.values():
+    assert pipeline["project_id"] in projects
+    positions = [step["position"] for step in pipeline["steps"]]
+    assert positions == sorted(positions)
+    assert positions[0] == 1
+
+for run in runs.values():
+    assert run["ticket_id"] in tickets
+    assert run["pipeline_definition_id"] in pipelines
+    assert run["current_step_id"] in step_ids
+    assert run["worktree"]["kind"] == "provider_owned_reference"
+    ticket = tickets[run["ticket_id"]]
+    if ticket["workspace_id"] is None:
+        assert run["workspace_session_group_id"] is None
+    else:
+        assert run["workspace_session_group_id"]
+
+for result in contract["gate_results"]:
+    assert result["run_id"] in runs
+    assert result["step_id"] in step_ids
+    assert result["gate_id"] in gate_ids
+    assert result["evidence_artifact_id"] in artifacts
+
+for artifact in artifacts.values():
+    assert artifact["run_id"] in runs
+    assert artifact["step_id"] in step_ids
+
+for finding in contract["findings"]:
+    assert finding["run_id"] in runs
+    assert finding["step_id"] in step_ids
+
+for question in questions.values():
+    assert question["run_id"] in runs
+    assert question["ticket_id"] in tickets
+
+for answer in contract["answers"]:
+    assert answer["question_id"] in questions
+
+for pr_link in contract["pr_links"]:
+    assert pr_link["run_id"] in runs
+    assert pr_link["ticket_id"] in tickets
+    assert pr_link["provider"] == "generic_pr_provider"
+
+for event in contract["events"]:
+    assert event["run_id"] in runs
+    assert event["kind"] in {
+        "ticket_created",
+        "run_started",
+        "step_started",
+        "gate_submitted",
+        "artifact_added",
+        "finding_opened",
+        "question_asked",
+        "answer_recorded",
+        "provider_pr_linked",
+        "provider_pr_ready_for_review",
+        "provider_pr_merged",
+        "run_completed",
+    }
+
+assert contract["persistence_boundaries"]["runtime_storage_namespace"] == "plugin-data/project-pipelines"
+assert "botster-workspaces" in contract["provider_capabilities"][0]["forbidden_runtime_imports"]
+assert "github" in contract["provider_capabilities"][0]["forbidden_runtime_imports"]
+assert "codex" in contract["provider_capabilities"][0]["forbidden_runtime_imports"]
+
+required_doc_phrases = [
+    "standalone",
+    "workspace-linked mode is additive",
+    "Provider Capability Contract",
+    "plugin-data/project-pipelines",
+    "project-pipelines.home",
+    "project-pipelines.settings",
+    "scaffold-only",
+]
+for phrase in required_doc_phrases:
+    assert phrase in docs
+PY
 
 python3 - <<'PY'
 import re
@@ -41,6 +194,8 @@ paths = [
     Path("botster-package.json"),
     Path("plugin.lua"),
     Path("script/test"),
+    Path("docs/domain-contract.md"),
+    Path("fixtures/project_pipelines/domain_contract.json"),
 ]
 
 for path in paths:
@@ -48,6 +203,36 @@ for path in paths:
     for pattern in patterns:
         if pattern.search(text):
             raise SystemExit(f"PII-like content found in {path}")
+PY
+
+python3 - <<'PY'
+from pathlib import Path
+
+runtime_files = [
+    path
+    for path in Path(".").rglob("*")
+    if path.is_file()
+    and ".git" not in path.parts
+    and path.parts[:2] != ("fixtures", "project_pipelines")
+]
+
+for path in runtime_files:
+    text = path.read_text(errors="ignore")
+    if path == Path("script/test") or path.suffix == ".md":
+        continue
+    forbidden_markers = [
+        "require('github",
+        'require("github',
+        "require('codex",
+        'require("codex',
+        "require('botster-workspaces",
+        'require("botster-workspaces',
+        "github.com/",
+        "api.github.com",
+    ]
+    for marker in forbidden_markers:
+        if marker in text:
+            raise SystemExit(f"Provider/workspace implementation marker found in {path}: {marker}")
 PY
 
 echo "package scaffold checks passed"
