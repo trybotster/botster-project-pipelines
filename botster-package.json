@@ -5,7 +5,9 @@
   "botster": ">=0.1.0",
   "source": { "type": "path", "path": "." },
   "capabilities": [
-    { "surface": "surfaces" }
+    { "surface": "surfaces" },
+    { "surface": "mcp" },
+    { "surface": "plugin_db", "scope": "project-pipelines" }
   ],
   "entrypoints": [
     { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
@@ -19,7 +21,7 @@
       "id": "project-pipelines.home",
       "kind": "app",
       "title": "Project Pipelines",
-      "description": "Project pipeline workbench descriptor placeholder.",
+      "description": "Project pipeline workbench for persisted projects and tickets.",
       "icon": "queue-list",
       "order": 30,
       "category": "workflows",
@@ -29,7 +31,7 @@
       "id": "project-pipelines.settings",
       "kind": "settings",
       "title": "Project Pipelines Settings",
-      "description": "Project Pipelines package settings descriptor placeholder.",
+      "description": "Project Pipelines package settings and persistence status.",
       "icon": "adjustments-horizontal",
       "order": 30,
       "category": "workflows",
@@ -38,8 +40,12 @@
   ],
   "features": [
     {
-      "id": "scaffold",
-      "label": "Installable scaffold"
+      "id": "minimal_crud",
+      "label": "Minimal Project Pipelines CRUD"
+    },
+    {
+      "id": "surface_proof",
+      "label": "App and settings surface proof"
     }
   ]
 }

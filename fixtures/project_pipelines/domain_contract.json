@@ -2,7 +2,7 @@
   "contract_version": 1,
   "manifest_anchors": {
     "package_name": "project-pipelines",
-    "capabilities": ["surfaces"],
+    "capabilities": ["surfaces", "mcp", "plugin_db"],
     "entrypoint": "plugin.lua",
     "configuration": {
       "groups": [],
@@ -12,7 +12,7 @@
       "home": "project-pipelines.home",
       "settings": "project-pipelines.settings"
     },
-    "runtime": "scaffold_only_inert_lua"
+    "runtime": "minimal_crud_lua_plugin"
   },
   "domain_objects": [
     "project",
