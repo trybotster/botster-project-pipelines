@@ -1,0 +1,45 @@
+{
+  "name": "project-pipelines",
+  "version": "0.1.0",
+  "kind": "plugin",
+  "botster": ">=0.1.0",
+  "source": { "type": "path", "path": "." },
+  "capabilities": [
+    { "surface": "surfaces" }
+  ],
+  "entrypoints": [
+    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+  ],
+  "configuration": {
+    "groups": [],
+    "fields": []
+  },
+  "surfaces": [
+    {
+      "id": "project-pipelines.home",
+      "kind": "app",
+      "title": "Project Pipelines",
+      "description": "Project pipeline workbench descriptor placeholder.",
+      "icon": "queue-list",
+      "order": 30,
+      "category": "workflows",
+      "supports": []
+    },
+    {
+      "id": "project-pipelines.settings",
+      "kind": "settings",
+      "title": "Project Pipelines Settings",
+      "description": "Project Pipelines package settings descriptor placeholder.",
+      "icon": "adjustments-horizontal",
+      "order": 30,
+      "category": "workflows",
+      "supports": []
+    }
+  ],
+  "features": [
+    {
+      "id": "scaffold",
+      "label": "Installable scaffold"
+    }
+  ]
+}
