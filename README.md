@@ -32,11 +32,14 @@ state.
 
 Runtime behavior is intentionally narrow in this pass: `plugin.lua` registers
 workflow CRUD tools, a `project_pipelines.activate_step` tool, and app/settings
-surface handlers. PTY-backed steps with `session_template_id` call the hub
-`spawn_session_template` primitive with `DaemonSessionTemplateRequest` field
-names. Manual, human, command, and other non-PTY steps do not spawn sessions.
-The manifest configuration schema is intentionally empty, and provider or
-workspace integrations are contract references rather than runtime imports.
+surface handlers. PTY-backed steps with `session_template_id` build and persist
+`DaemonSessionTemplateRequest` field names. Actual PTY spawn is blocked until
+the hub exposes a plugin-safe session-template spawn capability
+(`ticket_1782523439_100928`); until then activation returns
+`session_template_spawn_blocked`. Manual, human, command, and other non-PTY
+steps do not spawn sessions. The manifest configuration schema is intentionally
+empty, and provider or workspace integrations are contract references rather
+than runtime imports.
 
 ## UI Contract
 

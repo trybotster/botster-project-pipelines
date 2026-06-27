@@ -157,11 +157,11 @@ local function bounded_prompt(prompt)
   return prompt:sub(1, 497) .. "..."
 end
 
-local function clean_metadata(metadata)
+local function clean_string_map(values)
   local result = {}
-  if type(metadata) ~= "table" then return result end
-  for key, value in pairs(metadata) do
-    if type(key) == "string" and (type(value) == "string" or type(value) == "number" or type(value) == "boolean") then
+  if type(values) ~= "table" then return result end
+  for key, value in pairs(values) do
+    if type(key) == "string" and type(value) == "string" then
       result[key] = value
     end
   end
@@ -182,7 +182,7 @@ local function build_session_template_request(arguments, run, ticket, project, s
   local repository = context_value(arguments, run, ticket, project, step, "repository")
   local worktree = context_value(arguments, run, ticket, project, step, "worktree")
   local prompt = bounded_prompt(context_value(arguments, run, ticket, project, step, "prompt"))
-  local metadata = clean_metadata(context_value(arguments, run, ticket, project, step, "metadata"))
+  local metadata = clean_string_map(context_value(arguments, run, ticket, project, step, "metadata"))
   metadata.owner_plugin = metadata.owner_plugin or "project-pipelines"
   metadata.surface = metadata.surface or "project-pipelines"
   metadata.run_id = run.id
@@ -203,26 +203,15 @@ local function build_session_template_request(arguments, run, ticket, project, s
   return {
     target_id = context_value(arguments, run, ticket, project, step, "spawn_target_id") or project.spawn_target_id,
     cwd = context_value(arguments, run, ticket, project, step, "cwd"),
-    environment = context_value(arguments, run, ticket, project, step, "environment") or {},
+    environment = clean_string_map(context_value(arguments, run, ticket, project, step, "environment")),
     context = context,
   }
 end
 
 local function spawn_session_template(template_id, session_id, request)
-  local capabilities = botster and botster.capabilities or {}
-  local hub_client = capabilities.hub_client or capabilities.hub
-  if hub_client and type(hub_client.spawn_session_template) == "function" then
-    return hub_client.spawn_session_template({
-      template_id = template_id,
-      session_id = session_id,
-      request = request,
-    })
-  end
-  local session_templates = capabilities.session_templates
-  if session_templates and type(session_templates.spawn_session_template) == "function" then
-    return session_templates.spawn_session_template(template_id, session_id, request)
-  end
-  return failure("session_templates_unavailable", "hub session template spawn capability is unavailable")
+  return failure("session_template_spawn_blocked", "hub plugin-safe session template spawn capability is unavailable", {
+    "ticket_1782523439_100928",
+  })
 end
 
 local function repository_from(arguments)

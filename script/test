@@ -133,7 +133,8 @@ for request in session_requests.values():
     assert request["ticket_id"] in tickets
     assert request["template_id"]
     assert request["session_id"]
-    assert request["status"] == "spawn_requested"
+    assert request["status"] == "failed"
+    assert request["result"]["error"]["code"] == "session_template_spawn_blocked"
     daemon_request = request["request"]
     assert set(daemon_request) == {"target_id", "cwd", "environment", "context"}
     assert daemon_request["target_id"]
@@ -201,7 +202,7 @@ required_doc_phrases = [
     "plugin-data/project-pipelines",
     "project-pipelines.home",
     "project-pipelines.settings",
-    "spawn_session_template",
+    "session_template_spawn_blocked",
     "DaemonSessionTemplateRequest",
     "plugin database capability",
 ]
@@ -271,7 +272,6 @@ lua <<'LUA'
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
 local durable_store = {}
-local spawned_session_templates = {}
 
 local function deep_copy(value)
   if type(value) ~= "table" then return value end
@@ -284,21 +284,6 @@ end
 
 botster = {
   capabilities = {
-    hub_client = {
-      spawn_session_template = function(args)
-        table.insert(spawned_session_templates, deep_copy(args))
-        assert(args.template_id, "spawn_session_template requires template_id")
-        assert(type(args.request) == "table", "spawn_session_template requires request")
-        assert(args.request.target_id, "DaemonSessionTemplateRequest requires target_id")
-        assert(type(args.request.context) == "table", "DaemonSessionTemplateRequest requires context")
-        assert(args.request.context.ticket_id, "DaemonSessionTemplateContextInput requires ticket_id")
-        return {
-          ok = true,
-          session_id = args.session_id or "session_from_hub",
-          context_id = "context_from_hub",
-        }
-      end,
-    },
     plugin_db = {
       get = function(args)
         local record = durable_store[args.key]
@@ -404,19 +389,11 @@ local pty_activation = tools["project_pipelines.activate_step"]({
   request_id = "session_request_runtime_one",
   session_id = "session_runtime_one",
   prompt = "Runtime prompt body",
-  metadata = { role = "implement", ignored = { "not scalar" } },
+  environment = { STRING_VALUE = "kept", NUMBER_VALUE = 1 },
+  metadata = { role = "implement", ignored = { "not scalar" }, numeric = 1, boolean = true },
 })
-assert(pty_activation.ok, "PTY activation failed")
-assert(pty_activation.activation.template_id == "template_codex_runtime", "template id must be persisted")
-assert(pty_activation.activation.session_id == "session_runtime_one", "session id must be persisted")
-assert(pty_activation.activation.request.target_id == "spawn_target_runtime_override", "request target_id must come from explicit run context")
-assert(pty_activation.activation.request.context.ticket_id == "ticket_runtime_one", "request context must include ticket_id")
-assert(pty_activation.activation.request.context.branch_name == "project-pipelines/runtime-test", "request context must include branch_name")
-assert(pty_activation.activation.request.context.prompt == "Runtime prompt body", "request context must include prompt")
-assert(pty_activation.activation.request.context.metadata.owner_plugin == "project-pipelines", "request context metadata must include owner_plugin")
-assert(pty_activation.activation.request.context.metadata.role == "implement", "request context metadata must keep scalar caller metadata")
-assert(pty_activation.activation.request.context.metadata.ignored == nil, "request context metadata must drop non-scalar values")
-assert(pty_activation.activation.request.context.workspace_id == nil, "standalone request must omit workspace_id")
+assert(pty_activation.ok == false, "PTY activation should be blocked until hub exposes plugin-safe session-template spawn")
+assert(pty_activation.error.code == "session_template_spawn_blocked", "PTY activation should report the blocking hub dependency")
 
 local linked_ticket = tools["project_pipelines.create_ticket"]({
   id = "ticket_runtime_workspace",
@@ -451,19 +428,31 @@ local linked_activation = tools["project_pipelines.activate_step"]({
   step_id = "step_workspace_pty",
   request_id = "session_request_runtime_workspace",
 })
-assert(linked_activation.ok, "workspace-linked activation should not require botster-workspaces")
-assert(linked_activation.activation.request.target_id == "spawn_target_runtime_workspace", "workspace activation must use project spawn target")
-assert(linked_activation.activation.request.context.workspace_id == "workspace_runtime_alpha", "workspace_id should remain optional metadata")
-assert(#spawned_session_templates == 2, "only PTY-backed session-template steps should call spawn_session_template")
-assert(spawned_session_templates[1].template_id == "template_codex_runtime", "first spawn should use implement template")
-assert(spawned_session_templates[1].request.target_id == "spawn_target_runtime_override", "spawn request must use DaemonSessionTemplateRequest target_id")
-assert(spawned_session_templates[1].request.context.ticket_id == "ticket_runtime_one", "spawn context must use ticket_id")
-assert(spawned_session_templates[1].request.context.branch_name == "project-pipelines/runtime-test", "spawn context must use branch_name")
-assert(spawned_session_templates[1].request.context.prompt == "Runtime prompt body", "spawn context must use prompt")
-assert(spawned_session_templates[1].request.context.metadata.role == "implement", "spawn context must use metadata")
-assert(spawned_session_templates[1].request.context.workspace_id == nil, "standalone spawn context should omit workspace_id")
-assert(spawned_session_templates[2].template_id == "template_workspace_runtime", "second spawn should use workspace template")
-assert(spawned_session_templates[2].request.context.workspace_id == "workspace_runtime_alpha", "workspace spawn context should carry optional workspace_id")
+assert(linked_activation.ok == false, "workspace-linked activation should also be blocked only on the hub spawn dependency")
+assert(linked_activation.error.code == "session_template_spawn_blocked", "workspace-linked activation should not require botster-workspaces")
+
+local blocked_context = tools["project_pipelines.current_context"]({})
+assert(blocked_context.ok and #blocked_context.session_requests == 2, "blocked session requests must still be persisted")
+local standalone_request = blocked_context.session_requests[1]
+local workspace_request = blocked_context.session_requests[2]
+assert(standalone_request.status == "failed", "standalone request should record blocked status")
+assert(standalone_request.result.error.code == "session_template_spawn_blocked", "standalone request should record dependency blocker")
+assert(standalone_request.template_id == "template_codex_runtime", "first request should use implement template")
+assert(standalone_request.session_id == "session_runtime_one", "session id should be preserved for correlation")
+assert(standalone_request.request.target_id == "spawn_target_runtime_override", "request must use DaemonSessionTemplateRequest target_id")
+assert(standalone_request.request.environment.STRING_VALUE == "kept", "environment string values should be kept")
+assert(standalone_request.request.environment.NUMBER_VALUE == nil, "environment non-string values should be dropped")
+assert(standalone_request.request.context.ticket_id == "ticket_runtime_one", "request context must use ticket_id")
+assert(standalone_request.request.context.branch_name == "project-pipelines/runtime-test", "request context must use branch_name")
+assert(standalone_request.request.context.prompt == "Runtime prompt body", "request context must use prompt")
+assert(standalone_request.request.context.metadata.owner_plugin == "project-pipelines", "request context metadata must include owner_plugin")
+assert(standalone_request.request.context.metadata.role == "implement", "request context metadata must keep string caller metadata")
+assert(standalone_request.request.context.metadata.ignored == nil, "request context metadata must drop table values")
+assert(standalone_request.request.context.metadata.numeric == nil, "request context metadata must drop numeric values")
+assert(standalone_request.request.context.metadata.boolean == nil, "request context metadata must drop boolean values")
+assert(standalone_request.request.context.workspace_id == nil, "standalone spawn context should omit workspace_id")
+assert(workspace_request.template_id == "template_workspace_runtime", "second request should use workspace template")
+assert(workspace_request.request.context.workspace_id == "workspace_runtime_alpha", "workspace spawn context should carry optional workspace_id")
 
 local artifact = tools["project_pipelines.record_artifact"]({
   id = "artifact_runtime_one",
