@@ -1,9 +1,9 @@
 # Project Pipelines Domain Contract
 
-This repository defines and implements the first minimal Project Pipelines
-plugin domain path. It does not implement the workflow execution engine yet.
-The runtime package is declared by `botster-package.json` and wired through the
-`plugin.lua` entrypoint.
+This repository defines and implements the first Project Pipelines plugin
+domain path. Pipeline workflow state is plugin-owned, while PTY execution is
+delegated to hub-owned session templates. The runtime package is declared by
+`botster-package.json` and wired through the `plugin.lua` entrypoint.
 
 `botster-package.json` is the source of truth for package descriptors:
 
@@ -16,15 +16,25 @@ The runtime package is declared by `botster-package.json` and wired through the
 
 ## Runtime Disposition
 
-The current production path is minimal local CRUD and surface proof. `plugin.lua`
-is self-contained because the installed Lua package runtime does not expose the
-standard module loader. It registers MCP-style tools for project, ticket,
-pipeline definition, run, artifact, question, context, and entity-frame
-operations, and registers app/settings `surface_route` handlers for
-`project-pipelines.home` and `project-pipelines.settings`.
+The current production path is local workflow CRUD plus PTY-backed step
+activation through hub session templates. `plugin.lua` is self-contained because
+the installed Lua package runtime does not expose the standard module loader. It
+registers MCP-style tools for project, ticket, pipeline definition, run, step
+activation, artifact, question, context, and entity-frame operations, and
+registers app/settings `surface_route` handlers for `project-pipelines.home`
+and `project-pipelines.settings`.
 
-No provider-backed execution, workspace-owned grouping, PR lifecycle mutation,
-agent spawning, merge workflow, or notification policy is added in this pass.
+Project Pipelines does not create an agent runtime. For a PTY-backed step with a
+`session_template_id`, `project_pipelines.activate_step` builds a
+`DaemonSessionTemplateRequest`-shaped payload and calls the hub
+`spawn_session_template` primitive. The request uses the hub-client field names:
+`target_id`, optional `cwd`, optional `environment`, and `context` containing
+`worktree_path`, `repo_path`, `branch_name`, `prompt`, `ticket_id`, optional
+`workspace_id`, and `metadata`. Manual, human, command, and other non-PTY steps
+do not call `spawn_session_template`.
+
+No workspace-owned grouping, PR lifecycle mutation, merge workflow, provider
+runtime, notification policy, or `botster-agents` class is added in this pass.
 
 ## Domain Objects
 
@@ -37,9 +47,10 @@ instead of copied into plugin source files.
 | Project | Plugin-owned | Product or repository grouping for tickets. Stores standalone repo and spawn-target config, and may store optional workspace IDs. |
 | Ticket | Plugin-owned | Unit of delivery within a project. Stores title, description, status, dependency links, and optional workspace ID. |
 | Pipeline definition | Plugin-owned | Ordered step template selected for a ticket run. Defines steps, gate prompts, and default routing. |
-| Step | Plugin-owned | Named execution phase such as Plan, Review, Implement, Verify, or Merge. |
+| Step | Plugin-owned | Named execution phase such as Plan, Review, Implement, Verify, or Merge. PTY-backed steps may reference a hub `session_template_id`. |
 | Gate | Plugin-owned | Required evidence prompt or command attached to a step. Gate results are persisted on runs. |
 | Run | Plugin-owned | One execution of a pipeline definition for a ticket, with current step, status, assignments, and event history. |
+| Session request | Plugin-owned summary of hub-owned lifecycle | Correlation record for a requested hub session template spawn. Stores request/session IDs, template ID, status, bounded prompt/context summary, and returned context/session references. |
 | Artifact | Plugin-owned | Durable plan, report, command output, patch summary, or external URL attached to a run step. |
 | Finding | Plugin-owned | Review or verification issue linked to a run step, with severity, status, and suggested fix. |
 | Question | Plugin-owned | Durable human or agent question linked to a run, ticket, or step. |
@@ -55,6 +66,9 @@ instead of copied into plugin source files.
 - A step may define zero or more gates.
 - A run belongs to one ticket and one pipeline definition.
 - A run records current step state and append-only events.
+- PTY-backed steps may create session request records; the hub remains the
+  authority for the template registry, target policy, context injection, and PTY
+  lifecycle.
 - Artifacts, findings, questions, answers, gate results, and PR links are linked
   to runs and, when useful for review, to the exact run step that created them.
 - Questions have many answers. Answers reference their question and answering
@@ -76,7 +90,8 @@ pull-request mutations belong to provider implementations outside this scaffold.
 Workspace integration is optional. Standalone Project Pipelines records must be
 complete with explicit repository and spawn-target configuration. When a
 workspace plugin is present, Project Pipelines may store workspace IDs and use
-workspace-provided repo/session grouping as linked context.
+workspace-provided repo/session grouping as linked context. Missing or failing
+workspace data must not block a standalone session-template spawn request.
 
 ## Provider Capability Contract
 
@@ -85,9 +100,9 @@ capabilities. This repository only defines the required facts and lifecycle
 boundaries:
 
 - repository identity and display name
-- explicit spawn target ID for agent sessions
+- explicit spawn target ID for hub sessions
 - branch, worktree, base ref, and run context
-- session or agent lifecycle events with stable session IDs
+- hub session-template lifecycle events with stable session IDs
 - PR link creation, status observation, ready-for-review, merge, and close facts
 - durable artifact, finding, question, answer, gate, and review persistence
 - notification delivery for human and agent questions
@@ -126,6 +141,8 @@ Expected event kinds include:
 - `ticket_created`
 - `run_started`
 - `step_started`
+- `step_activation_preserved`
+- `session_template_spawn_requested`
 - `gate_submitted`
 - `artifact_added`
 - `finding_opened`
@@ -143,5 +160,8 @@ example. It uses synthetic IDs only and is validated by `script/test` for JSON
 shape, required relationships, standalone and workspace-linked examples,
 manifest anchors, provider capability boundaries, and PII/raw-path absence.
 `script/test` also runs a headless Lua runtime harness against `plugin.lua` to
-prove CRUD persistence survives an entrypoint reload and that app/settings
-surface handlers expose persisted project and ticket state.
+prove CRUD persistence survives an entrypoint reload, PTY-backed step activation
+calls `spawn_session_template` with the real hub DTO field names, optional
+workspace IDs stay metadata only, non-PTY steps preserve existing behavior, and
+app/settings surface handlers expose persisted project, ticket, run, and session
+state.
