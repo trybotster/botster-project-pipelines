@@ -23,8 +23,9 @@ persistence ownership.
 The executable contract fixture is
 [`fixtures/project_pipelines/domain_contract.json`](fixtures/project_pipelines/domain_contract.json).
 `script/test` validates the fixture relationships, standalone mode, optional
-workspace-linked mode, session-template request shape, provider capability
-boundaries, manifest anchors, and PII/raw-path absence. It also loads the
+workspace-linked mode, session-template request shape, template selector
+resolution, blocked provider diagnostics, provider capability boundaries,
+manifest anchors, and PII/raw-path absence. It also loads the
 production `plugin.lua` entrypoint with Botster capability stubs, creates
 persisted records, activates PTY and non-PTY steps, reloads the entrypoint, and
 proves the app and settings surfaces expose persisted project/ticket/run/session
@@ -32,12 +33,19 @@ state.
 
 Runtime behavior is intentionally narrow in this pass: `plugin.lua` registers
 workflow CRUD tools, a `project_pipelines.activate_step` tool, and app/settings
-surface handlers. PTY-backed steps with `session_template_id` build and persist
-`DaemonSessionTemplateRequest` field names, add `template_id` and optional
-`session_id`, and call the hub `session_templates.spawn` plugin capability.
-Manual, human, command, and other non-PTY steps do not spawn sessions. The
-manifest configuration schema is intentionally empty, and provider or workspace
-integrations are contract references rather than runtime imports.
+surface handlers. PTY-backed steps with `session_template_id`,
+`session_template_name`/`template_name`, or
+`session_template_capability`/`session_capability` build and persist
+`DaemonSessionTemplateRequest` field names, add resolved `template_id` and
+optional `session_id`, and call the hub `session_templates.spawn` plugin
+capability. Existing ID selection is direct; name and capability selection use
+`session_templates.resolve` or `session_templates.list`. If a selector cannot be
+resolved, or a declared dependency such as `github_auth` is unavailable,
+activation persists `status="blocked"` with a structured diagnostic and emits
+`session_template_spawn_blocked`. Manual, human, command, and other non-PTY
+steps do not spawn sessions. The manifest configuration schema is intentionally
+empty, and provider or workspace integrations are contract references rather
+than runtime imports.
 
 ## UI Contract
 
@@ -74,3 +82,16 @@ botster-hub apps list --data-dir "$DATA_DIR"
 The `show` output should include `package name=project-pipelines`, an enabled
 state, `schema_present=true`, the `surfaces`, `mcp`, and `plugin_db`
 capabilities, and the declared `app` and `settings` surface descriptors.
+
+Real hub acceptance for this ticket is a live Project Pipelines activation, not
+only package discovery. Use a temporary hub data directory, install and enable
+this package, define a tiny standalone project/ticket/run with a PTY step
+selected by template name or declared capability, activate it, then inspect
+`project_pipelines.current_context`. Persisted evidence should show
+`session_request.status="spawn_requested"`, `run.session_id`,
+`run.session_request_id`, a `session_template_spawn_requested` event, resolved
+`template_id`, persisted `template_selector`, `target_id`, and request context
+metadata for `run_id`, `step_id`, and `ticket_id`. The negative case is a PTY
+step declaring a missing provider dependency such as `github_auth`; activation
+should persist `status="blocked"`, a diagnostic naming the dependency/provider,
+and a `session_template_spawn_blocked` event without spawning a PTY session.

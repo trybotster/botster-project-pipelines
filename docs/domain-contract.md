@@ -25,17 +25,33 @@ registers app/settings `surface_route` handlers for `project-pipelines.home`
 and `project-pipelines.settings`.
 
 Project Pipelines does not create an agent runtime. For a PTY-backed step with a
-`session_template_id`, `project_pipelines.activate_step` builds a
+`session_template_id`, `session_template_name`/`template_name`, or
+`session_template_capability`/`session_capability`,
+`project_pipelines.activate_step` resolves the hub template selector and builds a
 `DaemonSessionTemplateRequest`-shaped payload. The request uses the hub-client
 field names: `template_id`, optional `session_id`, `target_id`, optional `cwd`,
 optional `environment`, and `context` containing `worktree_path`, `repo_path`,
 `branch_name`, `prompt`, `ticket_id`, optional `workspace_id`, and `metadata`.
 `environment` and `metadata` are string-keyed string maps to match the hub DTO
-contract. PTY-backed activation sends that single request table to the hub
-`session_templates.spawn` plugin capability and persists the request summary and
-returned session/context references. Hub spawn rejections are normalized into a
-failed session request before returning a structured activation error. Manual,
-human, command, and other non-PTY steps do not attempt a session-template spawn.
+contract. Existing ID selection is direct. Name and capability selectors use the
+hub `session_templates.resolve` capability when available, then
+`session_templates.list` as a deterministic registry fallback. If neither
+resolution path is available, Project Pipelines persists a blocked diagnostic
+instead of falling back silently. PTY-backed activation sends one resolved
+request table to the hub `session_templates.spawn` plugin capability and
+persists the request summary and returned session/context references. Hub spawn
+rejections are normalized into a failed session request before returning a
+structured activation error. Manual, human, command, and other non-PTY steps do
+not attempt a session-template spawn.
+
+Declared provider prerequisites are pre-spawn blockers. A step may declare
+`required_provider_dependencies`, `provider_dependencies`, or
+`required_provider_capabilities`. If a declared dependency such as
+`github_auth` is unavailable, activation persists a session request with
+`status: "blocked"`, a structured `diagnostic`, and a
+`session_template_spawn_blocked` event. Project Pipelines does not import GitHub
+or any provider client to satisfy that dependency; it records the dependency
+diagnostic and leaves provider auth to the provider boundary.
 
 No workspace-owned grouping, PR lifecycle mutation, merge workflow, provider
 runtime, notification policy, or `botster-agents` class is added in this pass.
@@ -51,10 +67,10 @@ instead of copied into plugin source files.
 | Project | Plugin-owned | Product or repository grouping for tickets. Stores standalone repo and spawn-target config, and may store optional workspace IDs. |
 | Ticket | Plugin-owned | Unit of delivery within a project. Stores title, description, status, dependency links, and optional workspace ID. |
 | Pipeline definition | Plugin-owned | Ordered step template selected for a ticket run. Defines steps, gate prompts, and default routing. |
-| Step | Plugin-owned | Named execution phase such as Plan, Review, Implement, Verify, or Merge. PTY-backed steps may reference a hub `session_template_id`. |
+| Step | Plugin-owned | Named execution phase such as Plan, Review, Implement, Verify, or Merge. PTY-backed steps may reference a hub `session_template_id`, `session_template_name`, or `session_template_capability`. |
 | Gate | Plugin-owned | Required evidence prompt or command attached to a step. Gate results are persisted on runs. |
 | Run | Plugin-owned | One execution of a pipeline definition for a ticket, with current step, status, assignments, and event history. |
-| Session request | Plugin-owned summary of hub-owned lifecycle | Correlation record for a requested hub session template spawn. Stores request/session IDs, template ID, status, bounded prompt/context summary, and returned context/session references. |
+| Session request | Plugin-owned summary of hub-owned lifecycle | Correlation record for a requested hub session template spawn. Stores request/session IDs, template selector, resolved template ID when available, status (`spawn_requested`, `failed`, or `blocked`), bounded prompt/context summary, returned context/session references, and structured diagnostics. |
 | Artifact | Plugin-owned | Durable plan, report, command output, patch summary, or external URL attached to a run step. |
 | Finding | Plugin-owned | Review or verification issue linked to a run step, with severity, status, and suggested fix. |
 | Question | Plugin-owned | Durable human or agent question linked to a run, ticket, or step. |
@@ -148,6 +164,7 @@ Expected event kinds include:
 - `step_activation_preserved`
 - `session_template_spawn_requested`
 - `session_template_spawn_failed`
+- `session_template_spawn_blocked`
 - `gate_submitted`
 - `artifact_added`
 - `finding_opened`
@@ -163,10 +180,12 @@ Expected event kinds include:
 `fixtures/project_pipelines/domain_contract.json` is the executable contract
 example. It uses synthetic IDs only and is validated by `script/test` for JSON
 shape, required relationships, standalone and workspace-linked examples,
-manifest anchors, provider capability boundaries, and PII/raw-path absence.
+manifest anchors, provider capability boundaries, selector styles, blocked
+provider diagnostics, and PII/raw-path absence.
 `script/test` also runs a headless Lua runtime harness against `plugin.lua` to
 prove CRUD persistence survives an entrypoint reload, PTY-backed step activation
-builds and stores the real hub DTO field names, optional workspace IDs stay
-metadata only, PTY-backed steps call `session_templates.spawn`, non-PTY steps
-preserve existing behavior, and app/settings surface handlers expose persisted
-project, ticket, run, and session state.
+builds and stores the real hub DTO field names, template ID/name/capability
+selectors resolve before spawn, optional workspace IDs stay metadata only,
+PTY-backed steps call `session_templates.spawn`, blocked dependencies do not
+spawn a PTY, non-PTY steps preserve existing behavior, and app/settings surface
+handlers expose persisted project, ticket, run, and session state.
