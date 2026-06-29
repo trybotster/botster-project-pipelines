@@ -232,17 +232,17 @@
       "ticket_id": "ticket_contract_define_domain",
       "template_id": "template_codex_implement",
       "session_id": "session_contract_standalone",
-      "status": "failed",
+      "status": "spawn_requested",
       "prompt_summary": "Implement the approved plan with Project Pipelines context.",
       "context_id": "context_contract_standalone",
       "result": {
-        "ok": false,
-        "error": {
-          "code": "session_template_spawn_blocked",
-          "message": "hub plugin-safe session template spawn capability is unavailable"
-        }
+        "ok": true,
+        "session_id": "session_contract_standalone",
+        "context_id": "context_contract_standalone"
       },
       "request": {
+        "template_id": "template_codex_implement",
+        "session_id": "session_contract_standalone",
         "target_id": "spawn_target_standalone",
         "cwd": null,
         "environment": {},
@@ -269,17 +269,17 @@
       "ticket_id": "ticket_contract_workspace_link",
       "template_id": "template_codex_implement",
       "session_id": "session_contract_workspace",
-      "status": "failed",
+      "status": "spawn_requested",
       "prompt_summary": "Implement with optional workspace metadata.",
       "context_id": "context_contract_workspace",
       "result": {
-        "ok": false,
-        "error": {
-          "code": "session_template_spawn_blocked",
-          "message": "hub plugin-safe session template spawn capability is unavailable"
-        }
+        "ok": true,
+        "session_id": "session_contract_workspace",
+        "context_id": "context_contract_workspace"
       },
       "request": {
+        "template_id": "template_codex_implement",
+        "session_id": "session_contract_workspace",
         "target_id": "spawn_target_workspace",
         "cwd": null,
         "environment": {},

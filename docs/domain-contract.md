@@ -27,16 +27,14 @@ and `project-pipelines.settings`.
 Project Pipelines does not create an agent runtime. For a PTY-backed step with a
 `session_template_id`, `project_pipelines.activate_step` builds a
 `DaemonSessionTemplateRequest`-shaped payload. The request uses the hub-client
-field names: `target_id`, optional `cwd`, optional `environment`, and `context`
-containing `worktree_path`, `repo_path`, `branch_name`, `prompt`, `ticket_id`,
-optional `workspace_id`, and `metadata`. `environment` and `metadata` are
-string-keyed string maps to match the hub DTO contract.
-
-Actual PTY spawn is blocked until the hub exposes a plugin-safe session-template
-spawn capability to Lua plugins (`ticket_1782523439_100928`). Until that
-dependency lands, PTY-backed activation records the request summary and returns
-`session_template_spawn_blocked`. Manual, human, command, and other non-PTY steps
-do not attempt a session-template spawn.
+field names: `template_id`, optional `session_id`, `target_id`, optional `cwd`,
+optional `environment`, and `context` containing `worktree_path`, `repo_path`,
+`branch_name`, `prompt`, `ticket_id`, optional `workspace_id`, and `metadata`.
+`environment` and `metadata` are string-keyed string maps to match the hub DTO
+contract. PTY-backed activation sends that single request table to the hub
+`session_templates.spawn` plugin capability and persists the request summary and
+returned session/context references. Manual, human, command, and other non-PTY
+steps do not attempt a session-template spawn.
 
 No workspace-owned grouping, PR lifecycle mutation, merge workflow, provider
 runtime, notification policy, or `botster-agents` class is added in this pass.
@@ -167,6 +165,6 @@ manifest anchors, provider capability boundaries, and PII/raw-path absence.
 `script/test` also runs a headless Lua runtime harness against `plugin.lua` to
 prove CRUD persistence survives an entrypoint reload, PTY-backed step activation
 builds and stores the real hub DTO field names, optional workspace IDs stay
-metadata only, non-PTY steps preserve existing behavior, the missing hub
-capability fails closed with `session_template_spawn_blocked`, and app/settings
-surface handlers expose persisted project, ticket, run, and session state.
+metadata only, PTY-backed steps call `session_templates.spawn`, non-PTY steps
+preserve existing behavior, and app/settings surface handlers expose persisted
+project, ticket, run, and session state.

@@ -209,9 +209,15 @@ local function build_session_template_request(arguments, run, ticket, project, s
 end
 
 local function spawn_session_template(template_id, session_id, request)
-  return failure("session_template_spawn_blocked", "hub plugin-safe session template spawn capability is unavailable", {
-    "ticket_1782523439_100928",
-  })
+  local capabilities = botster and botster.capabilities or {}
+  local session_templates = capabilities.session_templates
+  if not session_templates or type(session_templates.spawn) ~= "function" then
+    return failure("session_templates_unavailable", "hub session template spawn capability is unavailable")
+  end
+
+  request.template_id = template_id
+  request.session_id = session_id
+  return session_templates.spawn(request)
 end
 
 local function repository_from(arguments)
