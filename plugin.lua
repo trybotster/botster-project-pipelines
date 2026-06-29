@@ -57,6 +57,16 @@ local function failure(code, message, fields)
   }
 end
 
+local function diagnostic_failure(code, message, fields)
+  local diagnostic = fields or {}
+  diagnostic.code = code
+  diagnostic.message = message
+  return {
+    ok = false,
+    error = diagnostic,
+  }
+end
+
 local function default_state()
   return {
     schema_version = 1,
@@ -148,7 +158,155 @@ end
 local function step_uses_session_template(step)
   if type(step) ~= "table" then return false end
   local mode = step.kind or step.execution or step.run_mode or step.mode
-  return step.session_template_id and (mode == "pty" or mode == "session" or mode == "session_template")
+  if mode ~= "pty" and mode ~= "session" and mode ~= "session_template" then return false end
+  return step.session_template_id
+    or step.session_template_name
+    or step.template_name
+    or step.session_template_capability
+    or step.session_capability
+end
+
+local function session_template_selector(step)
+  if type(step) ~= "table" then return nil end
+  if type(step.session_template_id) == "string" and step.session_template_id ~= "" then
+    return { kind = "id", template_id = step.session_template_id, value = step.session_template_id }
+  end
+  local name = step.session_template_name or step.template_name
+  if type(name) == "string" and name ~= "" then
+    return { kind = "name", template_name = name, value = name }
+  end
+  local capability = step.session_template_capability or step.session_capability
+  if type(capability) == "string" and capability ~= "" then
+    return { kind = "capability", capability = capability, value = capability }
+  end
+  return nil
+end
+
+local function table_contains(values, expected)
+  if type(values) ~= "table" then return false end
+  for _, value in ipairs(values) do
+    if value == expected then return true end
+  end
+  return false
+end
+
+local function first_required_provider_dependency(step)
+  local sources = {
+    step.required_provider_dependencies,
+    step.provider_dependencies,
+    step.required_provider_capabilities,
+  }
+  for _, source in ipairs(sources) do
+    if type(source) == "table" then
+      for _, dependency in ipairs(source) do
+        if type(dependency) == "string" and dependency ~= "" then
+          return { dependency = dependency }
+        elseif type(dependency) == "table" then
+          return {
+            dependency = dependency.dependency or dependency.id or dependency.name or dependency.capability,
+            provider = dependency.provider,
+            capability = dependency.capability,
+          }
+        end
+      end
+    end
+  end
+  return nil
+end
+
+local function provider_dependency_available(dependency, capabilities)
+  if not dependency or not dependency.dependency then return true end
+  local provider_dependencies = capabilities and capabilities.provider_dependencies
+  if not provider_dependencies or type(provider_dependencies.check) ~= "function" then return false end
+  local ok_response, response = pcall(provider_dependencies.check, dependency)
+  if not ok_response or type(response) ~= "table" then return false end
+  if response.ok == false then return false end
+  if response.available == false or response.status == "blocked" then return false end
+  return true
+end
+
+local function blocked_diagnostic(code, message, fields)
+  local diagnostic = fields or {}
+  diagnostic.status = "blocked"
+  return diagnostic_failure(code, message, diagnostic)
+end
+
+local function resolve_from_list(selector, templates)
+  if type(templates) ~= "table" then return nil end
+  for _, template in ipairs(templates) do
+    if selector.kind == "name" and template.name == selector.template_name then
+      return template
+    end
+    if selector.kind == "capability" then
+      if template.capability == selector.capability or table_contains(template.capabilities, selector.capability) then
+        return template
+      end
+    end
+  end
+  return nil
+end
+
+local function resolve_session_template(selector, step, capabilities)
+  local dependency = first_required_provider_dependency(step)
+  if dependency and not provider_dependency_available(dependency, capabilities) then
+    return blocked_diagnostic("provider_dependency_missing", "required provider dependency is unavailable", {
+      dependency = dependency.dependency,
+      provider = dependency.provider,
+      capability = dependency.capability,
+      template_selector = selector,
+    })
+  end
+
+  if selector.kind == "id" then
+    return ok({ template_id = selector.template_id, selector = selector })
+  end
+
+  local session_templates = capabilities and capabilities.session_templates
+  if not session_templates then
+    return blocked_diagnostic("session_template_resolution_unavailable", "hub session template resolution capability is unavailable", {
+      template_selector = selector,
+    })
+  end
+
+  if type(session_templates.resolve) == "function" then
+    local ok_response, response = pcall(session_templates.resolve, selector)
+    if not ok_response then
+      return blocked_diagnostic("session_template_resolution_failed", tostring(response), {
+        template_selector = selector,
+      })
+    end
+    if type(response) == "table" and response.ok == false then
+      local diagnostic = response.error or response.diagnostic or {}
+      diagnostic.template_selector = diagnostic.template_selector or selector
+      diagnostic.status = diagnostic.status or "blocked"
+      return diagnostic_failure(diagnostic.code or "session_template_unavailable", diagnostic.message or "session template selector is unavailable", diagnostic)
+    end
+    local template_id = response and (response.template_id or response.id)
+    if template_id then
+      return ok({ template_id = template_id, template = response, selector = selector })
+    end
+  end
+
+  if type(session_templates.list) == "function" then
+    local ok_response, response = pcall(session_templates.list, {})
+    if not ok_response then
+      return blocked_diagnostic("session_template_resolution_failed", tostring(response), {
+        template_selector = selector,
+      })
+    end
+    local templates = response and (response.templates or response)
+    local template = resolve_from_list(selector, templates)
+    if template and (template.template_id or template.id) then
+      return ok({ template_id = template.template_id or template.id, template = template, selector = selector })
+    end
+    return blocked_diagnostic("session_template_unavailable", "no hub session template matched selector", {
+      template_selector = selector,
+    })
+  end
+
+  return blocked_diagnostic("session_template_resolution_unavailable", "hub session template resolution capability is unavailable", {
+    template_selector = selector,
+  })
 end
 
 local function bounded_prompt(prompt)
@@ -208,14 +366,14 @@ local function build_session_template_request(arguments, run, ticket, project, s
   }
 end
 
-local function spawn_session_template(template_id, session_id, request)
+local function spawn_session_template(resolved_template, session_id, request)
   local capabilities = botster and botster.capabilities or {}
   local session_templates = capabilities.session_templates
   if not session_templates or type(session_templates.spawn) ~= "function" then
     return failure("session_templates_unavailable", "hub session template spawn capability is unavailable")
   end
 
-  request.template_id = template_id
+  request.template_id = resolved_template.template_id
   request.session_id = session_id
   local ok_response, response = pcall(session_templates.spawn, request)
   if not ok_response then
@@ -430,14 +588,46 @@ local function activate_step(arguments)
   if not request.target_id or request.target_id == "" then
     return failure("validation_failed", "spawn target is required for session-template activation", { "target_id" })
   end
-  local response = spawn_session_template(step.session_template_id, session_id, request)
+  local selector = session_template_selector(step)
+  local resolved = resolve_session_template(selector, step, botster and botster.capabilities or {})
+  if resolved and resolved.ok == false then
+    local session_request = {
+      id = request_id,
+      run_id = run.id,
+      step_id = step.id,
+      ticket_id = ticket.id,
+      template_id = selector and selector.template_id,
+      template_selector = selector,
+      session_id = session_id,
+      status = "blocked",
+      request = request,
+      result = resolved,
+      diagnostic = resolved.error,
+      prompt_summary = bounded_prompt(request.context and request.context.prompt),
+    }
+    table.insert(state.session_requests, session_request)
+    run.session_request_id = session_request.id
+    run.blocked_reason = resolved.error and resolved.error.message
+    run.diagnostic = resolved.error
+    push_event(state, "session_template_spawn_blocked", run.id, session_request.id, {
+      template_selector = selector,
+      status = "blocked",
+      diagnostic = resolved.error,
+    })
+    local err = save_state(state)
+    if err then return err end
+    return resolved
+  end
+
+  local response = spawn_session_template(resolved, session_id, request)
   local status = response and response.ok == false and "failed" or "spawn_requested"
   local session_request = {
     id = request_id,
     run_id = run.id,
     step_id = step.id,
     ticket_id = ticket.id,
-    template_id = step.session_template_id,
+    template_id = resolved.template_id,
+    template_selector = selector,
     session_id = session_id or response and (response.session_id or response.session_uuid),
     status = status,
     request = request,
@@ -450,7 +640,8 @@ local function activate_step(arguments)
   run.session_id = session_request.session_id
   local event_kind = status == "failed" and "session_template_spawn_failed" or "session_template_spawn_requested"
   push_event(state, event_kind, run.id, session_request.id, {
-    template_id = step.session_template_id,
+    template_id = resolved.template_id,
+    template_selector = selector,
     session_id = session_request.session_id,
     status = status,
   })

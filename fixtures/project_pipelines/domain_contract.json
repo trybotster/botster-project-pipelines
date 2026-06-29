@@ -163,9 +163,39 @@
           ]
         },
         {
+          "id": "step_review_agent",
+          "name": "Review Agent",
+          "position": 3,
+          "kind": "pty",
+          "session_template_name": "Codex Review",
+          "gates": []
+        },
+        {
+          "id": "step_verify_agent",
+          "name": "Verify Agent",
+          "position": 4,
+          "kind": "pty",
+          "session_template_capability": "project-pipelines.verify",
+          "gates": []
+        },
+        {
+          "id": "step_provider_blocked",
+          "name": "Provider Blocked",
+          "position": 5,
+          "kind": "pty",
+          "session_template_id": "template_codex_implement",
+          "required_provider_dependencies": [
+            {
+              "provider": "github",
+              "dependency": "github_auth"
+            }
+          ],
+          "gates": []
+        },
+        {
           "id": "step_review",
           "name": "Review",
-          "position": 3,
+          "position": 6,
           "kind": "manual",
           "gates": [
             {
@@ -231,6 +261,11 @@
       "step_id": "step_implement",
       "ticket_id": "ticket_contract_define_domain",
       "template_id": "template_codex_implement",
+      "template_selector": {
+        "kind": "id",
+        "template_id": "template_codex_implement",
+        "value": "template_codex_implement"
+      },
       "session_id": "session_contract_standalone",
       "status": "spawn_requested",
       "prompt_summary": "Implement the approved plan with Project Pipelines context.",
@@ -270,6 +305,11 @@
       "step_id": "step_implement",
       "ticket_id": "ticket_contract_workspace_link",
       "template_id": "template_codex_implement",
+      "template_selector": {
+        "kind": "id",
+        "template_id": "template_codex_implement",
+        "value": "template_codex_implement"
+      },
       "session_id": "session_contract_workspace",
       "status": "spawn_requested",
       "prompt_summary": "Implement with optional workspace metadata.",
@@ -299,6 +339,145 @@
             "surface": "project-pipelines",
             "run_id": "run_contract_workspace",
             "step_id": "step_implement"
+          }
+        }
+      }
+    },
+    {
+      "id": "session_request_contract_name",
+      "run_id": "run_contract_standalone",
+      "step_id": "step_review_agent",
+      "ticket_id": "ticket_contract_define_domain",
+      "template_id": "template_codex_review",
+      "template_selector": {
+        "kind": "name",
+        "template_name": "Codex Review",
+        "value": "Codex Review"
+      },
+      "session_id": "session_contract_name",
+      "status": "spawn_requested",
+      "prompt_summary": "Review the implementation.",
+      "context_id": "context_contract_name",
+      "result": {
+        "session_id": "session_contract_name",
+        "lifecycle": "spawned",
+        "template_id": "template_codex_review",
+        "context_id": "context_contract_name",
+        "context_keys": ["ticket_id", "metadata"]
+      },
+      "request": {
+        "template_id": "template_codex_review",
+        "session_id": "session_contract_name",
+        "target_id": "spawn_target_standalone",
+        "cwd": null,
+        "environment": {},
+        "context": {
+          "worktree_path": "worktree://contract-standalone",
+          "repo_path": "repo://standalone-contract",
+          "branch_name": "project-pipelines/contract-domain",
+          "prompt": "Review the implementation.",
+          "ticket_id": "ticket_contract_define_domain",
+          "workspace_id": null,
+          "metadata": {
+            "owner_plugin": "project-pipelines",
+            "surface": "project-pipelines",
+            "run_id": "run_contract_standalone",
+            "step_id": "step_review_agent"
+          }
+        }
+      }
+    },
+    {
+      "id": "session_request_contract_capability",
+      "run_id": "run_contract_standalone",
+      "step_id": "step_verify_agent",
+      "ticket_id": "ticket_contract_define_domain",
+      "template_id": "template_codex_verify",
+      "template_selector": {
+        "kind": "capability",
+        "capability": "project-pipelines.verify",
+        "value": "project-pipelines.verify"
+      },
+      "session_id": "session_contract_capability",
+      "status": "spawn_requested",
+      "prompt_summary": "Verify the implementation.",
+      "context_id": "context_contract_capability",
+      "result": {
+        "session_id": "session_contract_capability",
+        "lifecycle": "spawned",
+        "template_id": "template_codex_verify",
+        "context_id": "context_contract_capability",
+        "context_keys": ["ticket_id", "metadata"]
+      },
+      "request": {
+        "template_id": "template_codex_verify",
+        "session_id": "session_contract_capability",
+        "target_id": "spawn_target_standalone",
+        "cwd": null,
+        "environment": {},
+        "context": {
+          "worktree_path": "worktree://contract-standalone",
+          "repo_path": "repo://standalone-contract",
+          "branch_name": "project-pipelines/contract-domain",
+          "prompt": "Verify the implementation.",
+          "ticket_id": "ticket_contract_define_domain",
+          "workspace_id": null,
+          "metadata": {
+            "owner_plugin": "project-pipelines",
+            "surface": "project-pipelines",
+            "run_id": "run_contract_standalone",
+            "step_id": "step_verify_agent"
+          }
+        }
+      }
+    },
+    {
+      "id": "session_request_contract_provider_blocked",
+      "run_id": "run_contract_standalone",
+      "step_id": "step_provider_blocked",
+      "ticket_id": "ticket_contract_define_domain",
+      "template_id": "template_codex_implement",
+      "template_selector": {
+        "kind": "id",
+        "template_id": "template_codex_implement",
+        "value": "template_codex_implement"
+      },
+      "session_id": null,
+      "status": "blocked",
+      "prompt_summary": "Implement the approved plan with Project Pipelines context.",
+      "diagnostic": {
+        "status": "blocked",
+        "code": "provider_dependency_missing",
+        "message": "required provider dependency is unavailable",
+        "provider": "github",
+        "dependency": "github_auth"
+      },
+      "result": {
+        "ok": false,
+        "error": {
+          "status": "blocked",
+          "code": "provider_dependency_missing",
+          "message": "required provider dependency is unavailable",
+          "provider": "github",
+          "dependency": "github_auth"
+        }
+      },
+      "request": {
+        "target_id": "spawn_target_standalone",
+        "cwd": null,
+        "environment": {},
+        "context": {
+          "worktree_path": "worktree://contract-standalone",
+          "repo_path": "repo://standalone-contract",
+          "branch_name": "project-pipelines/contract-domain",
+          "prompt": "Implement the approved plan with Project Pipelines context.",
+          "ticket_id": "ticket_contract_define_domain",
+          "workspace_id": null,
+          "metadata": {
+            "owner_plugin": "project-pipelines",
+            "surface": "project-pipelines",
+            "run_id": "run_contract_standalone",
+            "step_id": "step_provider_blocked"
           }
         }
       }
@@ -374,6 +553,12 @@
       "run_id": "run_contract_standalone",
       "kind": "session_template_spawn_requested",
       "subject_id": "session_request_contract_standalone"
+    },
+    {
+      "id": "event_contract_session_blocked",
+      "run_id": "run_contract_standalone",
+      "kind": "session_template_spawn_blocked",
+      "subject_id": "session_request_contract_provider_blocked"
     },
     {
       "id": "event_contract_manual_preserved",
