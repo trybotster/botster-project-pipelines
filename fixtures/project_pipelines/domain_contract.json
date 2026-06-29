@@ -12,7 +12,7 @@
       "home": "project-pipelines.home",
       "settings": "project-pipelines.settings"
     },
-    "runtime": "minimal_crud_lua_plugin"
+    "runtime": "session_template_lua_plugin"
   },
   "domain_objects": [
     "project",
@@ -25,6 +25,7 @@
     "question",
     "answer",
     "run",
+    "session_request",
     "pr_link",
     "provider_lifecycle_boundary",
     "event"
@@ -37,6 +38,7 @@
       "steps",
       "gates",
       "runs",
+      "session_requests",
       "artifacts",
       "findings",
       "questions",
@@ -65,7 +67,8 @@
         "spawn_target_id",
         "branch_context",
         "worktree_context",
-        "agent_session_lifecycle",
+        "session_template_spawn",
+        "hub_session_lifecycle",
         "pr_link_lifecycle",
         "artifact_persistence",
         "finding_persistence",
@@ -75,6 +78,7 @@
       "forbidden_runtime_imports": [
         "github",
         "codex",
+        "botster-agents",
         "botster-workspaces"
       ]
     }
@@ -133,6 +137,7 @@
           "id": "step_plan",
           "name": "Plan",
           "position": 1,
+          "kind": "manual",
           "gates": [
             {
               "id": "gate_plan_reviewable",
@@ -145,6 +150,9 @@
           "id": "step_implement",
           "name": "Implement",
           "position": 2,
+          "kind": "pty",
+          "session_template_id": "template_codex_implement",
+          "prompt": "Implement the approved plan with Project Pipelines context.",
           "gates": [
             {
               "id": "gate_implement_tests",
@@ -158,6 +166,7 @@
           "id": "step_review",
           "name": "Review",
           "position": 3,
+          "kind": "manual",
           "gates": [
             {
               "id": "gate_review_clear",
@@ -177,6 +186,14 @@
       "current_step_id": "step_implement",
       "status": "active",
       "workspace_session_group_id": null,
+      "workspace_id": null,
+      "repository": {
+        "id": "repo_standalone_contract",
+        "name": "example/project-pipelines-standalone",
+        "remote": "https://example.invalid/project-pipelines-standalone.git",
+        "path": "repo://standalone-contract"
+      },
+      "spawn_target_id": "spawn_target_standalone",
       "branch": "project-pipelines/contract-domain",
       "base_ref": "main",
       "worktree": {
@@ -191,11 +208,99 @@
       "current_step_id": "step_plan",
       "status": "active",
       "workspace_session_group_id": "workspace_session_group_alpha",
+      "workspace_id": "workspace_contract_alpha",
+      "repository": {
+        "id": "repo_workspace_contract",
+        "name": "example/project-pipelines-workspace",
+        "remote": "https://example.invalid/project-pipelines-workspace.git",
+        "path": "repo://workspace-contract"
+      },
+      "spawn_target_id": "spawn_target_workspace",
       "branch": "project-pipelines/workspace-contract",
       "base_ref": "main",
       "worktree": {
         "kind": "provider_owned_reference",
         "id": "worktree_contract_workspace"
+      }
+    }
+  ],
+  "session_requests": [
+    {
+      "id": "session_request_contract_standalone",
+      "run_id": "run_contract_standalone",
+      "step_id": "step_implement",
+      "ticket_id": "ticket_contract_define_domain",
+      "template_id": "template_codex_implement",
+      "session_id": "session_contract_standalone",
+      "status": "spawn_requested",
+      "prompt_summary": "Implement the approved plan with Project Pipelines context.",
+      "context_id": "context_contract_standalone",
+      "result": {
+        "session_id": "session_contract_standalone",
+        "lifecycle": "spawned",
+        "template_id": "template_codex_implement",
+        "context_id": "context_contract_standalone",
+        "context_keys": ["ticket_id", "metadata"]
+      },
+      "request": {
+        "template_id": "template_codex_implement",
+        "session_id": "session_contract_standalone",
+        "target_id": "spawn_target_standalone",
+        "cwd": null,
+        "environment": {},
+        "context": {
+          "worktree_path": "worktree://contract-standalone",
+          "repo_path": "repo://standalone-contract",
+          "branch_name": "project-pipelines/contract-domain",
+          "prompt": "Implement the approved plan with Project Pipelines context.",
+          "ticket_id": "ticket_contract_define_domain",
+          "workspace_id": null,
+          "metadata": {
+            "owner_plugin": "project-pipelines",
+            "surface": "project-pipelines",
+            "run_id": "run_contract_standalone",
+            "step_id": "step_implement"
+          }
+        }
+      }
+    },
+    {
+      "id": "session_request_contract_workspace",
+      "run_id": "run_contract_workspace",
+      "step_id": "step_implement",
+      "ticket_id": "ticket_contract_workspace_link",
+      "template_id": "template_codex_implement",
+      "session_id": "session_contract_workspace",
+      "status": "spawn_requested",
+      "prompt_summary": "Implement with optional workspace metadata.",
+      "context_id": "context_contract_workspace",
+      "result": {
+        "session_id": "session_contract_workspace",
+        "lifecycle": "spawned",
+        "template_id": "template_codex_implement",
+        "context_id": "context_contract_workspace",
+        "context_keys": ["ticket_id", "metadata"]
+      },
+      "request": {
+        "template_id": "template_codex_implement",
+        "session_id": "session_contract_workspace",
+        "target_id": "spawn_target_workspace",
+        "cwd": null,
+        "environment": {},
+        "context": {
+          "worktree_path": "worktree://contract-workspace",
+          "repo_path": "repo://workspace-contract",
+          "branch_name": "project-pipelines/workspace-contract",
+          "prompt": "Implement with optional workspace metadata.",
+          "ticket_id": "ticket_contract_workspace_link",
+          "workspace_id": "workspace_contract_alpha",
+          "metadata": {
+            "owner_plugin": "project-pipelines",
+            "surface": "project-pipelines",
+            "run_id": "run_contract_workspace",
+            "step_id": "step_implement"
+          }
+        }
       }
     }
   ],
@@ -263,6 +368,18 @@
       "run_id": "run_contract_standalone",
       "kind": "run_started",
       "subject_id": "run_contract_standalone"
+    },
+    {
+      "id": "event_contract_session_spawn",
+      "run_id": "run_contract_standalone",
+      "kind": "session_template_spawn_requested",
+      "subject_id": "session_request_contract_standalone"
+    },
+    {
+      "id": "event_contract_manual_preserved",
+      "run_id": "run_contract_standalone",
+      "kind": "step_activation_preserved",
+      "subject_id": "step_review"
     },
     {
       "id": "event_contract_gate_submitted",

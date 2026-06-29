@@ -68,6 +68,7 @@ local function default_state()
       artifact = 0,
       question = 0,
       event = 0,
+      session_request = 0,
     },
     projects = {},
     tickets = {},
@@ -76,6 +77,7 @@ local function default_state()
     artifacts = {},
     questions = {},
     events = {},
+    session_requests = {},
   }
 end
 
@@ -95,6 +97,7 @@ local function load_state()
   state.artifacts = state.artifacts or {}
   state.questions = state.questions or {}
   state.events = state.events or {}
+  state.session_requests = state.session_requests or {}
   return state
 end
 
@@ -119,13 +122,106 @@ local function find_by_id(records, id)
   return nil
 end
 
-local function push_event(state, kind, run_id, subject_id)
+local function push_event(state, kind, run_id, subject_id, payload)
   table.insert(state.events, {
     id = next_id(state, "event"),
     kind = kind,
     run_id = run_id,
     subject_id = subject_id,
+    payload = payload,
   })
+end
+
+local function find_project_for_ticket(state, ticket)
+  if not ticket then return nil end
+  return find_by_id(state.projects, ticket.project_id)
+end
+
+local function find_pipeline_step(pipeline, step_id)
+  if not pipeline then return nil end
+  for _, step in ipairs(array(pipeline.steps)) do
+    if step.id == step_id then return step end
+  end
+  return nil
+end
+
+local function step_uses_session_template(step)
+  if type(step) ~= "table" then return false end
+  local mode = step.kind or step.execution or step.run_mode or step.mode
+  return step.session_template_id and (mode == "pty" or mode == "session" or mode == "session_template")
+end
+
+local function bounded_prompt(prompt)
+  if type(prompt) ~= "string" then return nil end
+  if #prompt <= 500 then return prompt end
+  return prompt:sub(1, 497) .. "..."
+end
+
+local function clean_string_map(values)
+  local result = {}
+  if type(values) ~= "table" then return result end
+  for key, value in pairs(values) do
+    if type(key) == "string" and type(value) == "string" then
+      result[key] = value
+    end
+  end
+  return result
+end
+
+local function context_value(arguments, run, ticket, project, step, key)
+  local explicit = arguments and arguments[key]
+  if explicit ~= nil then return explicit end
+  if run and run[key] ~= nil then return run[key] end
+  if ticket and ticket[key] ~= nil then return ticket[key] end
+  if project and project[key] ~= nil then return project[key] end
+  if step and step[key] ~= nil then return step[key] end
+  return nil
+end
+
+local function build_session_template_request(arguments, run, ticket, project, step)
+  local repository = context_value(arguments, run, ticket, project, step, "repository")
+  local worktree = context_value(arguments, run, ticket, project, step, "worktree")
+  local prompt = bounded_prompt(context_value(arguments, run, ticket, project, step, "prompt"))
+  local metadata = clean_string_map(context_value(arguments, run, ticket, project, step, "metadata"))
+  metadata.owner_plugin = metadata.owner_plugin or "project-pipelines"
+  metadata.surface = metadata.surface or "project-pipelines"
+  metadata.run_id = run.id
+  metadata.step_id = step.id
+  metadata.ticket_id = ticket.id
+
+  local context = {
+    worktree_path = type(worktree) == "table" and worktree.path or nil,
+    repo_path = type(repository) == "table" and repository.path or nil,
+    branch_name = context_value(arguments, run, ticket, project, step, "branch") or run.branch,
+    prompt = prompt,
+    ticket_id = ticket.id,
+    workspace_id = context_value(arguments, run, ticket, project, step, "workspace_id"),
+    metadata = metadata,
+  }
+  if context.workspace_id == nil then context.workspace_id = project.workspace_id or ticket.workspace_id end
+
+  return {
+    target_id = context_value(arguments, run, ticket, project, step, "spawn_target_id") or project.spawn_target_id,
+    cwd = context_value(arguments, run, ticket, project, step, "cwd"),
+    environment = clean_string_map(context_value(arguments, run, ticket, project, step, "environment")),
+    context = context,
+  }
+end
+
+local function spawn_session_template(template_id, session_id, request)
+  local capabilities = botster and botster.capabilities or {}
+  local session_templates = capabilities.session_templates
+  if not session_templates or type(session_templates.spawn) ~= "function" then
+    return failure("session_templates_unavailable", "hub session template spawn capability is unavailable")
+  end
+
+  request.template_id = template_id
+  request.session_id = session_id
+  local ok_response, response = pcall(session_templates.spawn, request)
+  if not ok_response then
+    return failure("session_template_spawn_failed", tostring(response))
+  end
+  return response
 end
 
 local function repository_from(arguments)
@@ -280,6 +376,9 @@ local function record_run(arguments)
     current_step_id = string_arg(arguments, "current_step_id") or first_step.id,
     status = string_arg(arguments, "status") or "active",
     workspace_session_group_id = string_arg(arguments, "workspace_session_group_id"),
+    workspace_id = string_arg(arguments, "workspace_id"),
+    repository = arguments.repository,
+    spawn_target_id = string_arg(arguments, "spawn_target_id"),
     branch = string_arg(arguments, "branch"),
     base_ref = string_arg(arguments, "base_ref") or "main",
     worktree = arguments.worktree or { kind = "provider_owned_reference", id = string_arg(arguments, "worktree_id") },
@@ -289,6 +388,76 @@ local function record_run(arguments)
   local err = save_state(state)
   if err then return err end
   return ok({ run = run })
+end
+
+local function activate_step(arguments)
+  arguments = arguments or {}
+  local run_id = trim(arguments.run_id)
+  if not run_id or run_id == "" then return failure("validation_failed", "run_id is required", { "run_id" }) end
+  local state = load_state()
+  local run = find_by_id(state.runs, run_id)
+  if not run then return failure("not_found", "run not found: " .. run_id) end
+  local ticket = find_by_id(state.tickets, run.ticket_id)
+  if not ticket then return failure("not_found", "ticket not found: " .. run.ticket_id) end
+  local project = find_project_for_ticket(state, ticket)
+  if not project then return failure("not_found", "project not found: " .. ticket.project_id) end
+  local pipeline = find_by_id(state.pipeline_definitions, run.pipeline_definition_id)
+  if not pipeline then return failure("not_found", "pipeline definition not found: " .. run.pipeline_definition_id) end
+  local step_id = string_arg(arguments, "step_id") or run.current_step_id
+  local step = find_pipeline_step(pipeline, step_id)
+  if not step then return failure("not_found", "step not found: " .. tostring(step_id)) end
+
+  run.current_step_id = step.id
+  push_event(state, "step_started", run.id, step.id)
+
+  if not step_uses_session_template(step) then
+    local activation = {
+      run_id = run.id,
+      step_id = step.id,
+      spawned = false,
+      status = "preserved_non_pty",
+      reason = "step is not a PTY-backed session-template step",
+    }
+    push_event(state, "step_activation_preserved", run.id, step.id, activation)
+    local err = save_state(state)
+    if err then return err end
+    return ok({ activation = activation, run = run })
+  end
+
+  local request_id = string_arg(arguments, "request_id") or next_id(state, "session_request")
+  local session_id = string_arg(arguments, "session_id")
+  local request = build_session_template_request(arguments, run, ticket, project, step)
+  if not request.target_id or request.target_id == "" then
+    return failure("validation_failed", "spawn target is required for session-template activation", { "target_id" })
+  end
+  local response = spawn_session_template(step.session_template_id, session_id, request)
+  local status = response and response.ok == false and "failed" or "spawn_requested"
+  local session_request = {
+    id = request_id,
+    run_id = run.id,
+    step_id = step.id,
+    ticket_id = ticket.id,
+    template_id = step.session_template_id,
+    session_id = session_id or response and (response.session_id or response.session_uuid),
+    status = status,
+    request = request,
+    result = response,
+    prompt_summary = bounded_prompt(request.context and request.context.prompt),
+    context_id = response and response.context_id,
+  }
+  table.insert(state.session_requests, session_request)
+  run.session_request_id = session_request.id
+  run.session_id = session_request.session_id
+  local event_kind = status == "failed" and "session_template_spawn_failed" or "session_template_spawn_requested"
+  push_event(state, event_kind, run.id, session_request.id, {
+    template_id = step.session_template_id,
+    session_id = session_request.session_id,
+    status = status,
+  })
+  local err = save_state(state)
+  if err then return err end
+  if response and response.ok == false then return response end
+  return ok({ activation = session_request, run = run })
 end
 
 local function record_artifact(arguments)
@@ -345,6 +514,7 @@ local function current_context()
     artifacts = state.artifacts,
     questions = state.questions,
     events = state.events,
+    session_requests = state.session_requests,
   })
 end
 
@@ -365,6 +535,7 @@ local function entities()
   emit("ticket", context.tickets)
   emit("pipeline_definition", context.pipeline_definitions)
   emit("run", context.runs)
+  emit("session_request", context.session_requests)
   return ok({ frames = frames })
 end
 
@@ -411,11 +582,13 @@ local function render_home()
         projects = #context.projects,
         tickets = #context.tickets,
         runs = #context.runs,
+        sessions = #context.session_requests,
       },
       bindings = {
         { family = "project-pipelines.project" },
         { family = "project-pipelines.ticket" },
         { family = "project-pipelines.run" },
+        { family = "project-pipelines.session_request" },
       },
     },
     children = {
@@ -450,6 +623,7 @@ local function render_settings()
         tickets = #context.tickets,
         pipeline_definitions = #context.pipeline_definitions,
         runs = #context.runs,
+        sessions = #context.session_requests,
         artifacts = #context.artifacts,
         questions = #context.questions,
       },
@@ -471,7 +645,8 @@ return botster.register({
     { name = "project_pipelines.define_pipeline", description = "Define a simple Project Pipelines template.", input_schema = object_schema({ project_id = { type = "string" }, name = { type = "string" }, steps = { type = "array" } }, { "project_id", "name" }), handler = "define_pipeline", call = define_pipeline },
     { name = "project_pipelines.list_pipeline_definitions", description = "List Project Pipelines templates.", input_schema = empty_schema(), handler = "list_pipeline_definitions", call = list_pipeline_definitions },
     { name = "project_pipelines.show_pipeline_definition", description = "Show one Project Pipelines template.", input_schema = object_schema({ pipeline_definition_id = { type = "string" } }, { "pipeline_definition_id" }), handler = "show_pipeline_definition", call = show_pipeline_definition },
-    { name = "project_pipelines.record_run", description = "Record a Project Pipelines run skeleton.", input_schema = object_schema({ ticket_id = { type = "string" }, pipeline_definition_id = { type = "string" }, current_step_id = { type = "string" }, status = { type = "string" }, workspace_session_group_id = { type = "string" }, branch = { type = "string" }, base_ref = { type = "string" }, worktree = { type = "object" }, worktree_id = { type = "string" } }, { "ticket_id", "pipeline_definition_id" }), handler = "record_run", call = record_run },
+    { name = "project_pipelines.record_run", description = "Record a Project Pipelines run skeleton.", input_schema = object_schema({ ticket_id = { type = "string" }, pipeline_definition_id = { type = "string" }, current_step_id = { type = "string" }, status = { type = "string" }, workspace_session_group_id = { type = "string" }, workspace_id = { type = "string" }, repository = { type = "object" }, spawn_target_id = { type = "string" }, branch = { type = "string" }, base_ref = { type = "string" }, worktree = { type = "object" }, worktree_id = { type = "string" } }, { "ticket_id", "pipeline_definition_id" }), handler = "record_run", call = record_run },
+    { name = "project_pipelines.activate_step", description = "Activate a run step and spawn a hub session template for PTY-backed steps.", input_schema = object_schema({ run_id = { type = "string" }, step_id = { type = "string" }, request_id = { type = "string" }, session_id = { type = "string" }, repository = { type = "object" }, spawn_target_id = { type = "string" }, branch = { type = "string" }, worktree = { type = "object" }, workspace_id = { type = "string" }, prompt = { type = "string" }, cwd = { type = "string" }, environment = { type = "object" }, metadata = { type = "object" } }, { "run_id" }), handler = "activate_step", call = activate_step },
     { name = "project_pipelines.record_artifact", description = "Record a Project Pipelines artifact.", input_schema = object_schema({ run_id = { type = "string" }, step_id = { type = "string" }, kind = { type = "string" }, summary = { type = "string" }, uri = { type = "string" } }, { "run_id" }), handler = "record_artifact", call = record_artifact },
     { name = "project_pipelines.record_question", description = "Record a Project Pipelines question.", input_schema = object_schema({ run_id = { type = "string" }, ticket_id = { type = "string" }, step_id = { type = "string" }, status = { type = "string" }, question = { type = "string" } }, { "run_id", "question" }), handler = "record_question", call = record_question },
     { name = "project_pipelines.current_context", description = "Return persisted Project Pipelines context.", input_schema = empty_schema(), handler = "current_context", call = current_context },

@@ -6,11 +6,11 @@ This package is intended to own project pipeline state, tickets, runs, gates,
 questions, artifacts, findings, and provider-mediated PR lifecycle behavior as a
 self-contained Botster plugin.
 
-This repository is currently a minimal production-shaped Project Pipelines
-plugin. It declares the package identity, compatibility, Lua entrypoint,
-configuration schema placeholder, MCP/plugin database capabilities, and
-app/settings surface descriptors needed for local package install and discovery.
-It does not port the Project Pipelines workflow execution engine yet.
+This repository is a production-shaped Project Pipelines plugin. It declares the
+package identity, compatibility, Lua entrypoint, configuration schema
+placeholder, MCP/plugin database capabilities, and app/settings surface
+descriptors needed for local package install and discovery. Workflow state stays
+in the plugin; PTY execution is requested from hub-owned session templates.
 
 ## Domain Contract
 
@@ -23,15 +23,21 @@ persistence ownership.
 The executable contract fixture is
 [`fixtures/project_pipelines/domain_contract.json`](fixtures/project_pipelines/domain_contract.json).
 `script/test` validates the fixture relationships, standalone mode, optional
-workspace-linked mode, provider capability boundaries, manifest anchors, and
-PII/raw-path absence. It also loads the production `plugin.lua` entrypoint with
-Botster capability stubs, creates persisted records, reloads the entrypoint, and
-proves the app and settings surfaces expose the persisted project/ticket state.
+workspace-linked mode, session-template request shape, provider capability
+boundaries, manifest anchors, and PII/raw-path absence. It also loads the
+production `plugin.lua` entrypoint with Botster capability stubs, creates
+persisted records, activates PTY and non-PTY steps, reloads the entrypoint, and
+proves the app and settings surfaces expose persisted project/ticket/run/session
+state.
 
-Runtime behavior is intentionally minimal in this pass: `plugin.lua` registers
-CRUD tools and app/settings surface handlers, the manifest configuration schema
-is intentionally empty, and provider or workspace integrations are contract
-references rather than runtime imports.
+Runtime behavior is intentionally narrow in this pass: `plugin.lua` registers
+workflow CRUD tools, a `project_pipelines.activate_step` tool, and app/settings
+surface handlers. PTY-backed steps with `session_template_id` build and persist
+`DaemonSessionTemplateRequest` field names, add `template_id` and optional
+`session_id`, and call the hub `session_templates.spawn` plugin capability.
+Manual, human, command, and other non-PTY steps do not spawn sessions. The
+manifest configuration schema is intentionally empty, and provider or workspace
+integrations are contract references rather than runtime imports.
 
 ## UI Contract
 
@@ -42,8 +48,10 @@ such as `project-pipelines.project`, `project-pipelines.ticket`, and
 `project-pipelines.run`.
 
 Dynamic model state belongs in plugin-owned entity output. Surface snapshots
-should stay structural and declare bindings for project, ticket, and run lists
-instead of becoming a raw HTML or provider-specific data transport.
+should stay structural and declare bindings for project, ticket, run, and
+session request lists instead of becoming a raw HTML or provider-specific data
+transport. UI vocabulary should refer to sessions, templates, and accessories,
+not a separate execution or agent runtime class.
 
 ## Local Development
 

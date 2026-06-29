@@ -54,7 +54,7 @@ assert anchors["surfaces"] == {
 }
 assert anchors["surfaces"]["home"] in surfaces
 assert anchors["surfaces"]["settings"] in surfaces
-assert anchors["runtime"] == "minimal_crud_lua_plugin"
+assert anchors["runtime"] == "session_template_lua_plugin"
 
 required_domain_objects = {
     "project",
@@ -67,6 +67,7 @@ required_domain_objects = {
     "question",
     "answer",
     "run",
+    "session_request",
     "pr_link",
     "provider_lifecycle_boundary",
     "event",
@@ -77,6 +78,7 @@ projects = {project["id"]: project for project in contract["projects"]}
 tickets = {ticket["id"]: ticket for ticket in contract["tickets"]}
 pipelines = {pipeline["id"]: pipeline for pipeline in contract["pipeline_definitions"]}
 runs = {run["id"]: run for run in contract["runs"]}
+session_requests = {request["id"]: request for request in contract["session_requests"]}
 artifacts = {artifact["id"]: artifact for artifact in contract["artifacts"]}
 questions = {question["id"]: question for question in contract["questions"]}
 gate_ids = {
@@ -123,6 +125,28 @@ for run in runs.values():
         assert run["workspace_session_group_id"] is None
     else:
         assert run["workspace_session_group_id"]
+        assert run["workspace_id"]
+
+for request in session_requests.values():
+    assert request["run_id"] in runs
+    assert request["step_id"] in step_ids
+    assert request["ticket_id"] in tickets
+    assert request["template_id"]
+    assert request["session_id"]
+    assert request["status"] == "spawn_requested"
+    assert request["result"]["session_id"] == request["session_id"]
+    assert request["result"]["template_id"] == request["template_id"]
+    assert request["result"]["context_id"]
+    daemon_request = request["request"]
+    assert set(daemon_request) == {"template_id", "session_id", "target_id", "cwd", "environment", "context"}
+    assert daemon_request["template_id"] == request["template_id"]
+    assert daemon_request["session_id"] == request["session_id"]
+    assert daemon_request["target_id"]
+    context = daemon_request["context"]
+    for field in ["worktree_path", "repo_path", "branch_name", "prompt", "ticket_id", "workspace_id", "metadata"]:
+        assert field in context
+    assert context["ticket_id"] == request["ticket_id"]
+    assert context["metadata"]["owner_plugin"] == "project-pipelines"
 
 for result in contract["gate_results"]:
     assert result["run_id"] in runs
@@ -156,6 +180,9 @@ for event in contract["events"]:
         "ticket_created",
         "run_started",
         "step_started",
+        "step_activation_preserved",
+        "session_template_spawn_requested",
+        "session_template_spawn_failed",
         "gate_submitted",
         "artifact_added",
         "finding_opened",
@@ -169,6 +196,7 @@ for event in contract["events"]:
 
 assert contract["persistence_boundaries"]["runtime_storage_namespace"] == "plugin-data/project-pipelines"
 assert "botster-workspaces" in contract["provider_capabilities"][0]["forbidden_runtime_imports"]
+assert "botster-agents" in contract["provider_capabilities"][0]["forbidden_runtime_imports"]
 assert "github" in contract["provider_capabilities"][0]["forbidden_runtime_imports"]
 assert "codex" in contract["provider_capabilities"][0]["forbidden_runtime_imports"]
 
@@ -179,7 +207,8 @@ required_doc_phrases = [
     "plugin-data/project-pipelines",
     "project-pipelines.home",
     "project-pipelines.settings",
-    "minimal local CRUD",
+    "session_templates.spawn",
+    "DaemonSessionTemplateRequest",
     "plugin database capability",
 ]
 for phrase in required_doc_phrases:
@@ -234,6 +263,8 @@ for path in runtime_files:
         'require("codex',
         "require('botster-workspaces",
         'require("botster-workspaces',
+        "require('botster-agents",
+        'require("botster-agents',
         "github.com/",
         "api.github.com",
     ]
@@ -256,6 +287,9 @@ local function deep_copy(value)
   return result
 end
 
+local spawned_session_templates = {}
+local fail_next_spawn_error = nil
+
 botster = {
   capabilities = {
     plugin_db = {
@@ -274,6 +308,36 @@ botster = {
         return { ok = true }
       end,
     },
+    session_templates = {
+      spawn = function(args)
+        assert(type(args) == "table", "session_templates.spawn must receive one request table")
+        assert(args.template_id == "template_codex_runtime" or args.template_id == "template_workspace_runtime", "spawn request must carry template_id")
+        assert(args.session_id == nil or type(args.session_id) == "string", "spawn request session_id must be optional string")
+        assert(type(args.target_id) == "string" and args.target_id ~= "", "spawn request must carry target_id")
+        assert(type(args.context) == "table", "spawn request must carry context")
+        assert(args.context.ticket_id == "ticket_runtime_one" or args.context.ticket_id == "ticket_runtime_workspace", "spawn context must carry ticket_id")
+        assert(type(args.context.metadata) == "table", "spawn context must carry metadata")
+        for key, value in pairs(args.environment or {}) do
+          assert(type(key) == "string" and type(value) == "string", "spawn environment must be string keyed string values")
+        end
+        for key, value in pairs(args.context.metadata) do
+          assert(type(key) == "string" and type(value) == "string", "spawn metadata must be string keyed string values")
+        end
+        if fail_next_spawn_error then
+          local message = fail_next_spawn_error
+          fail_next_spawn_error = nil
+          error(message)
+        end
+        table.insert(spawned_session_templates, deep_copy(args))
+        return {
+          session_id = args.session_id or "session_from_hub_" .. tostring(#spawned_session_templates),
+          lifecycle = "spawned",
+          template_id = args.template_id,
+          context_id = "context_from_hub_" .. tostring(#spawned_session_templates),
+          context_keys = { "ticket_id", "metadata" },
+        }
+      end,
+    },
   },
   register = function(spec)
     return spec
@@ -282,7 +346,7 @@ botster = {
 
 local plugin = dofile("plugin.lua")
 assert(type(plugin) == "table", "plugin.lua must return a registration table")
-assert(type(plugin.tools) == "table" and #plugin.tools >= 13, "plugin must register CRUD/context/entity tools")
+assert(type(plugin.tools) == "table" and #plugin.tools >= 14, "plugin must register CRUD/context/entity/activation tools")
 assert(type(plugin.handlers) == "table" and #plugin.handlers == 2, "plugin must register app and settings surface handlers")
 
 local tools = {}
@@ -332,20 +396,149 @@ local pipeline = tools["project_pipelines.define_pipeline"]({
     { id = "step_plan", name = "Plan", position = 1, gates = {
       { id = "gate_plan", kind = "attestation", prompt = "Plan is reviewable." },
     } },
-    { id = "step_implement", name = "Implement", position = 2, gates = {
+    { id = "step_implement", name = "Implement", position = 2, kind = "pty", session_template_id = "template_codex_runtime", prompt = "Implement the ticket.", gates = {
       { id = "gate_tests", kind = "command", prompt = "Run script/test.", command = "script/test" },
     } },
+    { id = "step_manual", name = "Manual", position = 3, kind = "manual", session_template_id = "template_must_not_spawn", gates = {} },
   },
 })
-assert(pipeline.ok and #pipeline.pipeline_definition.steps == 2, "pipeline definition failed")
+assert(pipeline.ok and #pipeline.pipeline_definition.steps == 3, "pipeline definition failed")
 
 local run = tools["project_pipelines.record_run"]({
   id = "run_runtime_one",
   ticket_id = "ticket_runtime_one",
   pipeline_definition_id = "pipeline_runtime",
-  worktree = { kind = "provider_owned_reference", id = "worktree_runtime_one" },
+  repository = { id = "repo_runtime_standalone", name = "example/runtime-standalone", remote = "https://example.invalid/runtime-standalone.git", path = "repo://runtime-standalone" },
+  spawn_target_id = "spawn_target_runtime_override",
+  branch = "project-pipelines/runtime-test",
+  worktree = { kind = "provider_owned_reference", id = "worktree_runtime_one", path = "worktree://runtime-one" },
 })
 assert(run.ok and run.run.current_step_id == "step_plan", "run record failed")
+
+local manual_activation = tools["project_pipelines.activate_step"]({
+  run_id = "run_runtime_one",
+  step_id = "step_manual",
+})
+assert(manual_activation.ok and manual_activation.activation.spawned == false, "manual step must not spawn a session template")
+
+local pty_activation = tools["project_pipelines.activate_step"]({
+  run_id = "run_runtime_one",
+  step_id = "step_implement",
+  request_id = "session_request_runtime_one",
+  session_id = "session_runtime_one",
+  prompt = "Runtime prompt body",
+  environment = { STRING_VALUE = "kept", NUMBER_VALUE = 1 },
+  metadata = { role = "implement", ignored = { "not scalar" }, numeric = 1, boolean = true },
+})
+assert(pty_activation.ok and pty_activation.activation.status == "spawn_requested", "PTY activation should request a hub session template spawn")
+assert(pty_activation.activation.session_id == "session_runtime_one", "PTY activation should preserve caller session id")
+assert(pty_activation.activation.context_id == "context_from_hub_1", "PTY activation should store returned context id")
+
+local linked_ticket = tools["project_pipelines.create_ticket"]({
+  id = "ticket_runtime_workspace",
+  project_id = "proj_runtime_workspace",
+  workspace_id = "workspace_runtime_alpha",
+  title = "Runtime workspace ticket",
+})
+assert(linked_ticket.ok, "workspace ticket create failed")
+
+local linked_pipeline = tools["project_pipelines.define_pipeline"]({
+  id = "pipeline_runtime_workspace",
+  project_id = "proj_runtime_workspace",
+  name = "Runtime Workspace Delivery",
+  steps = {
+    { id = "step_workspace_pty", name = "Workspace PTY", position = 1, kind = "pty", session_template_id = "template_workspace_runtime", gates = {} },
+  },
+})
+assert(linked_pipeline.ok, "workspace pipeline definition failed")
+
+local linked_run = tools["project_pipelines.record_run"]({
+  id = "run_runtime_workspace",
+  ticket_id = "ticket_runtime_workspace",
+  pipeline_definition_id = "pipeline_runtime_workspace",
+  workspace_id = "workspace_runtime_alpha",
+  branch = "project-pipelines/workspace-runtime-test",
+  worktree = { kind = "provider_owned_reference", id = "worktree_runtime_workspace" },
+})
+assert(linked_run.ok, "workspace run record failed")
+
+local linked_activation = tools["project_pipelines.activate_step"]({
+  run_id = "run_runtime_workspace",
+  step_id = "step_workspace_pty",
+  request_id = "session_request_runtime_workspace",
+})
+assert(linked_activation.ok and linked_activation.activation.status == "spawn_requested", "workspace-linked activation should use hub session template spawn")
+assert(linked_activation.activation.session_id == "session_from_hub_2", "workspace-linked activation should store returned session id")
+
+assert(#spawned_session_templates == 2, "only PTY-backed steps should spawn session templates")
+local first_spawn = spawned_session_templates[1]
+assert(first_spawn.template_id == "template_codex_runtime", "first spawn should use implement template")
+assert(first_spawn.session_id == "session_runtime_one", "first spawn should pass correlation session_id")
+assert(first_spawn.target_id == "spawn_target_runtime_override", "first spawn should pass target_id")
+assert(first_spawn.context.ticket_id == "ticket_runtime_one", "first spawn should pass ticket_id")
+local spawned_context = tools["project_pipelines.current_context"]({})
+assert(spawned_context.ok and #spawned_context.session_requests == 2, "spawned session requests must be persisted")
+local standalone_request = spawned_context.session_requests[1]
+local workspace_request = spawned_context.session_requests[2]
+assert(standalone_request.status == "spawn_requested", "standalone request should record spawn-requested status")
+assert(standalone_request.result.lifecycle == "spawned", "standalone request should record real hub spawn lifecycle")
+assert(standalone_request.result.template_id == "template_codex_runtime", "standalone request should record returned template_id")
+assert(standalone_request.template_id == "template_codex_runtime", "first request should use implement template")
+assert(standalone_request.session_id == "session_runtime_one", "session id should be preserved for correlation")
+assert(standalone_request.request.template_id == "template_codex_runtime", "persisted request should carry template_id")
+assert(standalone_request.request.session_id == "session_runtime_one", "persisted request should carry session_id")
+assert(standalone_request.request.target_id == "spawn_target_runtime_override", "request must use DaemonSessionTemplateRequest target_id")
+assert(standalone_request.request.environment.STRING_VALUE == "kept", "environment string values should be kept")
+assert(standalone_request.request.environment.NUMBER_VALUE == nil, "environment non-string values should be dropped")
+assert(standalone_request.request.context.ticket_id == "ticket_runtime_one", "request context must use ticket_id")
+assert(standalone_request.request.context.branch_name == "project-pipelines/runtime-test", "request context must use branch_name")
+assert(standalone_request.request.context.prompt == "Runtime prompt body", "request context must use prompt")
+assert(standalone_request.request.context.metadata.owner_plugin == "project-pipelines", "request context metadata must include owner_plugin")
+assert(standalone_request.request.context.metadata.role == "implement", "request context metadata must keep string caller metadata")
+assert(standalone_request.request.context.metadata.ignored == nil, "request context metadata must drop table values")
+assert(standalone_request.request.context.metadata.numeric == nil, "request context metadata must drop numeric values")
+assert(standalone_request.request.context.metadata.boolean == nil, "request context metadata must drop boolean values")
+assert(standalone_request.request.context.workspace_id == nil, "standalone spawn context should omit workspace_id")
+assert(workspace_request.template_id == "template_workspace_runtime", "second request should use workspace template")
+assert(workspace_request.status == "spawn_requested", "workspace request should record spawn-requested status")
+assert(workspace_request.request.context.workspace_id == "workspace_runtime_alpha", "workspace spawn context should carry optional workspace_id")
+
+local failing_pipeline = tools["project_pipelines.define_pipeline"]({
+  id = "pipeline_runtime_failure",
+  project_id = "proj_runtime_standalone",
+  name = "Runtime Failure Delivery",
+  steps = {
+    { id = "step_failing_pty", name = "Failing PTY", position = 1, kind = "pty", session_template_id = "template_codex_runtime", gates = {} },
+  },
+})
+assert(failing_pipeline.ok, "failure pipeline definition failed")
+
+local failing_run = tools["project_pipelines.record_run"]({
+  id = "run_runtime_failure",
+  ticket_id = "ticket_runtime_one",
+  pipeline_definition_id = "pipeline_runtime_failure",
+  repository = { id = "repo_runtime_standalone", name = "example/runtime-standalone", remote = "https://example.invalid/runtime-standalone.git", path = "repo://runtime-standalone" },
+  spawn_target_id = "spawn_target_runtime_override",
+  branch = "project-pipelines/runtime-failure-test",
+  worktree = { kind = "provider_owned_reference", id = "worktree_runtime_failure", path = "worktree://runtime-failure" },
+})
+assert(failing_run.ok, "failure run record failed")
+
+fail_next_spawn_error = "hub rejected spawn target"
+local failed_activation = tools["project_pipelines.activate_step"]({
+  run_id = "run_runtime_failure",
+  step_id = "step_failing_pty",
+  request_id = "session_request_runtime_failure",
+})
+assert(failed_activation.ok == false, "thrown hub spawn error should return structured failure")
+assert(failed_activation.error.code == "session_template_spawn_failed", "thrown hub spawn error should use structured failure code")
+
+local failed_context = tools["project_pipelines.current_context"]({})
+assert(failed_context.ok and #failed_context.session_requests == 3, "failed session request must still be persisted")
+local failed_request = failed_context.session_requests[3]
+assert(failed_request.status == "failed", "failed request should record failed status")
+assert(failed_request.result.error.code == "session_template_spawn_failed", "failed request should store structured error")
+assert(failed_request.result.error.message:find("hub rejected spawn target", 1, true), "failed request should store hub error message")
 
 local artifact = tools["project_pipelines.record_artifact"]({
   id = "artifact_runtime_one",
@@ -368,17 +561,26 @@ assert(question.ok and question.question.status == "open", "question record fail
 local home = handlers["project-pipelines.home"]({})
 assert(home.props.surface_id == "project-pipelines.home", "home surface id missing")
 assert(home.props.state_counts.projects == 2, "home surface must expose persisted project count")
-assert(home.props.state_counts.tickets == 1, "home surface must expose persisted ticket count")
-assert(#home.props.bindings == 3, "home surface must declare entity bindings")
+assert(home.props.state_counts.tickets == 2, "home surface must expose persisted ticket count")
+assert(home.props.state_counts.sessions == 3, "home surface must expose session count")
+assert(#home.props.bindings == 4, "home surface must declare entity bindings")
 
 local settings = handlers["project-pipelines.settings"]({})
 assert(settings.props.surface_id == "project-pipelines.settings", "settings surface id missing")
-assert(settings.props.state_counts.pipeline_definitions == 1, "settings surface must expose pipeline count")
+assert(settings.props.state_counts.pipeline_definitions == 3, "settings surface must expose pipeline count")
+assert(settings.props.state_counts.sessions == 3, "settings surface must expose session count")
 assert(settings.props.state_counts.artifacts == 1, "settings surface must expose artifact count")
 assert(settings.props.state_counts.questions == 1, "settings surface must expose question count")
 
 local entities = tools["project_pipelines.entities"]({})
 assert(entities.ok and #entities.frames >= 5, "entity output must expose persisted state")
+local session_frames = 0
+for _, frame in ipairs(entities.frames) do
+  if frame.family == "project-pipelines.session_request" then
+    session_frames = session_frames + 1
+  end
+end
+assert(session_frames == 3, "entity output must expose session request state")
 
 local reloaded_plugin = dofile("plugin.lua")
 local reloaded_tools = {}
@@ -388,8 +590,9 @@ end
 local reloaded_context = reloaded_tools["project_pipelines.current_context"]({})
 assert(reloaded_context.ok, "reloaded context failed")
 assert(#reloaded_context.projects == 2, "projects must survive plugin reload")
-assert(#reloaded_context.tickets == 1, "tickets must survive plugin reload")
-assert(#reloaded_context.runs == 1, "runs must survive plugin reload")
+assert(#reloaded_context.tickets == 2, "tickets must survive plugin reload")
+assert(#reloaded_context.runs == 3, "runs must survive plugin reload")
+assert(#reloaded_context.session_requests == 3, "session requests must survive plugin reload")
 LUA
 
 echo "package scaffold checks passed"
