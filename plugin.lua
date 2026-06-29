@@ -217,7 +217,11 @@ local function spawn_session_template(template_id, session_id, request)
 
   request.template_id = template_id
   request.session_id = session_id
-  return session_templates.spawn(request)
+  local ok_response, response = pcall(session_templates.spawn, request)
+  if not ok_response then
+    return failure("session_template_spawn_failed", tostring(response))
+  end
+  return response
 end
 
 local function repository_from(arguments)
@@ -444,7 +448,8 @@ local function activate_step(arguments)
   table.insert(state.session_requests, session_request)
   run.session_request_id = session_request.id
   run.session_id = session_request.session_id
-  push_event(state, "session_template_spawn_requested", run.id, session_request.id, {
+  local event_kind = status == "failed" and "session_template_spawn_failed" or "session_template_spawn_requested"
+  push_event(state, event_kind, run.id, session_request.id, {
     template_id = step.session_template_id,
     session_id = session_request.session_id,
     status = status,

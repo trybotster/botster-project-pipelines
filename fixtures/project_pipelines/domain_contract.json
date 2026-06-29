@@ -236,9 +236,11 @@
       "prompt_summary": "Implement the approved plan with Project Pipelines context.",
       "context_id": "context_contract_standalone",
       "result": {
-        "ok": true,
         "session_id": "session_contract_standalone",
-        "context_id": "context_contract_standalone"
+        "lifecycle": "spawned",
+        "template_id": "template_codex_implement",
+        "context_id": "context_contract_standalone",
+        "context_keys": ["ticket_id", "metadata"]
       },
       "request": {
         "template_id": "template_codex_implement",
@@ -273,9 +275,11 @@
       "prompt_summary": "Implement with optional workspace metadata.",
       "context_id": "context_contract_workspace",
       "result": {
-        "ok": true,
         "session_id": "session_contract_workspace",
-        "context_id": "context_contract_workspace"
+        "lifecycle": "spawned",
+        "template_id": "template_codex_implement",
+        "context_id": "context_contract_workspace",
+        "context_keys": ["ticket_id", "metadata"]
       },
       "request": {
         "template_id": "template_codex_implement",

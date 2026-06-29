@@ -33,8 +33,9 @@ optional `environment`, and `context` containing `worktree_path`, `repo_path`,
 `environment` and `metadata` are string-keyed string maps to match the hub DTO
 contract. PTY-backed activation sends that single request table to the hub
 `session_templates.spawn` plugin capability and persists the request summary and
-returned session/context references. Manual, human, command, and other non-PTY
-steps do not attempt a session-template spawn.
+returned session/context references. Hub spawn rejections are normalized into a
+failed session request before returning a structured activation error. Manual,
+human, command, and other non-PTY steps do not attempt a session-template spawn.
 
 No workspace-owned grouping, PR lifecycle mutation, merge workflow, provider
 runtime, notification policy, or `botster-agents` class is added in this pass.
@@ -146,6 +147,7 @@ Expected event kinds include:
 - `step_started`
 - `step_activation_preserved`
 - `session_template_spawn_requested`
+- `session_template_spawn_failed`
 - `gate_submitted`
 - `artifact_added`
 - `finding_opened`
