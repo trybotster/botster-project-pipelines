@@ -734,6 +734,42 @@ local function text_node(id, value)
   return { type = "text", id = id, props = { value = value }, children = {} }
 end
 
+local function provider_dependency_status(context)
+  local blocked = {}
+  for _, request in ipairs(context.session_requests or {}) do
+    local diagnostic = request.diagnostic
+    if type(diagnostic) == "table" and diagnostic.code == "provider_dependency_missing" then
+      table.insert(blocked, {
+        request_id = request.id,
+        run_id = request.run_id,
+        step_id = request.step_id,
+        provider = diagnostic.provider,
+        dependency = diagnostic.dependency,
+        capability = diagnostic.capability,
+        status = "blocked",
+        code = diagnostic.code,
+        message = diagnostic.message,
+      })
+    end
+  end
+  return {
+    id = "project-pipelines-provider-dependencies",
+    status = #blocked > 0 and "blocked" or "available",
+    blocked_count = #blocked,
+    blocked = blocked,
+  }
+end
+
+local function provider_status_text(status)
+  if status.blocked_count == 0 then
+    return "Provider dependencies are available for recorded session requests."
+  end
+  local first = status.blocked[1] or {}
+  local label = first.dependency or first.capability or "provider dependency"
+  if first.provider then label = first.provider .. ":" .. label end
+  return "Provider dependency blocked: " .. label
+end
+
 local function bound_list(id, source, empty_title)
   return {
     type = "bind_list",
@@ -801,6 +837,7 @@ end
 
 local function render_settings()
   local context = current_context()
+  local provider_status = provider_dependency_status(context)
   return {
     type = "screen",
     id = "project-pipelines-settings",
@@ -809,6 +846,7 @@ local function render_settings()
       surface_id = "project-pipelines.settings",
       package_name = "project-pipelines",
       storage = "plugin_db",
+      provider_dependency_status = provider_status,
       state_counts = {
         projects = #context.projects,
         tickets = #context.tickets,
@@ -821,6 +859,18 @@ local function render_settings()
     },
     children = {
       text_node("project-pipelines-settings-storage", "Runtime state is persisted by the plugin database capability."),
+      {
+        type = "section",
+        id = "project-pipelines-provider-dependency-status",
+        props = {
+          title = "Provider Dependencies",
+          status = provider_status.status,
+          blocked_count = provider_status.blocked_count,
+        },
+        children = {
+          text_node("project-pipelines-provider-dependency-status-summary", provider_status_text(provider_status)),
+        },
+      },
     },
   }
 end

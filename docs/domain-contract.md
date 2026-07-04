@@ -13,6 +13,8 @@ delegated to hub-owned session templates. The runtime package is declared by
 - configuration schema placeholder: `{ "groups": [], "fields": [] }`
 - app surface: `project-pipelines.home`
 - settings surface: `project-pipelines.settings`
+- route contract: id-only package surface descriptors; current package surface
+  schema does not support route path fields
 
 ## Runtime Disposition
 
@@ -23,6 +25,13 @@ registers MCP-style tools for project, ticket, pipeline definition, run, step
 activation, artifact, question, context, and entity-frame operations, and
 registers app/settings `surface_route` handlers for `project-pipelines.home`
 and `project-pipelines.settings`.
+
+Hub clients should treat `project-pipelines.home` and
+`project-pipelines.settings` as the stable package route IDs. The manifest does
+not declare path metadata because the hub-compiled `PackageSurfaceDescriptor`
+currently exposes `id`, `kind`, `title`, `description`, `icon`, `order`,
+`category`, and `supports`, but not route path fields. A future hub package
+schema can add deterministic path descriptors without changing these IDs.
 
 Project Pipelines does not create an agent runtime. For a PTY-backed step with a
 `session_template_id`, `session_template_name`/`template_name`, or
@@ -52,6 +61,11 @@ Declared provider prerequisites are pre-spawn blockers. A step may declare
 `session_template_spawn_blocked` event. Project Pipelines does not import GitHub
 or any provider client to satisfy that dependency; it records the dependency
 diagnostic and leaves provider auth to the provider boundary.
+
+The settings surface projects those persisted diagnostics through a stable
+structural node, `project-pipelines-provider-dependency-status`. A blocked
+provider dependency remains visible as settings/config status, so missing
+configuration does not crash or hide the app/settings surface.
 
 No workspace-owned grouping, PR lifecycle mutation, merge workflow, provider
 runtime, notification policy, or `botster-agents` class is added in this pass.
@@ -188,4 +202,5 @@ builds and stores the real hub DTO field names, template ID/name/capability
 selectors resolve before spawn, optional workspace IDs stay metadata only,
 PTY-backed steps call `session_templates.spawn`, blocked dependencies do not
 spawn a PTY, non-PTY steps preserve existing behavior, and app/settings surface
-handlers expose persisted project, ticket, run, and session state.
+handlers expose persisted project, ticket, run, session, and provider/dependency
+status state.
