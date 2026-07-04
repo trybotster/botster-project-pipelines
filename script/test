@@ -23,6 +23,12 @@ assert manifest["configuration"] == {"groups": [], "fields": []}
 surfaces = {surface["id"]: surface for surface in manifest["surfaces"]}
 assert surfaces["project-pipelines.home"]["kind"] == "app"
 assert surfaces["project-pipelines.settings"]["kind"] == "settings"
+assert surfaces["project-pipelines.home"]["supports"] == ["render", "action"]
+assert surfaces["project-pipelines.settings"]["supports"] == ["render"]
+for surface in surfaces.values():
+    assert "path" not in surface
+    assert "route" not in surface
+    assert "route_path" not in surface
 assert {capability["surface"] for capability in manifest["capabilities"]} == {
     "surfaces",
     "mcp",
@@ -52,8 +58,18 @@ assert anchors["surfaces"] == {
     "home": "project-pipelines.home",
     "settings": "project-pipelines.settings",
 }
+assert anchors["route_contract"] == {
+    "manifest": "id_only",
+    "home": "project-pipelines.home",
+    "settings": "project-pipelines.settings",
+    "path_support": "unsupported_by_current_package_surface_descriptor",
+}
 assert anchors["surfaces"]["home"] in surfaces
 assert anchors["surfaces"]["settings"] in surfaces
+for surface in surfaces.values():
+    assert "path" not in surface
+    assert "route" not in surface
+    assert "route_path" not in surface
 assert anchors["runtime"] == "session_template_lua_plugin"
 
 required_domain_objects = {
@@ -218,6 +234,9 @@ required_doc_phrases = [
     "plugin-data/project-pipelines",
     "project-pipelines.home",
     "project-pipelines.settings",
+    "id-only",
+    "route path fields",
+    "project-pipelines-provider-dependency-status",
     "session_templates.spawn",
     "session_templates.resolve",
     "session_templates.list",
@@ -783,6 +802,22 @@ assert(settings.props.state_counts.pipeline_definitions == 6, "settings surface 
 assert(settings.props.state_counts.sessions == 8, "settings surface must expose session count")
 assert(settings.props.state_counts.artifacts == 1, "settings surface must expose artifact count")
 assert(settings.props.state_counts.questions == 1, "settings surface must expose question count")
+assert(settings.props.provider_dependency_status.id == "project-pipelines-provider-dependencies", "settings surface must expose stable provider dependency status id")
+assert(settings.props.provider_dependency_status.status == "blocked", "settings surface must represent missing provider dependency as blocked")
+assert(settings.props.provider_dependency_status.blocked_count == 1, "settings surface must count missing provider dependencies")
+assert(settings.props.provider_dependency_status.blocked[1].provider == "github", "settings surface must preserve diagnostic provider")
+assert(settings.props.provider_dependency_status.blocked[1].dependency == "github_auth", "settings surface must preserve diagnostic dependency")
+local provider_status_section = nil
+for _, child in ipairs(settings.children) do
+  if child.id == "project-pipelines-provider-dependency-status" then
+    provider_status_section = child
+  end
+end
+assert(provider_status_section ~= nil, "settings surface must render provider dependency status node")
+assert(provider_status_section.type == "section", "settings provider status node must use a supported structural primitive")
+assert(provider_status_section.props.status == "blocked", "settings provider status node must expose blocked status")
+assert(provider_status_section.children[1].id == "project-pipelines-provider-dependency-status-summary", "settings provider status node must include stable summary text node")
+assert(provider_status_section.children[1].props.value:find("github_auth", 1, true), "settings provider status summary must name missing dependency")
 
 local entities = tools["project_pipelines.entities"]({})
 assert(entities.ok and #entities.frames >= 5, "entity output must expose persisted state")

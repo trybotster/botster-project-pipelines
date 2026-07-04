@@ -11,6 +11,11 @@ package identity, compatibility, Lua entrypoint, configuration schema
 placeholder, MCP/plugin database capabilities, and app/settings surface
 descriptors needed for local package install and discovery. Workflow state stays
 in the plugin; PTY execution is requested from hub-owned session templates.
+The current hub package surface descriptor is an id-only route contract:
+clients open the app surface by `project-pipelines.home` and the settings
+surface by `project-pipelines.settings`. Route path fields are not declared in
+`botster-package.json` until the hub package schema grows a supported path
+field.
 
 ## Domain Contract
 
@@ -29,7 +34,9 @@ manifest anchors, and PII/raw-path absence. It also loads the
 production `plugin.lua` entrypoint with Botster capability stubs, creates
 persisted records, activates PTY and non-PTY steps, reloads the entrypoint, and
 proves the app and settings surfaces expose persisted project/ticket/run/session
-state.
+state. The settings surface also renders
+`project-pipelines-provider-dependency-status`, a stable provider/dependency
+status section derived from persisted session request diagnostics.
 
 Runtime behavior is intentionally narrow in this pass: `plugin.lua` registers
 workflow CRUD tools, a `project_pipelines.activate_step` tool, and app/settings
@@ -55,11 +62,28 @@ plugin emits structured nodes, stable node IDs, and plugin-owned entity families
 such as `project-pipelines.project`, `project-pipelines.ticket`, and
 `project-pipelines.run`.
 
+Stable package surface IDs are:
+
+- app: `project-pipelines.home`
+- settings/provider status: `project-pipelines.settings`
+
+The package manifest intentionally does not declare deterministic URL path
+fields because the current hub-compiled `PackageSurfaceDescriptor` supports
+`id`, `kind`, `title`, `description`, `icon`, `order`, `category`, and
+`supports`, but not path metadata. Runtime route paths remain a hub/client
+registry concern outside this package manifest.
+
 Dynamic model state belongs in plugin-owned entity output. Surface snapshots
 should stay structural and declare bindings for project, ticket, run, and
 session request lists instead of becoming a raw HTML or provider-specific data
 transport. UI vocabulary should refer to sessions, templates, and accessories,
 not a separate execution or agent runtime class.
+
+The settings surface reports provider/dependency status without importing a
+provider client. After a missing provider dependency blocks activation, the
+real settings handler returns `project-pipelines-provider-dependency-status`
+with blocked status and a summary naming the persisted provider/dependency
+diagnostic, such as `github:github_auth`.
 
 ## Local Development
 
@@ -82,6 +106,8 @@ botster-hub apps list --data-dir "$DATA_DIR"
 The `show` output should include `package name=project-pipelines`, an enabled
 state, `schema_present=true`, the `surfaces`, `mcp`, and `plugin_db`
 capabilities, and the declared `app` and `settings` surface descriptors.
+The surface descriptors should be id-only; current package metadata does not
+include route path fields.
 
 Real hub acceptance for this ticket is a live Project Pipelines activation, not
 only package discovery. Use a temporary hub data directory, install and enable

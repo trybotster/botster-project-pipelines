@@ -12,6 +12,12 @@
       "home": "project-pipelines.home",
       "settings": "project-pipelines.settings"
     },
+    "route_contract": {
+      "manifest": "id_only",
+      "home": "project-pipelines.home",
+      "settings": "project-pipelines.settings",
+      "path_support": "unsupported_by_current_package_surface_descriptor"
+    },
     "runtime": "session_template_lua_plugin"
   },
   "domain_objects": [

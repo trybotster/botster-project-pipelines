@@ -25,7 +25,7 @@
       "icon": "queue-list",
       "order": 30,
       "category": "workflows",
-      "supports": []
+      "supports": ["render", "action"]
     },
     {
       "id": "project-pipelines.settings",
@@ -35,7 +35,7 @@
       "icon": "adjustments-horizontal",
       "order": 30,
       "category": "workflows",
-      "supports": []
+      "supports": ["render"]
     }
   ],
   "features": [
