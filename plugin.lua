@@ -734,6 +734,190 @@ local function text_node(id, value)
   return { type = "text", id = id, props = { value = value }, children = {} }
 end
 
+local function ticket_for_run(context, run)
+  return find_by_id(context.tickets, run.ticket_id)
+end
+
+local function pipeline_for_run(context, run)
+  return find_by_id(context.pipeline_definitions, run.pipeline_definition_id)
+end
+
+local function status_summary(context)
+  local summary = {
+    projects = #context.projects,
+    tickets = #context.tickets,
+    open_tickets = 0,
+    active_runs = 0,
+    review_runs = 0,
+    blocked_sessions = 0,
+    failed_sessions = 0,
+    open_questions = 0,
+    artifacts = #context.artifacts,
+  }
+  for _, ticket in ipairs(context.tickets) do
+    if ticket.status == "open" or ticket.status == nil then
+      summary.open_tickets = summary.open_tickets + 1
+    end
+  end
+  for _, run in ipairs(context.runs) do
+    if run.status == "active" then
+      summary.active_runs = summary.active_runs + 1
+    elseif run.status == "ready_for_review" or run.status == "review" or run.status == "ready" then
+      summary.review_runs = summary.review_runs + 1
+    end
+  end
+  for _, request in ipairs(context.session_requests) do
+    if request.status == "blocked" then
+      summary.blocked_sessions = summary.blocked_sessions + 1
+    elseif request.status == "failed" then
+      summary.failed_sessions = summary.failed_sessions + 1
+    end
+  end
+  for _, question in ipairs(context.questions) do
+    if question.status == "open" or question.status == nil then
+      summary.open_questions = summary.open_questions + 1
+    end
+  end
+  summary.needs_attention = summary.blocked_sessions + summary.failed_sessions + summary.open_questions
+  return summary
+end
+
+local function metric_node(id, label, value, tone)
+  return {
+    type = "metric",
+    id = id,
+    props = {
+      label = label,
+      value = value,
+      tone = tone or "neutral",
+    },
+    children = {},
+  }
+end
+
+local function list_item(id, title, subtitle, status, metadata)
+  return {
+    type = "list_item",
+    id = id,
+    props = {
+      title = title,
+      subtitle = subtitle,
+      status = status,
+      metadata = metadata or {},
+    },
+    children = {},
+  }
+end
+
+local function list_section(id, title, empty_title, items)
+  local children = {}
+  if #items == 0 then
+    children = {
+      {
+        type = "empty_state",
+        id = id .. "-empty",
+        props = { title = empty_title },
+        children = {},
+      },
+    }
+  else
+    children = items
+  end
+  return {
+    type = "section",
+    id = id,
+    props = { title = title, count = #items },
+    children = children,
+  }
+end
+
+local function attention_items(context)
+  local items = {}
+  for _, request in ipairs(context.session_requests) do
+    if request.status == "blocked" or request.status == "failed" then
+      local ticket = find_by_id(context.tickets, request.ticket_id)
+      local diagnostic = request.diagnostic or (request.result and request.result.error) or {}
+      local status = request.status == "failed" and "failed" or "blocked"
+      table.insert(items, list_item(
+        "project-pipelines-attention-session-" .. request.id,
+        ticket and ticket.title or request.ticket_id or request.id,
+        diagnostic.message or request.prompt_summary or "Session request needs attention",
+        status,
+        {
+          run_id = request.run_id,
+          step_id = request.step_id,
+          request_id = request.id,
+          code = diagnostic.code,
+          provider = diagnostic.provider,
+          dependency = diagnostic.dependency,
+        }
+      ))
+    end
+  end
+  for _, question in ipairs(context.questions) do
+    if question.status == "open" or question.status == nil then
+      table.insert(items, list_item(
+        "project-pipelines-attention-question-" .. question.id,
+        question.question,
+        "Open question for run " .. tostring(question.run_id),
+        "question",
+        {
+          run_id = question.run_id,
+          ticket_id = question.ticket_id,
+          step_id = question.step_id,
+          question_id = question.id,
+        }
+      ))
+    end
+  end
+  return items
+end
+
+local function running_items(context)
+  local items = {}
+  for _, run in ipairs(context.runs) do
+    if run.status == "active" then
+      local ticket = ticket_for_run(context, run)
+      local pipeline = pipeline_for_run(context, run)
+      table.insert(items, list_item(
+        "project-pipelines-running-" .. run.id,
+        ticket and ticket.title or run.id,
+        (pipeline and pipeline.name or run.pipeline_definition_id) .. " / " .. tostring(run.current_step_id),
+        run.status,
+        {
+          run_id = run.id,
+          ticket_id = run.ticket_id,
+          pipeline_definition_id = run.pipeline_definition_id,
+          session_id = run.session_id,
+          session_request_id = run.session_request_id,
+        }
+      ))
+    end
+  end
+  return items
+end
+
+local function review_items(context)
+  local items = {}
+  for _, run in ipairs(context.runs) do
+    if run.status == "ready_for_review" or run.status == "review" or run.status == "ready" then
+      local ticket = ticket_for_run(context, run)
+      table.insert(items, list_item(
+        "project-pipelines-review-" .. run.id,
+        ticket and ticket.title or run.id,
+        "Current step " .. tostring(run.current_step_id),
+        run.status,
+        {
+          run_id = run.id,
+          ticket_id = run.ticket_id,
+          pipeline_definition_id = run.pipeline_definition_id,
+        }
+      ))
+    end
+  end
+  return items
+end
+
 local function provider_dependency_status(context)
   local blocked = {}
   for _, request in ipairs(context.session_requests or {}) do
@@ -770,6 +954,39 @@ local function provider_status_text(status)
   return "Provider dependency blocked: " .. label
 end
 
+local function settings_readiness(context, provider_status)
+  local summary = status_summary(context)
+  local items = {}
+  table.insert(items, list_item(
+    "project-pipelines-readiness-storage",
+    "Plugin database",
+    "Runtime state is persisted by the plugin database capability.",
+    "available"
+  ))
+  table.insert(items, list_item(
+    "project-pipelines-readiness-provider-dependencies",
+    "Provider dependencies",
+    provider_status_text(provider_status),
+    provider_status.status
+  ))
+  local session_status = "available"
+  local session_subtitle = "Session template requests are available for recorded runs."
+  if summary.failed_sessions > 0 then
+    session_status = "failed"
+    session_subtitle = tostring(summary.failed_sessions) .. " session request failed."
+  elseif summary.blocked_sessions > 0 then
+    session_status = "blocked"
+    session_subtitle = tostring(summary.blocked_sessions) .. " session request is blocked."
+  end
+  table.insert(items, list_item(
+    "project-pipelines-readiness-session-templates",
+    "Session templates",
+    session_subtitle,
+    session_status
+  ))
+  return items
+end
+
 local function bound_list(id, source, empty_title)
   return {
     type = "bind_list",
@@ -799,6 +1016,7 @@ end
 
 local function render_home()
   local context = current_context()
+  local summary = status_summary(context)
   return {
     type = "screen",
     id = "project-pipelines-home",
@@ -808,12 +1026,25 @@ local function render_home()
       state_counts = {
         projects = #context.projects,
         tickets = #context.tickets,
+        open_tickets = summary.open_tickets,
         runs = #context.runs,
+        active_runs = summary.active_runs,
+        review_runs = summary.review_runs,
         sessions = #context.session_requests,
+        blocked_sessions = summary.blocked_sessions,
+        failed_sessions = summary.failed_sessions,
+        open_questions = summary.open_questions,
+        needs_attention = summary.needs_attention,
+        artifacts = summary.artifacts,
+      },
+      navigation = {
+        primary = "pipelines",
+        settings_surface_id = "project-pipelines.settings",
       },
       bindings = {
         { family = "project-pipelines.project" },
         { family = "project-pipelines.ticket" },
+        { family = "project-pipelines.pipeline_definition" },
         { family = "project-pipelines.run" },
         { family = "project-pipelines.session_request" },
       },
@@ -821,15 +1052,67 @@ local function render_home()
     children = {
       {
         type = "section",
-        id = "project-pipelines-projects",
-        props = { title = "Projects" },
-        children = { bound_list("project-pipelines-project-list", "project-pipelines.project", "No projects") },
+        id = "project-pipelines-command-center",
+        props = { title = "Command Center" },
+        children = {
+          {
+            type = "metric_grid",
+            id = "project-pipelines-command-center-metrics",
+            props = {},
+            children = {
+              metric_node("project-pipelines-metric-attention", "Needs attention", summary.needs_attention, summary.needs_attention > 0 and "warning" or "neutral"),
+              metric_node("project-pipelines-metric-running", "Running", summary.active_runs, "active"),
+              metric_node("project-pipelines-metric-review", "Ready for review", summary.review_runs, "review"),
+              metric_node("project-pipelines-metric-open-tickets", "Open tickets", summary.open_tickets, "neutral"),
+            },
+          },
+        },
+      },
+      list_section(
+        "project-pipelines-needs-attention",
+        "Needs Attention",
+        "No blocked sessions, failed requests, or open questions",
+        attention_items(context)
+      ),
+      list_section(
+        "project-pipelines-running",
+        "Running",
+        "No active runs",
+        running_items(context)
+      ),
+      list_section(
+        "project-pipelines-ready-for-review",
+        "Ready For Review",
+        "No runs are waiting for review",
+        review_items(context)
+      ),
+      {
+        type = "section",
+        id = "project-pipelines-workbench",
+        props = { title = "Workbench" },
+        children = {
+          bound_list("project-pipelines-project-list", "project-pipelines.project", "No projects"),
+          bound_list("project-pipelines-ticket-list", "project-pipelines.ticket", "No tickets"),
+          bound_list("project-pipelines-run-list", "project-pipelines.run", "No runs"),
+          bound_list("project-pipelines-session-request-list", "project-pipelines.session_request", "No session requests"),
+        },
       },
       {
         type = "section",
-        id = "project-pipelines-tickets",
-        props = { title = "Tickets" },
-        children = { bound_list("project-pipelines-ticket-list", "project-pipelines.ticket", "No tickets") },
+        id = "project-pipelines-create-guidance",
+        props = {
+          title = "Create And Start Work",
+          actions = {
+            create_project_tool = "project_pipelines.create_project",
+            create_ticket_tool = "project_pipelines.create_ticket",
+            define_pipeline_tool = "project_pipelines.define_pipeline",
+            record_run_tool = "project_pipelines.record_run",
+            activate_step_tool = "project_pipelines.activate_step",
+          },
+        },
+        children = {
+          text_node("project-pipelines-create-guidance-summary", "Use the Project Pipelines tools to create projects, tickets, pipeline definitions, runs, and PTY-backed step activations. The app surface reflects persisted state after those actions."),
+        },
       },
     },
   }
@@ -838,6 +1121,7 @@ end
 local function render_settings()
   local context = current_context()
   local provider_status = provider_dependency_status(context)
+  local summary = status_summary(context)
   return {
     type = "screen",
     id = "project-pipelines-settings",
@@ -850,14 +1134,25 @@ local function render_settings()
       state_counts = {
         projects = #context.projects,
         tickets = #context.tickets,
+        open_tickets = summary.open_tickets,
         pipeline_definitions = #context.pipeline_definitions,
         runs = #context.runs,
+        active_runs = summary.active_runs,
+        blocked_sessions = summary.blocked_sessions,
+        failed_sessions = summary.failed_sessions,
         sessions = #context.session_requests,
         artifacts = #context.artifacts,
         questions = #context.questions,
+        open_questions = summary.open_questions,
       },
     },
     children = {
+      {
+        type = "section",
+        id = "project-pipelines-readiness",
+        props = { title = "Readiness" },
+        children = settings_readiness(context, provider_status),
+      },
       text_node("project-pipelines-settings-storage", "Runtime state is persisted by the plugin database capability."),
       {
         type = "section",
@@ -869,6 +1164,22 @@ local function render_settings()
         },
         children = {
           text_node("project-pipelines-provider-dependency-status-summary", provider_status_text(provider_status)),
+        },
+      },
+      {
+        type = "section",
+        id = "project-pipelines-settings-defaults",
+        props = {
+          title = "Defaults",
+          fields = {
+            "default_spawn_target_id",
+            "default_session_template_selector",
+            "default_pipeline_mode",
+            "workspace_id",
+          },
+        },
+        children = {
+          text_node("project-pipelines-settings-defaults-summary", "Package configuration supplies optional defaults for spawn targets, session template selection, pipeline mode, and workspace linkage. Standalone records remain valid without workspace configuration."),
         },
       },
     },

@@ -10,11 +10,13 @@ delegated to hub-owned session templates. The runtime package is declared by
 - package name: `project-pipelines`
 - capabilities: `surfaces`, `mcp`, and `plugin_db`
 - Lua entrypoint: `plugin.lua`
-- configuration schema placeholder: `{ "groups": [], "fields": [] }`
+- configuration schema: default spawn target, default session template selector,
+  default pipeline mode, and optional workspace id
 - app surface: `project-pipelines.home`
 - settings surface: `project-pipelines.settings`
-- route contract: id-only package surface descriptors; current package surface
-  schema does not support route path fields
+- navigation: `pipelines` targets `project-pipelines.home`
+- route contract: the manifest declares stable surface ids and navigation
+  intent; hub-admitted route descriptors own concrete route ids and paths
 
 ## Runtime Disposition
 
@@ -27,11 +29,11 @@ registers app/settings `surface_route` handlers for `project-pipelines.home`
 and `project-pipelines.settings`.
 
 Hub clients should treat `project-pipelines.home` and
-`project-pipelines.settings` as the stable package route IDs. The manifest does
-not declare path metadata because the hub-compiled `PackageSurfaceDescriptor`
-currently exposes `id`, `kind`, `title`, `description`, `icon`, `order`,
-`category`, and `supports`, but not route path fields. A future hub package
-schema can add deterministic path descriptors without changing these IDs.
+`project-pipelines.settings` as the stable package surface ids. The manifest
+does not declare route path fields. Instead it declares plugin-authored
+navigation intent (`pipelines` -> `project-pipelines.home`) and leaves route
+ids, paths, disabled state, blocked diagnostics, and shell placement to
+hub-admitted route descriptors and clients.
 
 Project Pipelines does not create an agent runtime. For a PTY-backed step with a
 `session_template_id`, `session_template_name`/`template_name`, or
@@ -66,6 +68,13 @@ The settings surface projects those persisted diagnostics through a stable
 structural node, `project-pipelines-provider-dependency-status`. A blocked
 provider dependency remains visible as settings/config status, so missing
 configuration does not crash or hide the app/settings surface.
+
+The app surface is an operator workbench. It renders a command-center summary,
+needs-attention queue, running run list, ready-for-review list, bound workbench
+lists for project/ticket/run/session-request entities, and action hints for the
+MCP tools that create and activate workflow records. Dynamic model state belongs
+in plugin-owned entity output; the surface snapshot carries enough structure for
+first render and for clients to know which entity families to refresh.
 
 No workspace-owned grouping, PR lifecycle mutation, merge workflow, provider
 runtime, notification policy, or `botster-agents` class is added in this pass.

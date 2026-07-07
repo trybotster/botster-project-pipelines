@@ -5,18 +5,29 @@
     "capabilities": ["surfaces", "mcp", "plugin_db"],
     "entrypoint": "plugin.lua",
     "configuration": {
-      "groups": [],
-      "fields": []
+      "groups": ["defaults", "integrations"],
+      "fields": [
+        "default_spawn_target_id",
+        "default_session_template_selector",
+        "default_pipeline_mode",
+        "workspace_id"
+      ]
+    },
+    "navigation": {
+      "pipelines": {
+        "label": "Pipelines",
+        "target_surface": "project-pipelines.home"
+      }
     },
     "surfaces": {
       "home": "project-pipelines.home",
       "settings": "project-pipelines.settings"
     },
     "route_contract": {
-      "manifest": "id_only",
+      "manifest": "surface_ids_and_navigation_intent",
       "home": "project-pipelines.home",
       "settings": "project-pipelines.settings",
-      "path_support": "unsupported_by_current_package_surface_descriptor"
+      "path_support": "hub_admitted_route_descriptors"
     },
     "runtime": "session_template_lua_plugin"
   },

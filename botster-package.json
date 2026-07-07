@@ -13,9 +13,61 @@
     { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
   ],
   "configuration": {
-    "groups": [],
-    "fields": []
+    "groups": [
+      {
+        "id": "defaults",
+        "label": "Defaults"
+      },
+      {
+        "id": "integrations",
+        "label": "Integrations"
+      }
+    ],
+    "fields": [
+      {
+        "key": "default_spawn_target_id",
+        "type": "string",
+        "label": "Default spawn target",
+        "description": "Fallback hub spawn target used when a project does not provide one.",
+        "group": "defaults"
+      },
+      {
+        "key": "default_session_template_selector",
+        "type": "string",
+        "label": "Default session template",
+        "description": "Template id, name, or capability used for PTY-backed pipeline steps without a step selector.",
+        "group": "defaults"
+      },
+      {
+        "key": "default_pipeline_mode",
+        "type": "select",
+        "label": "Default pipeline mode",
+        "description": "Default workflow shape for new tickets.",
+        "group": "defaults",
+        "default": { "type": "select", "value": "botster_delivery" },
+        "options": [
+          { "value": "botster_delivery", "label": "Botster delivery" },
+          { "value": "manual_review", "label": "Manual review" }
+        ]
+      },
+      {
+        "key": "workspace_id",
+        "type": "string",
+        "label": "Workspace id",
+        "description": "Optional workspace reference. Standalone project records remain valid without it.",
+        "group": "integrations"
+      }
+    ]
   },
+  "navigation": [
+    {
+      "id": "pipelines",
+      "label": "Pipelines",
+      "icon": "queue-list",
+      "description": "Open the Project Pipelines operator workbench.",
+      "target": { "kind": "surface", "surface_id": "project-pipelines.home" }
+    }
+  ],
   "surfaces": [
     {
       "id": "project-pipelines.home",

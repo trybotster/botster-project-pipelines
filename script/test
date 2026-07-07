@@ -18,7 +18,22 @@ assert manifest["entrypoints"] == [
 plugin_source = Path("plugin.lua").read_text()
 assert "require(" not in plugin_source
 assert "botster.register" in plugin_source
-assert manifest["configuration"] == {"groups": [], "fields": []}
+assert [group["id"] for group in manifest["configuration"]["groups"]] == ["defaults", "integrations"]
+assert [field["key"] for field in manifest["configuration"]["fields"]] == [
+    "default_spawn_target_id",
+    "default_session_template_selector",
+    "default_pipeline_mode",
+    "workspace_id",
+]
+assert manifest["navigation"] == [
+    {
+        "id": "pipelines",
+        "label": "Pipelines",
+        "icon": "queue-list",
+        "description": "Open the Project Pipelines operator workbench.",
+        "target": {"kind": "surface", "surface_id": "project-pipelines.home"},
+    }
+]
 
 surfaces = {surface["id"]: surface for surface in manifest["surfaces"]}
 assert surfaces["project-pipelines.home"]["kind"] == "app"
@@ -51,7 +66,16 @@ anchors = contract["manifest_anchors"]
 assert anchors["package_name"] == manifest["name"]
 assert anchors["capabilities"] == [capability["surface"] for capability in manifest["capabilities"]]
 assert anchors["entrypoint"] == manifest["entrypoints"][0]["path"]
-assert anchors["configuration"] == manifest["configuration"]
+assert anchors["configuration"] == {
+    "groups": [group["id"] for group in manifest["configuration"]["groups"]],
+    "fields": [field["key"] for field in manifest["configuration"]["fields"]],
+}
+assert anchors["navigation"] == {
+    "pipelines": {
+        "label": "Pipelines",
+        "target_surface": "project-pipelines.home",
+    }
+}
 
 surfaces = {surface["id"]: surface for surface in manifest["surfaces"]}
 assert anchors["surfaces"] == {
@@ -59,10 +83,10 @@ assert anchors["surfaces"] == {
     "settings": "project-pipelines.settings",
 }
 assert anchors["route_contract"] == {
-    "manifest": "id_only",
+    "manifest": "surface_ids_and_navigation_intent",
     "home": "project-pipelines.home",
     "settings": "project-pipelines.settings",
-    "path_support": "unsupported_by_current_package_surface_descriptor",
+    "path_support": "hub_admitted_route_descriptors",
 }
 assert anchors["surfaces"]["home"] in surfaces
 assert anchors["surfaces"]["settings"] in surfaces
@@ -234,7 +258,9 @@ required_doc_phrases = [
     "plugin-data/project-pipelines",
     "project-pipelines.home",
     "project-pipelines.settings",
-    "id-only",
+    "navigation",
+    "surface ids",
+    "hub-admitted route descriptors",
     "route path fields",
     "project-pipelines-provider-dependency-status",
     "session_templates.spawn",
@@ -794,7 +820,27 @@ assert(home.props.surface_id == "project-pipelines.home", "home surface id missi
 assert(home.props.state_counts.projects == 2, "home surface must expose persisted project count")
 assert(home.props.state_counts.tickets == 2, "home surface must expose persisted ticket count")
 assert(home.props.state_counts.sessions == 8, "home surface must expose session count")
-assert(#home.props.bindings == 4, "home surface must declare entity bindings")
+assert(home.props.state_counts.needs_attention == 4, "home surface must expose attention count")
+assert(home.props.state_counts.active_runs == 6, "home surface must expose active run count")
+assert(home.props.state_counts.blocked_sessions == 2, "home surface must expose blocked session count")
+assert(home.props.state_counts.failed_sessions == 1, "home surface must expose failed session count")
+assert(home.props.state_counts.open_questions == 1, "home surface must expose open question count")
+assert(home.props.navigation.primary == "pipelines", "home surface must expose manifest navigation id")
+assert(home.props.navigation.settings_surface_id == "project-pipelines.settings", "home surface must expose settings surface id")
+assert(#home.props.bindings == 5, "home surface must declare entity bindings")
+local home_sections = {}
+for _, child in ipairs(home.children) do
+  home_sections[child.id] = child
+end
+assert(home_sections["project-pipelines-command-center"] ~= nil, "home surface must render command center")
+assert(home_sections["project-pipelines-needs-attention"] ~= nil, "home surface must render attention section")
+assert(home_sections["project-pipelines-needs-attention"].props.count == 4, "attention section must count blocked, failed, and open question items")
+assert(home_sections["project-pipelines-running"] ~= nil, "home surface must render running section")
+assert(home_sections["project-pipelines-running"].props.count == 6, "running section must count active runs")
+assert(home_sections["project-pipelines-ready-for-review"] ~= nil, "home surface must render review section")
+assert(home_sections["project-pipelines-workbench"] ~= nil, "home surface must render workbench section")
+assert(#home_sections["project-pipelines-workbench"].children == 4, "workbench must include project, ticket, run, and session request lists")
+assert(home_sections["project-pipelines-create-guidance"].props.actions.create_ticket_tool == "project_pipelines.create_ticket", "home surface must expose create ticket action hint")
 
 local settings = handlers["project-pipelines.settings"]({})
 assert(settings.props.surface_id == "project-pipelines.settings", "settings surface id missing")
@@ -802,22 +848,33 @@ assert(settings.props.state_counts.pipeline_definitions == 6, "settings surface 
 assert(settings.props.state_counts.sessions == 8, "settings surface must expose session count")
 assert(settings.props.state_counts.artifacts == 1, "settings surface must expose artifact count")
 assert(settings.props.state_counts.questions == 1, "settings surface must expose question count")
+assert(settings.props.state_counts.open_questions == 1, "settings surface must expose open question count")
 assert(settings.props.provider_dependency_status.id == "project-pipelines-provider-dependencies", "settings surface must expose stable provider dependency status id")
 assert(settings.props.provider_dependency_status.status == "blocked", "settings surface must represent missing provider dependency as blocked")
 assert(settings.props.provider_dependency_status.blocked_count == 1, "settings surface must count missing provider dependencies")
 assert(settings.props.provider_dependency_status.blocked[1].provider == "github", "settings surface must preserve diagnostic provider")
 assert(settings.props.provider_dependency_status.blocked[1].dependency == "github_auth", "settings surface must preserve diagnostic dependency")
 local provider_status_section = nil
+local readiness_section = nil
+local defaults_section = nil
 for _, child in ipairs(settings.children) do
   if child.id == "project-pipelines-provider-dependency-status" then
     provider_status_section = child
+  elseif child.id == "project-pipelines-readiness" then
+    readiness_section = child
+  elseif child.id == "project-pipelines-settings-defaults" then
+    defaults_section = child
   end
 end
+assert(readiness_section ~= nil, "settings surface must render readiness section")
+assert(#readiness_section.children == 3, "settings readiness section must include storage, provider, and session template readiness")
 assert(provider_status_section ~= nil, "settings surface must render provider dependency status node")
 assert(provider_status_section.type == "section", "settings provider status node must use a supported structural primitive")
 assert(provider_status_section.props.status == "blocked", "settings provider status node must expose blocked status")
 assert(provider_status_section.children[1].id == "project-pipelines-provider-dependency-status-summary", "settings provider status node must include stable summary text node")
 assert(provider_status_section.children[1].props.value:find("github_auth", 1, true), "settings provider status summary must name missing dependency")
+assert(defaults_section ~= nil, "settings surface must render defaults configuration section")
+assert(defaults_section.props.fields[1] == "default_spawn_target_id", "settings defaults must expose spawn target config field")
 
 local entities = tools["project_pipelines.entities"]({})
 assert(entities.ok and #entities.frames >= 5, "entity output must expose persisted state")

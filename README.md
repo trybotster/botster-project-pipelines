@@ -7,15 +7,12 @@ questions, artifacts, findings, and provider-mediated PR lifecycle behavior as a
 self-contained Botster plugin.
 
 This repository is a production-shaped Project Pipelines plugin. It declares the
-package identity, compatibility, Lua entrypoint, configuration schema
-placeholder, MCP/plugin database capabilities, and app/settings surface
+package identity, compatibility, Lua entrypoint, package configuration schema,
+MCP/plugin database capabilities, navigation, and app/settings surface
 descriptors needed for local package install and discovery. Workflow state stays
 in the plugin; PTY execution is requested from hub-owned session templates.
-The current hub package surface descriptor is an id-only route contract:
-clients open the app surface by `project-pipelines.home` and the settings
-surface by `project-pipelines.settings`. Route path fields are not declared in
-`botster-package.json` until the hub package schema grows a supported path
-field.
+The manifest declares stable surface ids and a `pipelines` navigation entry;
+hub-admitted route descriptors own concrete route ids and paths.
 
 ## Domain Contract
 
@@ -33,8 +30,8 @@ resolution, blocked provider diagnostics, provider capability boundaries,
 manifest anchors, and PII/raw-path absence. It also loads the
 production `plugin.lua` entrypoint with Botster capability stubs, creates
 persisted records, activates PTY and non-PTY steps, reloads the entrypoint, and
-proves the app and settings surfaces expose persisted project/ticket/run/session
-state. The settings surface also renders
+proves the app workbench and settings surfaces expose persisted
+project/ticket/run/session state. The settings surface also renders
 `project-pipelines-provider-dependency-status`, a stable provider/dependency
 status section derived from persisted session request diagnostics.
 
@@ -51,8 +48,8 @@ resolved, or a declared dependency such as `github_auth` is unavailable,
 activation persists `status="blocked"` with a structured diagnostic and emits
 `session_template_spawn_blocked`. Manual, human, command, and other non-PTY
 steps do not spawn sessions. The manifest configuration schema is intentionally
-empty, and provider or workspace integrations are contract references rather
-than runtime imports.
+limited to package defaults, and provider or workspace integrations are contract
+references rather than runtime imports.
 
 ## UI Contract
 
@@ -67,17 +64,21 @@ Stable package surface IDs are:
 - app: `project-pipelines.home`
 - settings/provider status: `project-pipelines.settings`
 
-The package manifest intentionally does not declare deterministic URL path
-fields because the current hub-compiled `PackageSurfaceDescriptor` supports
-`id`, `kind`, `title`, `description`, `icon`, `order`, `category`, and
-`supports`, but not path metadata. Runtime route paths remain a hub/client
-registry concern outside this package manifest.
+The package manifest intentionally does not declare deterministic URL route path
+fields. It declares surface ids and navigation intent; runtime route paths
+remain a hub-admitted route descriptor concern outside this package manifest.
 
 Dynamic model state belongs in plugin-owned entity output. Surface snapshots
 should stay structural and declare bindings for project, ticket, run, and
 session request lists instead of becoming a raw HTML or provider-specific data
 transport. UI vocabulary should refer to sessions, templates, and accessories,
 not a separate execution or agent runtime class.
+
+The first app render is an operator workbench, not a placeholder. It exposes a
+command-center summary, needs-attention queue, running run list, ready-for-review
+list, and bound workbench lists for projects, tickets, runs, and session
+requests. The create/start guidance points clients at the plugin-owned MCP tools
+that mutate durable workflow records; the surface then reflects persisted state.
 
 The settings surface reports provider/dependency status without importing a
 provider client. After a missing provider dependency blocks activation, the
@@ -106,8 +107,8 @@ botster-hub apps list --data-dir "$DATA_DIR"
 The `show` output should include `package name=project-pipelines`, an enabled
 state, `schema_present=true`, the `surfaces`, `mcp`, and `plugin_db`
 capabilities, and the declared `app` and `settings` surface descriptors.
-The surface descriptors should be id-only; current package metadata does not
-include route path fields.
+The manifest should include the `pipelines` navigation entry and no route path
+fields; route paths are supplied by the hub route descriptor layer.
 
 Real hub acceptance for this ticket is a live Project Pipelines activation, not
 only package discovery. Use a temporary hub data directory, install and enable
