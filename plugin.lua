@@ -731,7 +731,59 @@ local function entities()
 end
 
 local function text_node(id, value)
-  return { type = "text", id = id, props = { value = value }, children = {} }
+  return { type = "text", id = id, props = { text = value }, children = {} }
+end
+
+local function badge_node(id, label, tone)
+  return {
+    type = "badge",
+    id = id,
+    props = { label = label, tone = tone or "default" },
+    children = {},
+  }
+end
+
+local function panel_node(id, title, children, tone)
+  local props = { title = title }
+  if tone then props.tone = tone end
+  return { type = "panel", id = id, props = props, children = children or {} }
+end
+
+local function inline_node(id, children)
+  return {
+    type = "inline",
+    id = id,
+    props = { gap = "sm", align = "center" },
+    children = children or {},
+  }
+end
+
+local function list_node(id, children)
+  return {
+    type = "list",
+    id = id,
+    props = { aria_label = id },
+    children = children or {},
+  }
+end
+
+local function list_item(id, title, subtitle, status)
+  local tone = status == "failed" and "danger" or status == "blocked" and "warning" or "muted"
+  return {
+    type = "list_item",
+    id = id,
+    props = { value = id },
+    slots = {
+      title = { text_node(id .. "-title", title) },
+      subtitle = {
+        inline_node(id .. "-subtitle", {
+          text_node(id .. "-subtitle-text", subtitle),
+          badge_node(id .. "-status", status or "unknown", tone),
+        }),
+      },
+    },
+    children = {},
+  }
 end
 
 local function ticket_for_run(context, run)
@@ -783,52 +835,17 @@ local function status_summary(context)
 end
 
 local function metric_node(id, label, value, tone)
-  return {
-    type = "metric",
-    id = id,
-    props = {
-      label = label,
-      value = value,
-      tone = tone or "neutral",
-    },
-    children = {},
-  }
-end
-
-local function list_item(id, title, subtitle, status, metadata)
-  return {
-    type = "list_item",
-    id = id,
-    props = {
-      title = title,
-      subtitle = subtitle,
-      status = status,
-      metadata = metadata or {},
-    },
-    children = {},
-  }
+  return badge_node(id, label .. ": " .. tostring(value), tone)
 end
 
 local function list_section(id, title, empty_title, items)
-  local children = {}
+  local children = items
   if #items == 0 then
     children = {
-      {
-        type = "empty_state",
-        id = id .. "-empty",
-        props = { title = empty_title },
-        children = {},
-      },
+      { type = "empty_state", id = id .. "-empty", props = { title = empty_title }, children = {} },
     }
-  else
-    children = items
   end
-  return {
-    type = "section",
-    id = id,
-    props = { title = title, count = #items },
-    children = children,
-  }
+  return panel_node(id, title, { list_node(id .. "-list", children) })
 end
 
 local function attention_items(context)
@@ -842,15 +859,7 @@ local function attention_items(context)
         "project-pipelines-attention-session-" .. request.id,
         ticket and ticket.title or request.ticket_id or request.id,
         diagnostic.message or request.prompt_summary or "Session request needs attention",
-        status,
-        {
-          run_id = request.run_id,
-          step_id = request.step_id,
-          request_id = request.id,
-          code = diagnostic.code,
-          provider = diagnostic.provider,
-          dependency = diagnostic.dependency,
-        }
+        status
       ))
     end
   end
@@ -860,13 +869,7 @@ local function attention_items(context)
         "project-pipelines-attention-question-" .. question.id,
         question.question,
         "Open question for run " .. tostring(question.run_id),
-        "question",
-        {
-          run_id = question.run_id,
-          ticket_id = question.ticket_id,
-          step_id = question.step_id,
-          question_id = question.id,
-        }
+        "question"
       ))
     end
   end
@@ -883,14 +886,7 @@ local function running_items(context)
         "project-pipelines-running-" .. run.id,
         ticket and ticket.title or run.id,
         (pipeline and pipeline.name or run.pipeline_definition_id) .. " / " .. tostring(run.current_step_id),
-        run.status,
-        {
-          run_id = run.id,
-          ticket_id = run.ticket_id,
-          pipeline_definition_id = run.pipeline_definition_id,
-          session_id = run.session_id,
-          session_request_id = run.session_request_id,
-        }
+        run.status
       ))
     end
   end
@@ -906,12 +902,7 @@ local function review_items(context)
         "project-pipelines-review-" .. run.id,
         ticket and ticket.title or run.id,
         "Current step " .. tostring(run.current_step_id),
-        run.status,
-        {
-          run_id = run.id,
-          ticket_id = run.ticket_id,
-          pipeline_definition_id = run.pipeline_definition_id,
-        }
+        run.status
       ))
     end
   end
@@ -989,85 +980,43 @@ end
 
 local function bound_list(id, source, empty_title)
   return {
-    type = "bind_list",
-    id = id,
-    props = {
-      source = source,
-      item_template = {
-        type = "row",
-        id = id .. "-row",
-        props = {
-          id = { bind = "@/id" },
-          title = { bind = "@/title" },
-          subtitle = { bind = "@/status" },
+    ["$kind"] = "bind_list",
+    source = "/" .. source,
+    item_template = {
+      type = "list_item",
+      id = id .. "-row",
+      props = { value = { ["$bind"] = "@/id" } },
+      slots = {
+        title = {
+          { type = "text", id = id .. "-row-title", props = { text = { ["$bind"] = "@/title" } }, children = {} },
         },
-        children = {},
+        subtitle = {
+          { type = "text", id = id .. "-row-subtitle", props = { text = { ["$bind"] = "@/status" } }, children = {} },
+        },
       },
-      empty_template = {
-        type = "empty_state",
-        id = id .. "-empty",
-        props = { title = empty_title },
-        children = {},
-      },
+      children = {},
     },
-    children = {},
+    empty_template = {
+      type = "empty_state",
+      id = id .. "-empty",
+      props = { title = empty_title },
+      children = {},
+    },
   }
 end
 
 local function render_home()
   local context = current_context()
   local summary = status_summary(context)
-  return {
-    type = "screen",
-    id = "project-pipelines-home",
-    props = {
-      title = "Project Pipelines",
-      surface_id = "project-pipelines.home",
-      state_counts = {
-        projects = #context.projects,
-        tickets = #context.tickets,
-        open_tickets = summary.open_tickets,
-        runs = #context.runs,
-        active_runs = summary.active_runs,
-        review_runs = summary.review_runs,
-        sessions = #context.session_requests,
-        blocked_sessions = summary.blocked_sessions,
-        failed_sessions = summary.failed_sessions,
-        open_questions = summary.open_questions,
-        needs_attention = summary.needs_attention,
-        artifacts = summary.artifacts,
-      },
-      navigation = {
-        primary = "pipelines",
-        settings_surface_id = "project-pipelines.settings",
-      },
-      bindings = {
-        { family = "project-pipelines.project" },
-        { family = "project-pipelines.ticket" },
-        { family = "project-pipelines.pipeline_definition" },
-        { family = "project-pipelines.run" },
-        { family = "project-pipelines.session_request" },
-      },
-    },
-    children = {
-      {
-        type = "section",
-        id = "project-pipelines-command-center",
-        props = { title = "Command Center" },
-        children = {
-          {
-            type = "metric_grid",
-            id = "project-pipelines-command-center-metrics",
-            props = {},
-            children = {
-              metric_node("project-pipelines-metric-attention", "Needs attention", summary.needs_attention, summary.needs_attention > 0 and "warning" or "neutral"),
-              metric_node("project-pipelines-metric-running", "Running", summary.active_runs, "active"),
-              metric_node("project-pipelines-metric-review", "Ready for review", summary.review_runs, "review"),
-              metric_node("project-pipelines-metric-open-tickets", "Open tickets", summary.open_tickets, "neutral"),
-            },
-          },
-        },
-      },
+  return panel_node("project-pipelines-home", "Project Pipelines", {
+      panel_node("project-pipelines-command-center", "Command Center", {
+        inline_node("project-pipelines-command-center-metrics", {
+          metric_node("project-pipelines-metric-attention", "Needs attention", summary.needs_attention, summary.needs_attention > 0 and "warning" or "default"),
+          metric_node("project-pipelines-metric-running", "Running", summary.active_runs, "accent"),
+          metric_node("project-pipelines-metric-review", "Ready for review", summary.review_runs, "success"),
+          metric_node("project-pipelines-metric-open-tickets", "Open tickets", summary.open_tickets, "muted"),
+        }),
+      }),
       list_section(
         "project-pipelines-needs-attention",
         "Needs Attention",
@@ -1086,104 +1035,57 @@ local function render_home()
         "No runs are waiting for review",
         review_items(context)
       ),
-      {
-        type = "section",
-        id = "project-pipelines-workbench",
-        props = { title = "Workbench" },
-        children = {
+      panel_node("project-pipelines-workbench", "Workbench", {
+        list_node("project-pipelines-workbench-lists", {
           bound_list("project-pipelines-project-list", "project-pipelines.project", "No projects"),
           bound_list("project-pipelines-ticket-list", "project-pipelines.ticket", "No tickets"),
           bound_list("project-pipelines-run-list", "project-pipelines.run", "No runs"),
           bound_list("project-pipelines-session-request-list", "project-pipelines.session_request", "No session requests"),
-        },
-      },
-      {
-        type = "section",
-        id = "project-pipelines-create-guidance",
-        props = {
-          title = "Create And Start Work",
-          actions = {
-            create_project_tool = "project_pipelines.create_project",
-            create_ticket_tool = "project_pipelines.create_ticket",
-            define_pipeline_tool = "project_pipelines.define_pipeline",
-            record_run_tool = "project_pipelines.record_run",
-            activate_step_tool = "project_pipelines.activate_step",
-          },
-        },
-        children = {
-          text_node("project-pipelines-create-guidance-summary", "Use the Project Pipelines tools to create projects, tickets, pipeline definitions, runs, and PTY-backed step activations. The app surface reflects persisted state after those actions."),
-        },
-      },
-    },
-  }
+        }),
+      }),
+      panel_node("project-pipelines-create-guidance", "Create And Start Work", {
+        text_node("project-pipelines-create-guidance-summary", "Use the Project Pipelines tools to create projects, tickets, pipeline definitions, runs, and PTY-backed step activations. The app surface reflects persisted state after those actions."),
+        list_node("project-pipelines-create-guidance-actions", {
+          list_item("project-pipelines-create-project-action", "Create project", "project_pipelines.create_project", "tool"),
+          list_item("project-pipelines-create-ticket-action", "Create ticket", "project_pipelines.create_ticket", "tool"),
+          list_item("project-pipelines-define-pipeline-action", "Define pipeline", "project_pipelines.define_pipeline", "tool"),
+          list_item("project-pipelines-record-run-action", "Record run", "project_pipelines.record_run", "tool"),
+          list_item("project-pipelines-activate-step-action", "Activate step", "project_pipelines.activate_step", "tool"),
+        }),
+      }),
+    })
 end
 
 local function render_settings()
   local context = current_context()
   local provider_status = provider_dependency_status(context)
   local summary = status_summary(context)
-  return {
-    type = "screen",
-    id = "project-pipelines-settings",
-    props = {
-      title = "Project Pipelines Settings",
-      surface_id = "project-pipelines.settings",
-      package_name = "project-pipelines",
-      storage = "plugin_db",
-      provider_dependency_status = provider_status,
-      state_counts = {
-        projects = #context.projects,
-        tickets = #context.tickets,
-        open_tickets = summary.open_tickets,
-        pipeline_definitions = #context.pipeline_definitions,
-        runs = #context.runs,
-        active_runs = summary.active_runs,
-        blocked_sessions = summary.blocked_sessions,
-        failed_sessions = summary.failed_sessions,
-        sessions = #context.session_requests,
-        artifacts = #context.artifacts,
-        questions = #context.questions,
-        open_questions = summary.open_questions,
-      },
-    },
-    children = {
-      {
-        type = "section",
-        id = "project-pipelines-readiness",
-        props = { title = "Readiness" },
-        children = settings_readiness(context, provider_status),
-      },
+  return panel_node("project-pipelines-settings", "Project Pipelines Settings", {
+      inline_node("project-pipelines-settings-counts", {
+        metric_node("project-pipelines-settings-count-projects", "Projects", #context.projects, "muted"),
+        metric_node("project-pipelines-settings-count-tickets", "Tickets", #context.tickets, "muted"),
+        metric_node("project-pipelines-settings-count-runs", "Runs", #context.runs, "muted"),
+        metric_node("project-pipelines-settings-count-sessions", "Session requests", #context.session_requests, "muted"),
+        metric_node("project-pipelines-settings-count-open-questions", "Open questions", summary.open_questions, summary.open_questions > 0 and "warning" or "muted"),
+      }),
+      panel_node("project-pipelines-readiness", "Readiness", {
+        list_node("project-pipelines-readiness-list", settings_readiness(context, provider_status)),
+      }),
       text_node("project-pipelines-settings-storage", "Runtime state is persisted by the plugin database capability."),
-      {
-        type = "section",
-        id = "project-pipelines-provider-dependency-status",
-        props = {
-          title = "Provider Dependencies",
-          status = provider_status.status,
-          blocked_count = provider_status.blocked_count,
-        },
-        children = {
-          text_node("project-pipelines-provider-dependency-status-summary", provider_status_text(provider_status)),
-        },
-      },
-      {
-        type = "section",
-        id = "project-pipelines-settings-defaults",
-        props = {
-          title = "Defaults",
-          fields = {
-            "default_spawn_target_id",
-            "default_session_template_selector",
-            "default_pipeline_mode",
-            "workspace_id",
-          },
-        },
-        children = {
-          text_node("project-pipelines-settings-defaults-summary", "Package configuration supplies optional defaults for spawn targets, session template selection, pipeline mode, and workspace linkage. Standalone records remain valid without workspace configuration."),
-        },
-      },
-    },
-  }
+      panel_node("project-pipelines-provider-dependency-status", "Provider Dependencies", {
+        text_node("project-pipelines-provider-dependency-status-summary", provider_status_text(provider_status)),
+        badge_node("project-pipelines-provider-dependency-status-badge", provider_status.status .. ": " .. tostring(provider_status.blocked_count), provider_status.status == "blocked" and "warning" or "success"),
+      }),
+      panel_node("project-pipelines-settings-defaults", "Defaults", {
+        text_node("project-pipelines-settings-defaults-summary", "Package configuration supplies optional defaults for spawn targets, session template selection, pipeline mode, and workspace linkage. Standalone records remain valid without workspace configuration."),
+        list_node("project-pipelines-settings-default-fields", {
+          list_item("project-pipelines-settings-default-spawn-target", "Default spawn target", "default_spawn_target_id", "config"),
+          list_item("project-pipelines-settings-default-session-template", "Default session template", "default_session_template_selector", "config"),
+          list_item("project-pipelines-settings-default-pipeline-mode", "Default pipeline mode", "default_pipeline_mode", "config"),
+          list_item("project-pipelines-settings-workspace-id", "Workspace id", "workspace_id", "config"),
+        }),
+      }),
+    })
 end
 
 return botster.register({

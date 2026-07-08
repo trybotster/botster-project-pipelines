@@ -815,45 +815,102 @@ local question = tools["project_pipelines.record_question"]({
 })
 assert(question.ok and question.question.status == "open", "question record failed")
 
+local allowed_ui_node_types = {
+  stack = true,
+  inline = true,
+  form = true,
+  form_section = true,
+  form_field = true,
+  panel = true,
+  scroll_area = true,
+  text = true,
+  icon = true,
+  badge = true,
+  status_dot = true,
+  empty_state = true,
+  list = true,
+  list_item = true,
+  tree = true,
+  tree_item = true,
+  table = true,
+  button = true,
+  icon_button = true,
+  menu = true,
+  menu_item = true,
+  dialog = true,
+  text_input = true,
+  textarea = true,
+  checkbox = true,
+  select = true,
+  select_option = true,
+  terminal_view = true,
+  connection_code_view = true,
+  iframe = true,
+}
+
+local function validate_ui_child_contract(child, path)
+  assert(type(child) == "table", path .. " must be a table")
+  if child["$kind"] ~= nil then
+    assert(child["$kind"] == "bind_list" or child["$kind"] == "bind_if" or child["$kind"] == "when" or child["$kind"] == "hidden", path .. " has unsupported $kind")
+    if child["$kind"] == "bind_list" then
+      assert(type(child.source) == "string" and child.source:sub(1, 1) == "/", path .. " bind_list source must be absolute")
+      validate_ui_child_contract(child.item_template, path .. ".item_template")
+      if child.empty_template ~= nil then
+        validate_ui_child_contract(child.empty_template, path .. ".empty_template")
+      end
+    elseif child.node ~= nil then
+      validate_ui_child_contract(child.node, path .. ".node")
+    end
+    return
+  end
+  assert(allowed_ui_node_types[child.type] == true, path .. " has unsupported UiNode type " .. tostring(child.type))
+  if child.type == "text" then
+    assert(child.props ~= nil and child.props.text ~= nil, path .. " text node must use props.text")
+  end
+  for index, nested in ipairs(child.children or {}) do
+    validate_ui_child_contract(nested, path .. ".children[" .. tostring(index) .. "]")
+  end
+  for slot_name, slot_children in pairs(child.slots or {}) do
+    assert(type(slot_children) == "table", path .. ".slots." .. tostring(slot_name) .. " must be a child array")
+    for index, nested in ipairs(slot_children) do
+      validate_ui_child_contract(nested, path .. ".slots." .. tostring(slot_name) .. "[" .. tostring(index) .. "]")
+    end
+  end
+end
+
 local home = handlers["project-pipelines.home"]({})
-assert(home.props.surface_id == "project-pipelines.home", "home surface id missing")
-assert(home.props.state_counts.projects == 2, "home surface must expose persisted project count")
-assert(home.props.state_counts.tickets == 2, "home surface must expose persisted ticket count")
-assert(home.props.state_counts.sessions == 8, "home surface must expose session count")
-assert(home.props.state_counts.needs_attention == 4, "home surface must expose attention count")
-assert(home.props.state_counts.active_runs == 6, "home surface must expose active run count")
-assert(home.props.state_counts.blocked_sessions == 2, "home surface must expose blocked session count")
-assert(home.props.state_counts.failed_sessions == 1, "home surface must expose failed session count")
-assert(home.props.state_counts.open_questions == 1, "home surface must expose open question count")
-assert(home.props.navigation.primary == "pipelines", "home surface must expose manifest navigation id")
-assert(home.props.navigation.settings_surface_id == "project-pipelines.settings", "home surface must expose settings surface id")
-assert(#home.props.bindings == 5, "home surface must declare entity bindings")
+validate_ui_child_contract(home, "home")
+assert(home.type == "panel", "home surface must use hub UiNode panel primitive")
+assert(home.id == "project-pipelines-home", "home surface id missing")
+assert(home.props.title == "Project Pipelines", "home surface title missing")
 local home_sections = {}
 for _, child in ipairs(home.children) do
   home_sections[child.id] = child
 end
 assert(home_sections["project-pipelines-command-center"] ~= nil, "home surface must render command center")
+assert(home_sections["project-pipelines-command-center"].type == "panel", "command center must use panel primitive")
+assert(home_sections["project-pipelines-command-center"].children[1].type == "inline", "command center metrics must use inline primitive")
 assert(home_sections["project-pipelines-needs-attention"] ~= nil, "home surface must render attention section")
-assert(home_sections["project-pipelines-needs-attention"].props.count == 4, "attention section must count blocked, failed, and open question items")
+assert(home_sections["project-pipelines-needs-attention"].type == "panel", "attention section must use panel primitive")
+assert(#home_sections["project-pipelines-needs-attention"].children[1].children == 4, "attention section must count blocked, failed, and open question items")
 assert(home_sections["project-pipelines-running"] ~= nil, "home surface must render running section")
-assert(home_sections["project-pipelines-running"].props.count == 6, "running section must count active runs")
+assert(#home_sections["project-pipelines-running"].children[1].children == 6, "running section must count active runs")
 assert(home_sections["project-pipelines-ready-for-review"] ~= nil, "home surface must render review section")
 assert(home_sections["project-pipelines-workbench"] ~= nil, "home surface must render workbench section")
-assert(#home_sections["project-pipelines-workbench"].children == 4, "workbench must include project, ticket, run, and session request lists")
-assert(home_sections["project-pipelines-create-guidance"].props.actions.create_ticket_tool == "project_pipelines.create_ticket", "home surface must expose create ticket action hint")
+local workbench_list = home_sections["project-pipelines-workbench"].children[1]
+assert(workbench_list.type == "list", "workbench must use list primitive")
+assert(#workbench_list.children == 4, "workbench must include project, ticket, run, and session request lists")
+assert(workbench_list.children[1]["$kind"] == "bind_list", "workbench child must use hub bind_list child wrapper")
+assert(workbench_list.children[1].source == "/project-pipelines.project", "project binding must use absolute entity family path")
+assert(workbench_list.children[1].item_template.type == "list_item", "bound rows must render list_item primitives")
+assert(workbench_list.children[1].item_template.slots.title[1].props.text["$bind"] == "@/title", "bound row title must use hub $bind shape")
+assert(home_sections["project-pipelines-create-guidance"].children[2].children[2].slots.subtitle[1].children[1].props.text == "project_pipelines.create_ticket", "home surface must expose create ticket action hint")
 
 local settings = handlers["project-pipelines.settings"]({})
-assert(settings.props.surface_id == "project-pipelines.settings", "settings surface id missing")
-assert(settings.props.state_counts.pipeline_definitions == 6, "settings surface must expose pipeline count")
-assert(settings.props.state_counts.sessions == 8, "settings surface must expose session count")
-assert(settings.props.state_counts.artifacts == 1, "settings surface must expose artifact count")
-assert(settings.props.state_counts.questions == 1, "settings surface must expose question count")
-assert(settings.props.state_counts.open_questions == 1, "settings surface must expose open question count")
-assert(settings.props.provider_dependency_status.id == "project-pipelines-provider-dependencies", "settings surface must expose stable provider dependency status id")
-assert(settings.props.provider_dependency_status.status == "blocked", "settings surface must represent missing provider dependency as blocked")
-assert(settings.props.provider_dependency_status.blocked_count == 1, "settings surface must count missing provider dependencies")
-assert(settings.props.provider_dependency_status.blocked[1].provider == "github", "settings surface must preserve diagnostic provider")
-assert(settings.props.provider_dependency_status.blocked[1].dependency == "github_auth", "settings surface must preserve diagnostic dependency")
+validate_ui_child_contract(settings, "settings")
+assert(settings.type == "panel", "settings surface must use hub UiNode panel primitive")
+assert(settings.id == "project-pipelines-settings", "settings surface id missing")
+assert(settings.props.title == "Project Pipelines Settings", "settings surface title missing")
 local provider_status_section = nil
 local readiness_section = nil
 local defaults_section = nil
@@ -867,14 +924,15 @@ for _, child in ipairs(settings.children) do
   end
 end
 assert(readiness_section ~= nil, "settings surface must render readiness section")
-assert(#readiness_section.children == 3, "settings readiness section must include storage, provider, and session template readiness")
+assert(readiness_section.type == "panel", "settings readiness section must use panel primitive")
+assert(#readiness_section.children[1].children == 3, "settings readiness section must include storage, provider, and session template readiness")
 assert(provider_status_section ~= nil, "settings surface must render provider dependency status node")
-assert(provider_status_section.type == "section", "settings provider status node must use a supported structural primitive")
-assert(provider_status_section.props.status == "blocked", "settings provider status node must expose blocked status")
+assert(provider_status_section.type == "panel", "settings provider status node must use a supported structural primitive")
 assert(provider_status_section.children[1].id == "project-pipelines-provider-dependency-status-summary", "settings provider status node must include stable summary text node")
-assert(provider_status_section.children[1].props.value:find("github_auth", 1, true), "settings provider status summary must name missing dependency")
+assert(provider_status_section.children[1].props.text:find("github_auth", 1, true), "settings provider status summary must name missing dependency")
+assert(provider_status_section.children[2].props.label == "blocked: 1", "settings provider status badge must expose blocked count")
 assert(defaults_section ~= nil, "settings surface must render defaults configuration section")
-assert(defaults_section.props.fields[1] == "default_spawn_target_id", "settings defaults must expose spawn target config field")
+assert(defaults_section.children[2].children[1].slots.subtitle[1].children[1].props.text == "default_spawn_target_id", "settings defaults must expose spawn target config field")
 
 local entities = tools["project_pipelines.entities"]({})
 assert(entities.ok and #entities.frames >= 5, "entity output must expose persisted state")
