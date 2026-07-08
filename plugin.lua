@@ -731,7 +731,7 @@ local function entities()
 end
 
 local function text_node(id, value)
-  return { type = "text", id = id, props = { text = value }, children = {} }
+  return { type = "text", id = id, props = { text = value } }
 end
 
 local function badge_node(id, label, tone)
@@ -739,32 +739,35 @@ local function badge_node(id, label, tone)
     type = "badge",
     id = id,
     props = { label = label, tone = tone or "default" },
-    children = {},
   }
 end
 
 local function panel_node(id, title, children, tone)
   local props = { title = title }
   if tone then props.tone = tone end
-  return { type = "panel", id = id, props = props, children = children or {} }
+  local node = { type = "panel", id = id, props = props }
+  if children and #children > 0 then node.children = children end
+  return node
 end
 
 local function inline_node(id, children)
-  return {
+  local node = {
     type = "inline",
     id = id,
     props = { gap = "sm", align = "center" },
-    children = children or {},
   }
+  if children and #children > 0 then node.children = children end
+  return node
 end
 
 local function list_node(id, children)
-  return {
+  local node = {
     type = "list",
     id = id,
     props = { aria_label = id },
-    children = children or {},
   }
+  if children and #children > 0 then node.children = children end
+  return node
 end
 
 local function list_item(id, title, subtitle, status)
@@ -782,7 +785,6 @@ local function list_item(id, title, subtitle, status)
         }),
       },
     },
-    children = {},
   }
 end
 
@@ -842,7 +844,7 @@ local function list_section(id, title, empty_title, items)
   local children = items
   if #items == 0 then
     children = {
-      { type = "empty_state", id = id .. "-empty", props = { title = empty_title }, children = {} },
+      { type = "empty_state", id = id .. "-empty", props = { title = empty_title } },
     }
   end
   return panel_node(id, title, { list_node(id .. "-list", children) })
@@ -988,19 +990,17 @@ local function bound_list(id, source, empty_title)
       props = { value = { ["$bind"] = "@/id" } },
       slots = {
         title = {
-          { type = "text", id = id .. "-row-title", props = { text = { ["$bind"] = "@/title" } }, children = {} },
+          { type = "text", id = id .. "-row-title", props = { text = { ["$bind"] = "@/title" } } },
         },
         subtitle = {
-          { type = "text", id = id .. "-row-subtitle", props = { text = { ["$bind"] = "@/status" } }, children = {} },
+          { type = "text", id = id .. "-row-subtitle", props = { text = { ["$bind"] = "@/status" } } },
         },
       },
-      children = {},
     },
     empty_template = {
       type = "empty_state",
       id = id .. "-empty",
       props = { title = empty_title },
-      children = {},
     },
   }
 end

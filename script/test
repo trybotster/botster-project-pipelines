@@ -867,6 +867,9 @@ local function validate_ui_child_contract(child, path)
   if child.type == "text" then
     assert(child.props ~= nil and child.props.text ~= nil, path .. " text node must use props.text")
   end
+  if child.children ~= nil then
+    assert(#child.children > 0, path .. " must omit empty children arrays for hub Lua-to-JSON compatibility")
+  end
   for index, nested in ipairs(child.children or {}) do
     validate_ui_child_contract(nested, path .. ".children[" .. tostring(index) .. "]")
   end
