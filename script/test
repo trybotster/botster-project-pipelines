@@ -446,16 +446,36 @@ botster = {
 local plugin = dofile("plugin.lua")
 assert(type(plugin) == "table", "plugin.lua must return a registration table")
 assert(type(plugin.tools) == "table" and #plugin.tools >= 14, "plugin must register CRUD/context/entity/activation tools")
-assert(type(plugin.handlers) == "table" and #plugin.handlers == 2, "plugin must register app and settings surface handlers")
+assert(type(plugin.handlers) == "table" and #plugin.handlers == 7, "plugin must register app/settings surfaces and workbench actions")
 
 local tools = {}
 for _, tool in ipairs(plugin.tools) do
   tools[tool.name] = tool.call
 end
 local handlers = {}
+local surface_routes = 0
+local ui_actions = 0
 for _, handler in ipairs(plugin.handlers) do
   handlers[handler.descriptor_id] = handler.call
+  if handler.kind == "surface_route" then surface_routes = surface_routes + 1 end
+  if handler.kind == "ui_action" then ui_actions = ui_actions + 1 end
 end
+assert(surface_routes == 2, "plugin must register app and settings surface routes")
+assert(ui_actions == 5, "plugin must register every declared workbench ui_action")
+assert(handlers["project_pipelines.create_ticket"] ~= nil, "create ticket ui_action must be wired")
+assert(handlers["project_pipelines.record_run"] ~= nil, "record run ui_action must be wired")
+assert(handlers["project_pipelines.activate_step"] ~= nil, "activate step ui_action must be wired")
+assert(handlers["project_pipelines.filter"] ~= nil, "filter ui_action must be wired")
+assert(handlers["project_pipelines.select_row"] ~= nil, "select row ui_action must be wired")
+
+local empty_home = handlers["project-pipelines.home"]({})
+local empty_home_sections = {}
+for _, child in ipairs(empty_home.children) do
+  empty_home_sections[child.id] = child
+end
+assert(empty_home_sections["project-pipelines-workbench"].children[1].type == "table", "empty workbench must still render project table")
+assert(empty_home_sections["project-pipelines-workbench"].children[1].props.rows == nil, "empty table rows must be omitted so Lua does not serialize an empty map")
+assert(empty_home_sections["project-pipelines-workbench"].children[1].props.empty_state.type == "empty_state", "empty table must carry empty_state primitive")
 
 local project = tools["project_pipelines.create_project"]({
   id = "proj_runtime_standalone",
@@ -560,6 +580,39 @@ local linked_ticket = tools["project_pipelines.create_ticket"]({
   title = "Runtime workspace ticket",
 })
 assert(linked_ticket.ok, "workspace ticket create failed")
+
+local invalid_ticket_action = handlers["project_pipelines.create_ticket"]({
+  request_id = "invalid-ticket-action",
+  project_id = "proj_runtime_standalone",
+  title = "   ",
+})
+assert(invalid_ticket_action.state == "rejected", "invalid create_ticket ui_action must reject")
+assert(invalid_ticket_action.action_id == "project_pipelines.create_ticket", "invalid create_ticket action id must be preserved")
+assert(invalid_ticket_action.field_errors.title[1] == "title is required", "invalid create_ticket ui_action must expose field error")
+
+local valid_ticket_action = handlers["project_pipelines.create_ticket"]({
+  request_id = "valid-ticket-action",
+  id = "ticket_runtime_action",
+  project_id = "proj_runtime_standalone",
+  title = "Runtime action ticket",
+})
+assert(valid_ticket_action.state == "accepted", "valid create_ticket ui_action must accept")
+assert(valid_ticket_action.payload.ok == true, "valid create_ticket ui_action must include tool payload")
+assert(valid_ticket_action.payload.ticket.id == "ticket_runtime_action", "valid create_ticket ui_action must persist ticket")
+
+local filter_action = handlers["project_pipelines.filter"]({
+  request_id = "filter-action",
+  status = "active",
+})
+assert(filter_action.state == "accepted", "filter ui_action must accept")
+assert(filter_action.payload.filter == "active", "filter ui_action must echo filter payload")
+
+local select_row_action = handlers["project_pipelines.select_row"]({
+  request_id = "select-row-action",
+  row_id = "run_runtime_one",
+})
+assert(select_row_action.state == "accepted", "select row ui_action must accept")
+assert(select_row_action.payload.row_id == "run_runtime_one", "select row ui_action must echo selected row")
 
 local linked_pipeline = tools["project_pipelines.define_pipeline"]({
   id = "pipeline_runtime_workspace",
@@ -822,10 +875,15 @@ local allowed_ui_node_types = {
   form_section = true,
   form_field = true,
   panel = true,
+  section = true,
+  toolbar = true,
+  metric_grid = true,
+  metric = true,
   scroll_area = true,
   text = true,
   icon = true,
   badge = true,
+  status_badge = true,
   status_dot = true,
   empty_state = true,
   list = true,
@@ -892,22 +950,46 @@ for _, child in ipairs(home.children) do
 end
 assert(home_sections["project-pipelines-command-center"] ~= nil, "home surface must render command center")
 assert(home_sections["project-pipelines-command-center"].type == "panel", "command center must use panel primitive")
-assert(home_sections["project-pipelines-command-center"].children[1].type == "inline", "command center metrics must use inline primitive")
+assert(home.children[1].id == "project-pipelines-command-center", "home first viewport must start with command center")
+assert(home.children[2].id == "project-pipelines-needs-attention", "home first viewport must put attention before drilldown")
+assert(home.children[3].id == "project-pipelines-running", "home first viewport must put running before drilldown")
+assert(home.children[4].id == "project-pipelines-ready-for-review", "home first viewport must put review before drilldown")
+assert(home_sections["project-pipelines-command-center"].children[1].type == "toolbar", "command center must use toolbar primitive")
+assert(home_sections["project-pipelines-command-center"].children[1].slots.commands[1].props.action.id == "project_pipelines.create_ticket", "toolbar must expose command actions")
+assert(home_sections["project-pipelines-command-center"].children[2].type == "metric_grid", "command center metrics must use metric_grid primitive")
+assert(home_sections["project-pipelines-command-center"].children[2].children[1].type == "metric", "command center metrics must use metric primitive")
+assert(home_sections["project-pipelines-command-center"].children[2].children[1].props.label == "Needs attention", "attention metric must be first")
 assert(home_sections["project-pipelines-needs-attention"] ~= nil, "home surface must render attention section")
-assert(home_sections["project-pipelines-needs-attention"].type == "panel", "attention section must use panel primitive")
+assert(home_sections["project-pipelines-needs-attention"].type == "section", "attention section must use section primitive")
 assert(#home_sections["project-pipelines-needs-attention"].children[1].children == 4, "attention section must count blocked, failed, and open question items")
+assert(home_sections["project-pipelines-needs-attention"].children[1].children[1].slots.subtitle[1].children[2].type == "status_badge", "attention rows must use status_badge state")
 assert(home_sections["project-pipelines-running"] ~= nil, "home surface must render running section")
+assert(home_sections["project-pipelines-running"].type == "section", "running section must use section primitive")
 assert(#home_sections["project-pipelines-running"].children[1].children == 6, "running section must count active runs")
 assert(home_sections["project-pipelines-ready-for-review"] ~= nil, "home surface must render review section")
+assert(home_sections["project-pipelines-ready-for-review"].type == "section", "review section must use section primitive")
 assert(home_sections["project-pipelines-workbench"] ~= nil, "home surface must render workbench section")
-local workbench_list = home_sections["project-pipelines-workbench"].children[1]
+assert(home_sections["project-pipelines-workbench"].type == "section", "workbench drilldown must use section primitive")
+assert(home_sections["project-pipelines-workbench"].children[1].type == "table", "workbench must use table primitive for projects")
+assert(home_sections["project-pipelines-workbench"].children[1].props.columns[1].id == "name", "project table must declare columns")
+assert(home_sections["project-pipelines-workbench"].children[1].props.rows[1].cells.name == "Runtime Standalone", "project table must expose current records")
+assert(home_sections["project-pipelines-workbench"].children[3].id == "project-pipelines-run-table", "workbench must include run table")
+assert(home_sections["project-pipelines-workbench"].children[3].props.selection.mode == "single", "run table must declare selection semantics")
+assert(home_sections["project-pipelines-workbench"].children[3].props.row_action.id == "project_pipelines.select_row", "run table must declare row action semantics")
+assert(home_sections["project-pipelines-entity-streams"] ~= nil, "home surface must preserve entity stream bindings")
+local workbench_list = home_sections["project-pipelines-entity-streams"].children[1]
 assert(workbench_list.type == "list", "workbench must use list primitive")
 assert(#workbench_list.children == 4, "workbench must include project, ticket, run, and session request lists")
 assert(workbench_list.children[1]["$kind"] == "bind_list", "workbench child must use hub bind_list child wrapper")
 assert(workbench_list.children[1].source == "/project-pipelines.project", "project binding must use absolute entity family path")
 assert(workbench_list.children[1].item_template.type == "list_item", "bound rows must render list_item primitives")
 assert(workbench_list.children[1].item_template.slots.title[1].props.text["$bind"] == "@/title", "bound row title must use hub $bind shape")
+assert(home_sections["project-pipelines-create-guidance"].type == "section", "create guidance must use section primitive")
 assert(home_sections["project-pipelines-create-guidance"].children[2].children[2].slots.subtitle[1].children[1].props.text == "project_pipelines.create_ticket", "home surface must expose create ticket action hint")
+assert(home_sections["project-pipelines-create-guidance"].children[3].type == "form", "create guidance must expose form/action feedback")
+assert(home_sections["project-pipelines-create-guidance"].children[3].children[1].type == "form_section", "action feedback must use form_section primitive")
+assert(home_sections["project-pipelines-create-guidance"].children[3].children[1].children[1].type == "form_field", "action feedback must use form_field primitive")
+assert(home_sections["project-pipelines-create-guidance"].children[3].children[1].children[3].props.action.id == "project_pipelines.activate_step", "action feedback form must route to activate_step")
 
 local settings = handlers["project-pipelines.settings"]({})
 validate_ui_child_contract(settings, "settings")
@@ -955,7 +1037,7 @@ end
 local reloaded_context = reloaded_tools["project_pipelines.current_context"]({})
 assert(reloaded_context.ok, "reloaded context failed")
 assert(#reloaded_context.projects == 2, "projects must survive plugin reload")
-assert(#reloaded_context.tickets == 2, "tickets must survive plugin reload")
+assert(#reloaded_context.tickets == 3, "tickets must survive plugin reload")
 assert(#reloaded_context.runs == 6, "runs must survive plugin reload")
 assert(#reloaded_context.session_requests == 8, "session requests must survive plugin reload")
 LUA
