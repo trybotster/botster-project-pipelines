@@ -69,12 +69,24 @@ structural node, `project-pipelines-provider-dependency-status`. A blocked
 provider dependency remains visible as settings/config status, so missing
 configuration does not crash or hide the app/settings surface.
 
-The app surface is an operator workbench. It renders a command-center summary,
-needs-attention queue, running run list, ready-for-review list, bound workbench
-lists for project/ticket/run/session-request entities, and action hints for the
-MCP tools that create and activate workflow records. Dynamic model state belongs
-in plugin-owned entity output; the surface snapshot carries enough structure for
-first render and for clients to know which entity families to refresh.
+The app surface is an operator workbench. It renders a command-center
+`metric_grid`, a `toolbar` with command/filter/action slots, needs-attention,
+running, and ready-for-review `section` queues, `status_badge` state cues,
+selectable `table` drilldowns for project/ticket/run/session-request records,
+bound workbench lists for the same entity families, `empty_state` fallbacks, and
+a `form`/`form_section`/`form_field` action feedback block for step activation.
+The first viewport order is command center, needs attention, running, and
+ready-for-review before drilldown. Dynamic model state belongs in plugin-owned
+entity output; the surface snapshot carries enough structure for first render
+and for clients to know which entity families to refresh.
+
+Workbench interactions remain renderer-neutral. Tables declare single-row
+selection and row-action metadata, while toolbar and form controls use
+plugin-owned action ids such as `project_pipelines.create_ticket`,
+`project_pipelines.record_run`, and `project_pipelines.activate_step`. CRUD and
+operator controls must remain structured UiNodes. Raw HTML is not a workbench
+transport, and iframes are reserved for later graph/report surfaces that need a
+custom full-screen visual app with an explicit plugin asset bridge.
 
 No workspace-owned grouping, PR lifecycle mutation, merge workflow, provider
 runtime, notification policy, or `botster-agents` class is added in this pass.
@@ -211,5 +223,9 @@ builds and stores the real hub DTO field names, template ID/name/capability
 selectors resolve before spawn, optional workspace IDs stay metadata only,
 PTY-backed steps call `session_templates.spawn`, blocked dependencies do not
 spawn a PTY, non-PTY steps preserve existing behavior, and app/settings surface
-handlers expose persisted project, ticket, run, session, and provider/dependency
-status state.
+handlers expose persisted project, ticket, run, session, provider/dependency
+status state, and the literal application primitives used by the operator
+workbench. Hub acceptance for packaged rendering should use
+`PluginSurfaceRender` for package `project-pipelines` and surface
+`project-pipelines.home`, with primitive shapes kept aligned to the
+`botster-hub-test-support` plugin-contract-matrix fixture.

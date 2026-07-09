@@ -74,11 +74,26 @@ session request lists instead of becoming a raw HTML or provider-specific data
 transport. UI vocabulary should refer to sessions, templates, and accessories,
 not a separate execution or agent runtime class.
 
-The first app render is an operator workbench, not a placeholder. It exposes a
-command-center summary, needs-attention queue, running run list, ready-for-review
-list, and bound workbench lists for projects, tickets, runs, and session
-requests. The create/start guidance points clients at the plugin-owned MCP tools
-that mutate durable workflow records; the surface then reflects persisted state.
+The first app render is an operator workbench, not a placeholder. It emits the
+literal application UiNode primitives consumed by hub clients: `metric_grid` and
+`metric` for the command-center summary, `toolbar` command/filter/action slots
+for the operator controls, `section` groupings for attention/running/review
+queues, `status_badge` state cues, selectable `table` rows for the
+project/ticket/run/session-request drilldown, `empty_state` fallbacks, and a
+`form`/`form_section`/`form_field` action feedback block for step activation.
+The first viewport answers needs attention, running, and ready for review before
+the drilldown tables. Entity-backed lists remain bound to
+`/project-pipelines.project`, `/project-pipelines.ticket`,
+`/project-pipelines.run`, and `/project-pipelines.session_request` so durable
+model state stays in plugin-owned entity frames instead of the UI snapshot.
+
+Workbench controls are structured UiNodes only. Tables declare single-row
+selection and row-action metadata; toolbar and form buttons route to
+plugin-owned action ids such as `project_pipelines.create_ticket`,
+`project_pipelines.record_run`, and `project_pipelines.activate_step`. Raw HTML
+and iframes are intentionally out of scope for CRUD/workbench controls. Future
+graph or report surfaces may use an iframe only when they need a custom
+full-screen visual app with an explicit plugin asset bridge.
 
 The settings surface reports provider/dependency status without importing a
 provider client. After a missing provider dependency blocks activation, the
@@ -109,6 +124,14 @@ state, `schema_present=true`, the `surfaces`, `mcp`, and `plugin_db`
 capabilities, and the declared `app` and `settings` surface descriptors.
 The manifest should include the `pipelines` navigation entry and no route path
 fields; route paths are supplied by the hub route descriptor layer.
+
+Render acceptance should exercise the production package route, not only this
+repository's Lua harness. The expected hub path is a packaged
+`PluginSurfaceRender` request for package `project-pipelines` and surface
+`project-pipelines.home`, returning `response=plugin_surface` with a surface
+tree containing `toolbar`, `metric_grid`, `metric`, `section`, `status_badge`,
+`table`, `empty_state`, and `form` primitives. The node shapes mirror the
+canonical `botster-hub-test-support` plugin-contract-matrix fixture.
 
 Real hub acceptance for this ticket is a live Project Pipelines activation, not
 only package discovery. Use a temporary hub data directory, install and enable
