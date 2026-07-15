@@ -520,6 +520,100 @@ local function show_ticket(arguments)
   return ok({ ticket = ticket })
 end
 
+local function add_ticket_dependency(arguments)
+  arguments = arguments or {}
+  local ticket_id = string_arg(arguments, "ticket_id")
+  local dependency_ticket_id = string_arg(arguments, "dependency_ticket_id")
+  if not ticket_id then return failure("validation_failed", "ticket_id is required", { "ticket_id" }) end
+  if not dependency_ticket_id then return failure("validation_failed", "dependency_ticket_id is required", { "dependency_ticket_id" }) end
+  if ticket_id == dependency_ticket_id then
+    return failure("validation_failed", "ticket cannot depend on itself", { "dependency_ticket_id" })
+  end
+  local state = load_state()
+  local ticket = find_by_id(state.tickets, ticket_id)
+  if not ticket then return failure("not_found", "ticket not found: " .. ticket_id) end
+  if not find_by_id(state.tickets, dependency_ticket_id) then
+    return failure("not_found", "dependency ticket not found: " .. dependency_ticket_id)
+  end
+  ticket.dependency_ticket_ids = array(ticket.dependency_ticket_ids)
+  if table_contains(ticket.dependency_ticket_ids, dependency_ticket_id) then
+    return ok({ ticket = ticket })
+  end
+  table.insert(ticket.dependency_ticket_ids, dependency_ticket_id)
+  push_event(state, "ticket_dependency_added", nil, ticket.id, { dependency_ticket_id = dependency_ticket_id })
+  local err = save_state(state)
+  if err then return err end
+  return ok({ ticket = ticket })
+end
+
+local function remove_ticket_dependency(arguments)
+  arguments = arguments or {}
+  local ticket_id = string_arg(arguments, "ticket_id")
+  local dependency_ticket_id = string_arg(arguments, "dependency_ticket_id")
+  if not ticket_id then return failure("validation_failed", "ticket_id is required", { "ticket_id" }) end
+  if not dependency_ticket_id then return failure("validation_failed", "dependency_ticket_id is required", { "dependency_ticket_id" }) end
+  local state = load_state()
+  local ticket = find_by_id(state.tickets, ticket_id)
+  if not ticket then return failure("not_found", "ticket not found: " .. ticket_id) end
+  local dependencies = {}
+  local removed = false
+  for _, id in ipairs(array(ticket.dependency_ticket_ids)) do
+    if id == dependency_ticket_id then
+      removed = true
+    else
+      table.insert(dependencies, id)
+    end
+  end
+  if not removed then return ok({ ticket = ticket }) end
+  ticket.dependency_ticket_ids = dependencies
+  push_event(state, "ticket_dependency_removed", nil, ticket.id, { dependency_ticket_id = dependency_ticket_id })
+  local err = save_state(state)
+  if err then return err end
+  return ok({ ticket = ticket })
+end
+
+local function update_ticket_status(arguments)
+  arguments = arguments or {}
+  local ticket_id = string_arg(arguments, "ticket_id")
+  local status = string_arg(arguments, "status")
+  if not ticket_id then return failure("validation_failed", "ticket_id is required", { "ticket_id" }) end
+  if status ~= "open" and status ~= "closed" then
+    return failure("validation_failed", "status must be open or closed", { "status" })
+  end
+  local state = load_state()
+  local ticket = find_by_id(state.tickets, ticket_id)
+  if not ticket then return failure("not_found", "ticket not found: " .. ticket_id) end
+  if ticket.status == status then return ok({ ticket = ticket }) end
+  ticket.status = status
+  push_event(state, "ticket_status_updated", nil, ticket.id, { status = status })
+  local err = save_state(state)
+  if err then return err end
+  return ok({ ticket = ticket })
+end
+
+local function unmet_ticket_dependencies(state, ticket)
+  local unmet = {}
+  for _, dependency_ticket_id in ipairs(array(ticket and ticket.dependency_ticket_ids)) do
+    local dependency_ticket = find_by_id(state.tickets, dependency_ticket_id)
+    if not dependency_ticket or dependency_ticket.status ~= "closed" then
+      table.insert(unmet, {
+        dependency_ticket_id = dependency_ticket_id,
+        status = dependency_ticket and (dependency_ticket.status or "open") or "missing",
+      })
+    end
+  end
+  return unmet
+end
+
+local function existing_spawn_activation(state, run, step)
+  if run.current_step_id ~= step.id then return nil end
+  local request = find_by_id(state.session_requests, run.session_request_id)
+  if request and request.run_id == run.id and request.step_id == step.id and request.status == "spawn_requested" then
+    return request
+  end
+  return nil
+end
+
 local function define_pipeline(arguments)
   arguments = arguments or {}
   local project_id = trim(arguments.project_id)
@@ -607,6 +701,28 @@ local function activate_step(arguments)
   local step = find_pipeline_step(pipeline, step_id)
   if not step then return failure("not_found", "step not found: " .. tostring(step_id)) end
 
+  if step.allows_open_ticket_dependencies ~= true then
+    local unmet_dependencies = unmet_ticket_dependencies(state, ticket)
+    if #unmet_dependencies > 0 then
+      local diagnostic = {
+        status = "blocked",
+        code = "ticket_dependencies_unmet",
+        message = "ticket has open blocking dependencies",
+        ticket_id = ticket.id,
+        step_id = step.id,
+        unmet_dependencies = unmet_dependencies,
+      }
+      run.blocked_transition = copy(diagnostic)
+      push_event(state, "ticket_dependencies_blocked", run.id, step.id, copy(diagnostic))
+      local err = save_state(state)
+      if err then return err end
+      return diagnostic_failure(diagnostic.code, diagnostic.message, diagnostic)
+    end
+  end
+
+  local existing_activation = existing_spawn_activation(state, run, step)
+  if existing_activation then return ok({ activation = existing_activation, run = run }) end
+
   run.current_step_id = step.id
   push_event(state, "step_started", run.id, step.id)
 
@@ -618,6 +734,7 @@ local function activate_step(arguments)
       status = "preserved_non_pty",
       reason = "step is not a PTY-backed session-template step",
     }
+    run.blocked_transition = nil
     push_event(state, "step_activation_preserved", run.id, step.id, activation)
     local err = save_state(state)
     if err then return err end
@@ -687,6 +804,7 @@ local function activate_step(arguments)
     session_id = session_request.session_id,
     status = status,
   })
+  if not response or response.ok ~= false then run.blocked_transition = nil end
   local err = save_state(state)
   if err then return err end
   if response and response.ok == false then return response end
@@ -878,6 +996,7 @@ local function status_summary(context)
     active_runs = 0,
     review_runs = 0,
     blocked_sessions = 0,
+    blocked_transitions = 0,
     failed_sessions = 0,
     open_questions = 0,
     artifacts = #context.artifacts,
@@ -888,6 +1007,9 @@ local function status_summary(context)
     end
   end
   for _, run in ipairs(context.runs) do
+    if type(run.blocked_transition) == "table" then
+      summary.blocked_transitions = summary.blocked_transitions + 1
+    end
     if run.status == "active" then
       summary.active_runs = summary.active_runs + 1
     elseif run.status == "ready_for_review" or run.status == "review" or run.status == "ready" then
@@ -906,7 +1028,7 @@ local function status_summary(context)
       summary.open_questions = summary.open_questions + 1
     end
   end
-  summary.needs_attention = summary.blocked_sessions + summary.failed_sessions + summary.open_questions
+  summary.needs_attention = summary.blocked_transitions + summary.blocked_sessions + summary.failed_sessions + summary.open_questions
   return summary
 end
 
@@ -982,6 +1104,23 @@ end
 
 local function attention_items(context)
   local items = {}
+  for _, run in ipairs(context.runs) do
+    local blocked = run.blocked_transition
+    if type(blocked) == "table" and blocked.code == "ticket_dependencies_unmet" then
+      local ticket = ticket_for_run(context, run)
+      local names = {}
+      for _, dependency in ipairs(array(blocked.unmet_dependencies)) do
+        local dependency_ticket = find_by_id(context.tickets, dependency.dependency_ticket_id)
+        table.insert(names, dependency_ticket and dependency_ticket.title or dependency.dependency_ticket_id)
+      end
+      table.insert(items, list_item(
+        "project-pipelines-attention-dependencies-" .. run.id,
+        ticket and ticket.title or run.ticket_id,
+        "Blocked before " .. tostring(blocked.step_id) .. " by " .. table.concat(names, ", "),
+        "blocked"
+      ))
+    end
+  end
   for _, request in ipairs(context.session_requests) do
     if request.status == "blocked" or request.status == "failed" then
       local ticket = find_by_id(context.tickets, request.ticket_id)
@@ -1014,11 +1153,13 @@ local function running_items(context)
     if run.status == "active" then
       local ticket = ticket_for_run(context, run)
       local pipeline = pipeline_for_run(context, run)
+      local blocked = run.blocked_transition
+      local step_id = type(blocked) == "table" and blocked.step_id or run.current_step_id
       table.insert(items, list_item(
         "project-pipelines-running-" .. run.id,
         ticket and ticket.title or run.id,
-        (pipeline and pipeline.name or run.pipeline_definition_id) .. " / " .. tostring(run.current_step_id),
-        run.status
+        (pipeline and pipeline.name or run.pipeline_definition_id) .. " / " .. tostring(step_id),
+        type(blocked) == "table" and "blocked" or run.status
       ))
     end
   end
@@ -1044,6 +1185,7 @@ end
 local bound_list
 
 local function run_status_label(run)
+  if type(run.blocked_transition) == "table" then return "blocked" end
   return run.status or "unknown"
 end
 
@@ -1091,12 +1233,19 @@ local function run_rows(context)
   for _, run in ipairs(context.runs) do
     local ticket = ticket_for_run(context, run)
     local pipeline = pipeline_for_run(context, run)
+    local blocked = run.blocked_transition
+    local blockers = {}
+    for _, dependency in ipairs(type(blocked) == "table" and array(blocked.unmet_dependencies) or {}) do
+      local dependency_ticket = find_by_id(context.tickets, dependency.dependency_ticket_id)
+      table.insert(blockers, dependency_ticket and dependency_ticket.title or dependency.dependency_ticket_id)
+    end
     table.insert(rows, {
       id = run.id,
       cells = {
         ticket = ticket and ticket.title or run.ticket_id,
         pipeline = pipeline and pipeline.name or run.pipeline_definition_id,
-        step = run.current_step_id or "",
+        step = type(blocked) == "table" and blocked.step_id or run.current_step_id or "",
+        blocker = table.concat(blockers, ", "),
         status = run_status_label(run),
       },
     })
@@ -1202,6 +1351,7 @@ local function drilldown_tables(context)
       { id = "ticket", label = "Ticket" },
       { id = "pipeline", label = "Pipeline" },
       { id = "step", label = "Step" },
+      { id = "blocker", label = "Blocking prerequisite" },
       { id = "status", label = "Status" },
     }, run_rows(context), "No runs"),
     table_node("project-pipelines-session-request-table", {
@@ -1334,7 +1484,7 @@ local function render_home()
       list_section(
         "project-pipelines-needs-attention",
         "Needs Attention",
-        "No blocked sessions, failed requests, or open questions",
+        "No blocked transitions, blocked sessions, failed requests, or open questions",
         attention_items(context)
       ),
       list_section(
@@ -1405,6 +1555,9 @@ return botster.register({
     { name = "project_pipelines.create_ticket", description = "Create a Project Pipelines ticket.", input_schema = object_schema({ project_id = { type = "string" }, workspace_id = { type = "string" }, title = { type = "string" }, description = { type = "string" }, status = { type = "string" }, dependency_ticket_ids = { type = "array" } }, { "project_id", "title" }), handler = "create_ticket", call = create_ticket },
     { name = "project_pipelines.list_tickets", description = "List Project Pipelines tickets.", input_schema = object_schema({ project_id = { type = "string" } }), handler = "list_tickets", call = list_tickets },
     { name = "project_pipelines.show_ticket", description = "Show one Project Pipelines ticket.", input_schema = object_schema({ ticket_id = { type = "string" } }, { "ticket_id" }), handler = "show_ticket", call = show_ticket },
+    { name = "project_pipelines.add_ticket_dependency", description = "Add a blocking dependency to a Project Pipelines ticket.", input_schema = object_schema({ ticket_id = { type = "string" }, dependency_ticket_id = { type = "string" } }, { "ticket_id", "dependency_ticket_id" }), handler = "add_ticket_dependency", call = add_ticket_dependency },
+    { name = "project_pipelines.remove_ticket_dependency", description = "Remove a blocking dependency from a Project Pipelines ticket.", input_schema = object_schema({ ticket_id = { type = "string" }, dependency_ticket_id = { type = "string" } }, { "ticket_id", "dependency_ticket_id" }), handler = "remove_ticket_dependency", call = remove_ticket_dependency },
+    { name = "project_pipelines.update_ticket_status", description = "Update a Project Pipelines ticket status.", input_schema = object_schema({ ticket_id = { type = "string" }, status = { type = "string", enum = { "open", "closed" } } }, { "ticket_id", "status" }), handler = "update_ticket_status", call = update_ticket_status },
     { name = "project_pipelines.define_pipeline", description = "Define a simple Project Pipelines template.", input_schema = object_schema({ project_id = { type = "string" }, name = { type = "string" }, steps = { type = "array" } }, { "project_id", "name" }), handler = "define_pipeline", call = define_pipeline },
     { name = "project_pipelines.list_pipeline_definitions", description = "List Project Pipelines templates.", input_schema = empty_schema(), handler = "list_pipeline_definitions", call = list_pipeline_definitions },
     { name = "project_pipelines.show_pipeline_definition", description = "Show one Project Pipelines template.", input_schema = object_schema({ pipeline_definition_id = { type = "string" } }, { "pipeline_definition_id" }), handler = "show_pipeline_definition", call = show_pipeline_definition },

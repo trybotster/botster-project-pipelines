@@ -154,6 +154,7 @@ for pipeline in pipelines.values():
     positions = [step["position"] for step in pipeline["steps"]]
     assert positions == sorted(positions)
     assert positions[0] == 1
+    assert pipeline["steps"][0]["allows_open_ticket_dependencies"] is True
 
 for run in runs.values():
     assert run["ticket_id"] in tickets
@@ -166,6 +167,15 @@ for run in runs.values():
     else:
         assert run["workspace_session_group_id"]
         assert run["workspace_id"]
+    blocked_transition = run.get("blocked_transition")
+    if blocked_transition:
+        assert blocked_transition["code"] == "ticket_dependencies_unmet"
+        assert blocked_transition["ticket_id"] == run["ticket_id"]
+        assert blocked_transition["step_id"] in step_ids
+        assert blocked_transition["unmet_dependencies"]
+        for dependency in blocked_transition["unmet_dependencies"]:
+            assert dependency["dependency_ticket_id"] in tickets
+            assert dependency["status"] == "open"
 
 for request in session_requests.values():
     assert request["run_id"] in runs
@@ -228,6 +238,10 @@ for event in contract["events"]:
     assert event["run_id"] in runs
     assert event["kind"] in {
         "ticket_created",
+        "ticket_dependency_added",
+        "ticket_dependency_removed",
+        "ticket_status_updated",
+        "ticket_dependencies_blocked",
         "run_started",
         "step_started",
         "step_activation_preserved",
@@ -349,6 +363,7 @@ local function deep_copy(value)
 end
 
 local spawned_session_templates = {}
+local session_template_resolution_calls = 0
 local fail_next_spawn_error = nil
 local session_template_registry = {
   { id = "template_codex_runtime", name = "Codex Runtime", capabilities = { "codex", "implementation" } },
@@ -377,6 +392,7 @@ botster = {
     },
     session_templates = {
       resolve = function(selector)
+        session_template_resolution_calls = session_template_resolution_calls + 1
         assert(type(selector) == "table", "session_templates.resolve must receive one selector table")
         if selector.kind == "name" then
           for _, template in ipairs(session_template_registry) do
@@ -396,6 +412,7 @@ botster = {
         return { ok = false, error = { code = "session_template_unavailable", message = "no matching test template" } }
       end,
       list = function()
+        session_template_resolution_calls = session_template_resolution_calls + 1
         return { templates = deep_copy(session_template_registry) }
       end,
       spawn = function(args)
@@ -850,6 +867,185 @@ assert(failed_request.status == "failed", "failed request should record failed s
 assert(failed_request.result.error.code == "session_template_spawn_failed", "failed request should store structured error")
 assert(failed_request.result.error.message:find("hub rejected spawn target", 1, true), "failed request should store hub error message")
 
+local prerequisite_ticket = tools["project_pipelines.create_ticket"]({
+  id = "ticket_runtime_prerequisite",
+  project_id = "proj_runtime_standalone",
+  title = "Runtime prerequisite",
+})
+assert(prerequisite_ticket.ok, "prerequisite ticket create failed")
+
+local dependency_pipeline = tools["project_pipelines.define_pipeline"]({
+  id = "pipeline_runtime_dependencies",
+  project_id = "proj_runtime_standalone",
+  name = "Runtime Dependency Delivery",
+  steps = {
+    { id = "step_dependency_plan", name = "Plan", position = 1, kind = "manual", allows_open_ticket_dependencies = true, gates = {} },
+    { id = "step_dependency_implement", name = "Implement", position = 2, kind = "pty", session_template_id = "template_codex_runtime", gates = {} },
+  },
+})
+assert(dependency_pipeline.ok, "dependency pipeline definition failed")
+assert(dependency_pipeline.pipeline_definition.steps[1].allows_open_ticket_dependencies == true, "planning exemption must persist")
+assert(dependency_pipeline.pipeline_definition.steps[2].allows_open_ticket_dependencies == nil, "legacy unclassified delivery step must retain safe gated default")
+
+local dependency_run = tools["project_pipelines.record_run"]({
+  id = "run_runtime_dependencies_close",
+  ticket_id = "ticket_runtime_one",
+  pipeline_definition_id = "pipeline_runtime_dependencies",
+  repository = { id = "repo_runtime_standalone", name = "example/runtime-standalone", remote = "https://example.invalid/runtime-standalone.git", path = "repo://runtime-standalone" },
+  spawn_target_id = "spawn_target_runtime_override",
+  branch = "project-pipelines/dependency-close-test",
+  worktree = { kind = "provider_owned_reference", id = "worktree_runtime_dependencies_close", path = "worktree://runtime-dependencies-close" },
+})
+assert(dependency_run.ok and dependency_run.run.current_step_id == "step_dependency_plan", "dependency close run record failed")
+
+local added_dependency = tools["project_pipelines.add_ticket_dependency"]({
+  ticket_id = "ticket_runtime_one",
+  dependency_ticket_id = "ticket_runtime_prerequisite",
+})
+assert(added_dependency.ok and #added_dependency.ticket.dependency_ticket_ids == 1, "dependency add failed")
+local duplicate_dependency = tools["project_pipelines.add_ticket_dependency"]({
+  ticket_id = "ticket_runtime_one",
+  dependency_ticket_id = "ticket_runtime_prerequisite",
+})
+assert(duplicate_dependency.ok and #duplicate_dependency.ticket.dependency_ticket_ids == 1, "dependency add must be idempotent")
+
+local planning_activation = tools["project_pipelines.activate_step"]({
+  run_id = "run_runtime_dependencies_close",
+  step_id = "step_dependency_plan",
+})
+assert(planning_activation.ok and planning_activation.activation.status == "preserved_non_pty", "explicit planning exemption must remain activatable")
+
+local before_dependency_block = tools["project_pipelines.current_context"]({})
+local before_dependency_events = #before_dependency_block.events
+local before_dependency_requests = #before_dependency_block.session_requests
+local before_dependency_spawns = #spawned_session_templates
+local before_dependency_resolutions = session_template_resolution_calls
+local before_dependency_session_id = dependency_run.run.session_id
+local before_dependency_request_id = dependency_run.run.session_request_id
+local blocked_dependency_activation = tools["project_pipelines.activate_step"]({
+  run_id = "run_runtime_dependencies_close",
+  step_id = "step_dependency_implement",
+  request_id = "session_request_runtime_dependency_close",
+})
+assert(blocked_dependency_activation.ok == false, "open ticket dependency must block activation")
+assert(blocked_dependency_activation.error.status == "blocked", "ticket dependency failure must report blocked status")
+assert(blocked_dependency_activation.error.code == "ticket_dependencies_unmet", "ticket dependency failure must use stable code")
+assert(blocked_dependency_activation.error.ticket_id == "ticket_runtime_one", "ticket dependency failure must name the dependent ticket")
+assert(blocked_dependency_activation.error.step_id == "step_dependency_implement", "ticket dependency failure must name attempted step")
+assert(blocked_dependency_activation.error.unmet_dependencies[1].dependency_ticket_id == "ticket_runtime_prerequisite", "ticket dependency failure must name prerequisite ticket")
+assert(blocked_dependency_activation.error.unmet_dependencies[1].status == "open", "ticket dependency failure must report prerequisite status")
+local blocked_dependency_context = tools["project_pipelines.current_context"]({})
+local blocked_dependency_run = nil
+for _, persisted_run in ipairs(blocked_dependency_context.runs) do
+  if persisted_run.id == "run_runtime_dependencies_close" then blocked_dependency_run = persisted_run end
+end
+assert(blocked_dependency_run.current_step_id == "step_dependency_plan", "blocked activation must preserve current step")
+assert(blocked_dependency_run.session_id == before_dependency_session_id, "blocked activation must preserve session id")
+assert(blocked_dependency_run.session_request_id == before_dependency_request_id, "blocked activation must preserve session request id")
+assert(blocked_dependency_run.blocked_transition.step_id == "step_dependency_implement", "blocked transition must persist attempted step")
+assert(#blocked_dependency_context.session_requests == before_dependency_requests, "blocked activation must not create a session request")
+assert(#spawned_session_templates == before_dependency_spawns, "blocked activation must not spawn")
+assert(session_template_resolution_calls == before_dependency_resolutions, "blocked activation must not resolve session templates")
+assert(#blocked_dependency_context.events == before_dependency_events + 1, "blocked activation must record only its diagnostic event")
+assert(blocked_dependency_context.events[#blocked_dependency_context.events].kind == "ticket_dependencies_blocked", "blocked activation must record dependency diagnostic event")
+
+local closed_dependency = tools["project_pipelines.update_ticket_status"]({
+  ticket_id = "ticket_runtime_prerequisite",
+  status = "closed",
+})
+assert(closed_dependency.ok and closed_dependency.ticket.status == "closed", "dependency close failed")
+local closed_context = tools["project_pipelines.current_context"]({})
+for _, persisted_run in ipairs(closed_context.runs) do
+  if persisted_run.id == "run_runtime_dependencies_close" then
+    assert(persisted_run.current_step_id == "step_dependency_plan", "closing dependency must not auto-advance")
+  end
+end
+local close_retry = tools["project_pipelines.activate_step"]({
+  run_id = "run_runtime_dependencies_close",
+  step_id = "step_dependency_implement",
+  request_id = "session_request_runtime_dependency_close",
+})
+assert(close_retry.ok and close_retry.activation.status == "spawn_requested", "explicit retry after close must activate")
+assert(close_retry.run.blocked_transition == nil, "successful retry must clear blocked transition")
+assert(#spawned_session_templates == before_dependency_spawns + 1, "close retry must spawn exactly once")
+local close_repeat = tools["project_pipelines.activate_step"]({
+  run_id = "run_runtime_dependencies_close",
+  step_id = "step_dependency_implement",
+})
+assert(close_repeat.ok and close_repeat.activation.id == "session_request_runtime_dependency_close", "repeat activation must reuse existing request")
+assert(#spawned_session_templates == before_dependency_spawns + 1, "repeat activation must not spawn again")
+
+local reopened_dependency = tools["project_pipelines.update_ticket_status"]({
+  ticket_id = "ticket_runtime_prerequisite",
+  status = "open",
+})
+assert(reopened_dependency.ok, "dependency reopen failed")
+local removal_run = tools["project_pipelines.record_run"]({
+  id = "run_runtime_dependencies_remove",
+  ticket_id = "ticket_runtime_one",
+  pipeline_definition_id = "pipeline_runtime_dependencies",
+  repository = { id = "repo_runtime_standalone", name = "example/runtime-standalone", remote = "https://example.invalid/runtime-standalone.git", path = "repo://runtime-standalone" },
+  spawn_target_id = "spawn_target_runtime_override",
+  branch = "project-pipelines/dependency-remove-test",
+  worktree = { kind = "provider_owned_reference", id = "worktree_runtime_dependencies_remove", path = "worktree://runtime-dependencies-remove" },
+})
+assert(removal_run.ok, "dependency removal run record failed")
+local removal_block = tools["project_pipelines.activate_step"]({
+  run_id = "run_runtime_dependencies_remove",
+  step_id = "step_dependency_implement",
+})
+assert(removal_block.ok == false and removal_block.error.code == "ticket_dependencies_unmet", "open dependency must block removal scenario")
+local removed_dependency = tools["project_pipelines.remove_ticket_dependency"]({
+  ticket_id = "ticket_runtime_one",
+  dependency_ticket_id = "ticket_runtime_prerequisite",
+})
+assert(removed_dependency.ok and #removed_dependency.ticket.dependency_ticket_ids == 0, "dependency removal failed")
+local removed_context = tools["project_pipelines.current_context"]({})
+for _, persisted_run in ipairs(removed_context.runs) do
+  if persisted_run.id == "run_runtime_dependencies_remove" then
+    assert(persisted_run.current_step_id == "step_dependency_plan", "removing dependency must not auto-advance")
+  end
+end
+local remove_retry = tools["project_pipelines.activate_step"]({
+  run_id = "run_runtime_dependencies_remove",
+  step_id = "step_dependency_implement",
+  request_id = "session_request_runtime_dependency_remove",
+})
+assert(remove_retry.ok and remove_retry.activation.status == "spawn_requested", "explicit retry after removal must activate")
+assert(#spawned_session_templates == before_dependency_spawns + 2, "remove retry must spawn exactly once")
+local remove_repeat = tools["project_pipelines.activate_step"]({
+  run_id = "run_runtime_dependencies_remove",
+  step_id = "step_dependency_implement",
+})
+assert(remove_repeat.ok and remove_repeat.activation.id == "session_request_runtime_dependency_remove", "removal repeat must reuse existing request")
+assert(#spawned_session_templates == before_dependency_spawns + 2, "removal repeat must not spawn again")
+
+local missing_dependency_ticket = tools["project_pipelines.create_ticket"]({
+  id = "ticket_runtime_missing_dependency",
+  project_id = "proj_runtime_standalone",
+  title = "Runtime missing dependency",
+  dependency_ticket_ids = { "ticket_runtime_deleted_prerequisite" },
+})
+assert(missing_dependency_ticket.ok, "missing dependency ticket create failed")
+local missing_dependency_run = tools["project_pipelines.record_run"]({
+  id = "run_runtime_missing_dependency",
+  ticket_id = "ticket_runtime_missing_dependency",
+  pipeline_definition_id = "pipeline_runtime_dependencies",
+  repository = { id = "repo_runtime_standalone", name = "example/runtime-standalone", remote = "https://example.invalid/runtime-standalone.git", path = "repo://runtime-standalone" },
+  spawn_target_id = "spawn_target_runtime_override",
+  branch = "project-pipelines/missing-dependency-test",
+  worktree = { kind = "provider_owned_reference", id = "worktree_runtime_missing_dependency", path = "worktree://runtime-missing-dependency" },
+})
+assert(missing_dependency_run.ok, "missing dependency run record failed")
+local missing_dependency_block = tools["project_pipelines.activate_step"]({
+  run_id = "run_runtime_missing_dependency",
+  step_id = "step_dependency_implement",
+})
+assert(missing_dependency_block.ok == false and missing_dependency_block.error.unmet_dependencies[1].status == "missing", "missing referenced ticket must fail safe")
+assert(#spawned_session_templates == before_dependency_spawns + 2, "missing dependency must not spawn")
+assert(tools["project_pipelines.add_ticket_dependency"]({ ticket_id = "ticket_runtime_one", dependency_ticket_id = "ticket_runtime_one" }).ok == false, "self dependency must reject")
+assert(tools["project_pipelines.update_ticket_status"]({ ticket_id = "ticket_runtime_one", status = "done" }).ok == false, "unknown ticket status must reject")
+
 local artifact = tools["project_pipelines.record_artifact"]({
   id = "artifact_runtime_one",
   run_id = "run_runtime_one",
@@ -961,11 +1157,13 @@ assert(home_sections["project-pipelines-command-center"].children[2].children[1]
 assert(home_sections["project-pipelines-command-center"].children[2].children[1].props.label == "Needs attention", "attention metric must be first")
 assert(home_sections["project-pipelines-needs-attention"] ~= nil, "home surface must render attention section")
 assert(home_sections["project-pipelines-needs-attention"].type == "section", "attention section must use section primitive")
-assert(#home_sections["project-pipelines-needs-attention"].children[1].children == 4, "attention section must count blocked, failed, and open question items")
+assert(#home_sections["project-pipelines-needs-attention"].children[1].children == 5, "attention section must count dependency blocks, blocked sessions, failures, and open questions")
+assert(home_sections["project-pipelines-needs-attention"].children[1].children[1].slots.subtitle[1].children[1].props.text:find("ticket_runtime_deleted_prerequisite", 1, true), "dependency attention row must name missing prerequisite")
+assert(home_sections["project-pipelines-needs-attention"].children[1].children[1].slots.subtitle[1].children[1].props.text:find("step_dependency_implement", 1, true), "dependency attention row must name attempted step")
 assert(home_sections["project-pipelines-needs-attention"].children[1].children[1].slots.subtitle[1].children[2].type == "status_badge", "attention rows must use status_badge state")
 assert(home_sections["project-pipelines-running"] ~= nil, "home surface must render running section")
 assert(home_sections["project-pipelines-running"].type == "section", "running section must use section primitive")
-assert(#home_sections["project-pipelines-running"].children[1].children == 6, "running section must count active runs")
+assert(#home_sections["project-pipelines-running"].children[1].children == 9, "running section must count active runs")
 assert(home_sections["project-pipelines-ready-for-review"] ~= nil, "home surface must render review section")
 assert(home_sections["project-pipelines-ready-for-review"].type == "section", "review section must use section primitive")
 assert(home_sections["project-pipelines-workbench"] ~= nil, "home surface must render workbench section")
@@ -976,6 +1174,13 @@ assert(home_sections["project-pipelines-workbench"].children[1].props.rows[1].ce
 assert(home_sections["project-pipelines-workbench"].children[3].id == "project-pipelines-run-table", "workbench must include run table")
 assert(home_sections["project-pipelines-workbench"].children[3].props.selection.mode == "single", "run table must declare selection semantics")
 assert(home_sections["project-pipelines-workbench"].children[3].props.row_action.id == "project_pipelines.select_row", "run table must declare row action semantics")
+local missing_dependency_row = nil
+for _, row in ipairs(home_sections["project-pipelines-workbench"].children[3].props.rows) do
+  if row.id == "run_runtime_missing_dependency" then missing_dependency_row = row end
+end
+assert(missing_dependency_row.cells.step == "step_dependency_implement", "blocked run row must expose attempted step")
+assert(missing_dependency_row.cells.blocker == "ticket_runtime_deleted_prerequisite", "blocked run row must expose prerequisite")
+assert(missing_dependency_row.cells.status == "blocked", "blocked run row must expose blocked status")
 assert(home_sections["project-pipelines-entity-streams"] ~= nil, "home surface must preserve entity stream bindings")
 local workbench_list = home_sections["project-pipelines-entity-streams"].children[1]
 assert(workbench_list.type == "list", "workbench must use list primitive")
@@ -1027,7 +1232,7 @@ for _, frame in ipairs(entities.frames) do
     session_frames = session_frames + 1
   end
 end
-assert(session_frames == 8, "entity output must expose session request state")
+assert(session_frames == 10, "entity output must expose session request state")
 
 local reloaded_plugin = dofile("plugin.lua")
 local reloaded_tools = {}
@@ -1037,9 +1242,14 @@ end
 local reloaded_context = reloaded_tools["project_pipelines.current_context"]({})
 assert(reloaded_context.ok, "reloaded context failed")
 assert(#reloaded_context.projects == 2, "projects must survive plugin reload")
-assert(#reloaded_context.tickets == 3, "tickets must survive plugin reload")
-assert(#reloaded_context.runs == 6, "runs must survive plugin reload")
-assert(#reloaded_context.session_requests == 8, "session requests must survive plugin reload")
+assert(#reloaded_context.tickets == 5, "tickets must survive plugin reload")
+assert(#reloaded_context.runs == 9, "runs must survive plugin reload")
+assert(#reloaded_context.session_requests == 10, "session requests must survive plugin reload")
+local reloaded_missing_run = nil
+for _, persisted_run in ipairs(reloaded_context.runs) do
+  if persisted_run.id == "run_runtime_missing_dependency" then reloaded_missing_run = persisted_run end
+end
+assert(reloaded_missing_run.blocked_transition.code == "ticket_dependencies_unmet", "blocked transition must survive plugin reload")
 LUA
 
 echo "package scaffold checks passed"
