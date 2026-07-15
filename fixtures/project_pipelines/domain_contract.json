@@ -155,6 +155,7 @@
           "name": "Plan",
           "position": 1,
           "kind": "manual",
+          "allows_open_ticket_dependencies": true,
           "gates": [
             {
               "id": "gate_plan_reviewable",
@@ -268,6 +269,19 @@
       "worktree": {
         "kind": "provider_owned_reference",
         "id": "worktree_contract_workspace"
+      },
+      "blocked_transition": {
+        "status": "blocked",
+        "code": "ticket_dependencies_unmet",
+        "message": "ticket has open blocking dependencies",
+        "ticket_id": "ticket_contract_workspace_link",
+        "step_id": "step_implement",
+        "unmet_dependencies": [
+          {
+            "dependency_ticket_id": "ticket_contract_define_domain",
+            "status": "open"
+          }
+        ]
       }
     }
   ],
@@ -576,6 +590,24 @@
       "run_id": "run_contract_standalone",
       "kind": "session_template_spawn_blocked",
       "subject_id": "session_request_contract_provider_blocked"
+    },
+    {
+      "id": "event_contract_ticket_dependency_blocked",
+      "run_id": "run_contract_workspace",
+      "kind": "ticket_dependencies_blocked",
+      "subject_id": "step_implement",
+      "payload": {
+        "status": "blocked",
+        "code": "ticket_dependencies_unmet",
+        "ticket_id": "ticket_contract_workspace_link",
+        "step_id": "step_implement",
+        "unmet_dependencies": [
+          {
+            "dependency_ticket_id": "ticket_contract_define_domain",
+            "status": "open"
+          }
+        ]
+      }
     },
     {
       "id": "event_contract_manual_preserved",

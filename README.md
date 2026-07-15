@@ -35,6 +35,14 @@ project/ticket/run/session state. The settings surface also renders
 `project-pipelines-provider-dependency-status`, a stable provider/dependency
 status section derived from persisted session request diagnostics.
 
+The harness also exercises the public ticket-dependency lifecycle through the
+registered production tools: it adds a dependency after a run starts, proves an
+open prerequisite blocks Implement without changing the current step or
+creating a session request, closes/removes the prerequisite, explicitly retries,
+and proves each run spawns only once. Missing referenced tickets fail safe and
+planning steps remain available only when they explicitly set
+`allows_open_ticket_dependencies=true`.
+
 Runtime behavior is intentionally narrow in this pass: `plugin.lua` registers
 workflow CRUD tools, a `project_pipelines.activate_step` tool, and app/settings
 surface handlers. PTY-backed steps with `session_template_id`,
@@ -50,6 +58,20 @@ activation persists `status="blocked"` with a structured diagnostic and emits
 steps do not spawn sessions. The manifest configuration schema is intentionally
 limited to package defaults, and provider or workspace integrations are contract
 references rather than runtime imports.
+
+Ticket dependencies use `ticket.dependency_ticket_ids` as their sole canonical
+representation. `project_pipelines.add_ticket_dependency`,
+`project_pipelines.remove_ticket_dependency`, and
+`project_pipelines.update_ticket_status` mutate that lifecycle without
+auto-advancing a run. Every step is dependency-gated unless it explicitly sets
+`allows_open_ticket_dependencies=true`; standard Plan/Plan Review definitions
+should set that exemption, while legacy unclassified delivery steps fail safe.
+An open or missing prerequisite returns `ok=false` with
+`error.code="ticket_dependencies_unmet"`, persists the attempted step and unmet
+ticket IDs in `run.blocked_transition`, and performs no step transition,
+session-request creation, provider/template resolution, or spawn. Closing or
+removing the blocker permits a later explicit retry, and repeated activation of
+an already spawned run/step reuses the existing request.
 
 ## UI Contract
 
@@ -86,6 +108,8 @@ the drilldown tables. Entity-backed lists remain bound to
 `/project-pipelines.project`, `/project-pipelines.ticket`,
 `/project-pipelines.run`, and `/project-pipelines.session_request` so durable
 model state stays in plugin-owned entity frames instead of the UI snapshot.
+Ticket-dependency blocks appear in needs-attention and in run rows, where the
+operator sees the attempted step and blocking prerequisite ticket.
 
 Workbench controls are structured UiNodes only. Tables declare single-row
 selection and row-action metadata; toolbar and form buttons route to
@@ -145,3 +169,8 @@ metadata for `run_id`, `step_id`, and `ticket_id`. The negative case is a PTY
 step declaring a missing provider dependency such as `github_auth`; activation
 should persist `status="blocked"`, a diagnostic naming the dependency/provider,
 and a `session_template_spawn_blocked` event without spawning a PTY session.
+Ticket dependency acceptance should separately add an open prerequisite through
+`project_pipelines.add_ticket_dependency`, attempt an unexempted delivery step,
+and observe `ticket_dependencies_unmet` with unchanged current-step and session
+state. After closing or removing the prerequisite, a later explicit activation
+should spawn once and a repeat activation should reuse that request.

@@ -55,6 +55,31 @@ rejections are normalized into a failed session request before returning a
 structured activation error. Manual, human, command, and other non-PTY steps do
 not attempt a session-template spawn.
 
+Ticket dependencies gate step activation independently of provider
+prerequisites. `ticket.dependency_ticket_ids` is the canonical link set and can
+be changed after a run starts with `project_pipelines.add_ticket_dependency`
+and `project_pipelines.remove_ticket_dependency`; the referenced ticket's
+`open`/`closed` state is changed with `project_pipelines.update_ticket_status`.
+Every target step is gated by default. Planning steps that must remain usable
+while prerequisites are open declare
+`allows_open_ticket_dependencies: true`; a missing field remains gated so
+persisted legacy delivery definitions fail safe.
+
+Before changing `run.current_step_id`, emitting `step_started`, creating a
+session request, resolving a provider/template, or spawning a session,
+`project_pipelines.activate_step` resolves every referenced ticket. Any ticket
+that is not `closed`, including a missing referenced ticket, persists
+`run.blocked_transition` plus a `ticket_dependencies_blocked` event and returns
+`ok: false` with `error.status: "blocked"`,
+`error.code: "ticket_dependencies_unmet"`, the dependent `ticket_id`, attempted
+`step_id`, and structured `unmet_dependencies` entries containing
+`dependency_ticket_id` and status.
+
+Closing or removing a dependency never advances a run automatically. A caller
+must explicitly retry activation. The successful retry clears
+`blocked_transition`; repeating activation for the same already
+`spawn_requested` run/step returns the existing request without another spawn.
+
 Declared provider prerequisites are pre-spawn blockers. A step may declare
 `required_provider_dependencies`, `provider_dependencies`, or
 `required_provider_capabilities`. If a declared dependency such as
@@ -80,6 +105,11 @@ ready-for-review before drilldown. Dynamic model state belongs in plugin-owned
 entity output; the surface snapshot carries enough structure for first render
 and for clients to know which entity families to refresh.
 
+Persisted ticket-dependency blocks appear in the needs-attention queue and run
+drilldown. Both projections name the attempted step and each blocking
+prerequisite ticket; the run row reports `blocked` without changing the run's
+persisted active status or current step.
+
 Workbench interactions remain renderer-neutral. Tables declare single-row
 selection and row-action metadata, while toolbar and form controls use
 plugin-owned action ids such as `project_pipelines.create_ticket`,
@@ -102,7 +132,7 @@ instead of copied into plugin source files.
 | Project | Plugin-owned | Product or repository grouping for tickets. Stores standalone repo and spawn-target config, and may store optional workspace IDs. |
 | Ticket | Plugin-owned | Unit of delivery within a project. Stores title, description, status, dependency links, and optional workspace ID. |
 | Pipeline definition | Plugin-owned | Ordered step template selected for a ticket run. Defines steps, gate prompts, and default routing. |
-| Step | Plugin-owned | Named execution phase such as Plan, Review, Implement, Verify, or Merge. PTY-backed steps may reference a hub `session_template_id`, `session_template_name`, or `session_template_capability`. |
+| Step | Plugin-owned | Named execution phase such as Plan, Review, Implement, Verify, or Merge. PTY-backed steps may reference a hub `session_template_id`, `session_template_name`, or `session_template_capability`. Planning steps may explicitly set `allows_open_ticket_dependencies: true`; absent/false is gated. |
 | Gate | Plugin-owned | Required evidence prompt or command attached to a step. Gate results are persisted on runs. |
 | Run | Plugin-owned | One execution of a pipeline definition for a ticket, with current step, status, assignments, and event history. |
 | Session request | Plugin-owned summary of hub-owned lifecycle | Correlation record for a requested hub session template spawn. Stores request/session IDs, template selector, resolved template ID when available, status (`spawn_requested`, `failed`, or `blocked`), bounded prompt/context summary, returned context/session references, and structured diagnostics. |
@@ -121,6 +151,9 @@ instead of copied into plugin source files.
 - A step may define zero or more gates.
 - A run belongs to one ticket and one pipeline definition.
 - A run records current step state and append-only events.
+- A ticket's `dependency_ticket_ids` identify blocking prerequisite tickets.
+  Only a referenced ticket with `status: "closed"`, or removal of its ID,
+  resolves that link.
 - PTY-backed steps may create session request records; the hub remains the
   authority for the template registry, target policy, context injection, and PTY
   lifecycle.
@@ -194,8 +227,12 @@ and external observations, not raw transcripts or secret-bearing payloads.
 Expected event kinds include:
 
 - `ticket_created`
+- `ticket_dependency_added`
+- `ticket_dependency_removed`
+- `ticket_status_updated`
 - `run_started`
 - `step_started`
+- `ticket_dependencies_blocked`
 - `step_activation_preserved`
 - `session_template_spawn_requested`
 - `session_template_spawn_failed`
@@ -216,13 +253,16 @@ Expected event kinds include:
 example. It uses synthetic IDs only and is validated by `script/test` for JSON
 shape, required relationships, standalone and workspace-linked examples,
 manifest anchors, provider capability boundaries, selector styles, blocked
-provider diagnostics, and PII/raw-path absence.
+ticket/provider diagnostics, and PII/raw-path absence.
 `script/test` also runs a headless Lua runtime harness against `plugin.lua` to
 prove CRUD persistence survives an entrypoint reload, PTY-backed step activation
 builds and stores the real hub DTO field names, template ID/name/capability
 selectors resolve before spawn, optional workspace IDs stay metadata only,
-PTY-backed steps call `session_templates.spawn`, blocked dependencies do not
-spawn a PTY, non-PTY steps preserve existing behavior, and app/settings surface
+PTY-backed steps call `session_templates.spawn`, open dependencies added to an
+active run block before transition/session/spawn side effects, close/removal
+requires an explicit retry, retries deduplicate agent activation, missing
+references fail safe, non-PTY planning exemptions preserve existing behavior,
+and app/settings surface
 handlers expose persisted project, ticket, run, session, provider/dependency
 status state, and the literal application primitives used by the operator
 workbench. Hub acceptance for packaged rendering should use
