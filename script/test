@@ -982,6 +982,33 @@ local reopened_dependency = tools["project_pipelines.update_ticket_status"]({
   status = "open",
 })
 assert(reopened_dependency.ok, "dependency reopen failed")
+local existing_request_block = tools["project_pipelines.activate_step"]({
+  run_id = "run_runtime_dependencies_close",
+  step_id = "step_dependency_implement",
+})
+assert(existing_request_block.ok == false and existing_request_block.error.code == "ticket_dependencies_unmet", "open dependency must block a step with an existing request")
+local existing_request_close = tools["project_pipelines.update_ticket_status"]({
+  ticket_id = "ticket_runtime_prerequisite",
+  status = "closed",
+})
+assert(existing_request_close.ok, "existing-request dependency close failed")
+local existing_request_retry = tools["project_pipelines.activate_step"]({
+  run_id = "run_runtime_dependencies_close",
+  step_id = "step_dependency_implement",
+})
+assert(existing_request_retry.ok and existing_request_retry.activation.id == "session_request_runtime_dependency_close", "existing-request retry must reuse the persisted request")
+assert(#spawned_session_templates == before_dependency_spawns + 1, "existing-request retry must not spawn again")
+local existing_request_context = tools["project_pipelines.current_context"]({})
+for _, persisted_run in ipairs(existing_request_context.runs) do
+  if persisted_run.id == "run_runtime_dependencies_close" then
+    assert(persisted_run.blocked_transition == nil, "existing-request retry must persist clearing blocked transition")
+  end
+end
+local reopened_removal_dependency = tools["project_pipelines.update_ticket_status"]({
+  ticket_id = "ticket_runtime_prerequisite",
+  status = "open",
+})
+assert(reopened_removal_dependency.ok, "dependency reopen for removal failed")
 local removal_run = tools["project_pipelines.record_run"]({
   id = "run_runtime_dependencies_remove",
   ticket_id = "ticket_runtime_one",

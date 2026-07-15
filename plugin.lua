@@ -720,10 +720,17 @@ local function activate_step(arguments)
     end
   end
 
+  local blocked_transition_cleared = run.blocked_transition ~= nil
   run.blocked_transition = nil
 
   local existing_activation = existing_spawn_activation(state, run, step)
-  if existing_activation then return ok({ activation = existing_activation, run = run }) end
+  if existing_activation then
+    if blocked_transition_cleared then
+      local err = save_state(state)
+      if err then return err end
+    end
+    return ok({ activation = existing_activation, run = run })
+  end
 
   run.current_step_id = step.id
   push_event(state, "step_started", run.id, step.id)
