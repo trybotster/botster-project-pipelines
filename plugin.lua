@@ -720,6 +720,8 @@ local function activate_step(arguments)
     end
   end
 
+  run.blocked_transition = nil
+
   local existing_activation = existing_spawn_activation(state, run, step)
   if existing_activation then return ok({ activation = existing_activation, run = run }) end
 
@@ -734,7 +736,6 @@ local function activate_step(arguments)
       status = "preserved_non_pty",
       reason = "step is not a PTY-backed session-template step",
     }
-    run.blocked_transition = nil
     push_event(state, "step_activation_preserved", run.id, step.id, activation)
     local err = save_state(state)
     if err then return err end
@@ -804,7 +805,6 @@ local function activate_step(arguments)
     session_id = session_request.session_id,
     status = status,
   })
-  if not response or response.ok ~= false then run.blocked_transition = nil end
   local err = save_state(state)
   if err then return err end
   if response and response.ok == false then return response end

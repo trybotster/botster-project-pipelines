@@ -348,7 +348,9 @@ for path in runtime_files:
             raise SystemExit(f"Provider/workspace implementation marker found in {path}: {marker}")
 PY
 
-lua <<'LUA'
+lua_test="$(mktemp "${TMPDIR:-/tmp}/botster-project-pipelines-test.XXXXXX")"
+trap 'rm -f "$lua_test"' EXIT HUP INT TERM
+cat > "$lua_test" <<'LUA'
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
 local durable_store = {}
@@ -1251,5 +1253,8 @@ for _, persisted_run in ipairs(reloaded_context.runs) do
 end
 assert(reloaded_missing_run.blocked_transition.code == "ticket_dependencies_unmet", "blocked transition must survive plugin reload")
 LUA
+lua "$lua_test"
+rm -f "$lua_test"
+trap - EXIT HUP INT TERM
 
 echo "package scaffold checks passed"
