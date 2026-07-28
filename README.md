@@ -134,7 +134,9 @@ activate-step dialogs use `presentation="auto"` and are wrapped in scoped
 `presentation_if` presence predicates; selected workspace content uses an
 equality predicate. Dialogs never use `props.open`. Modal visibility remains
 client-local presentation state, while tickets and runs remain plugin-owned
-entity state.
+entity state. Toolbar buttons dispatch product-authored `open_dialog` payloads
+that set their scoped presence keys; form submission is the only path that
+invokes the matching workflow mutation.
 
 Action results echo request, surface, action, and optional node identity exactly.
 Accepted filter/select results set scoped presentation values. Accepted
@@ -143,7 +145,9 @@ exposes the mutation. Rejected form results have stable input-node
 `field_errors`, `form_errors`, and `normalized_values` equal to the submitted
 values, with no presentation or replacement effects, so the active dialog and
 operator input are retained. `tree_update` and compatibility result aliases are
-not part of this contract.
+not part of this contract. Workspace-linked project rows author their own
+payload-bearing selection actions; table-level row actions are not used because
+they cannot carry row identity.
 
 The settings surface reports provider/dependency status without importing a
 provider client. After a missing provider dependency blocks activation, the
@@ -210,7 +214,9 @@ should spawn once and a repeat activation should reuse that request.
 For the Hub-owned UI contract flow, build the exact merged Hub and its locked
 Core session worker from a fresh checkout. The second binary is a
 `botster-core` target pinned by that Hub commit's `Cargo.lock`; it does not carry
-the Hub SHA.
+the Hub SHA. `script/test-hub-flow` runs both locked build commands itself after
+verifying the checkout revision, so stale target artifacts cannot satisfy the
+proof.
 
 ```sh
 git clone https://github.com/trybotster/botster-hub.git /private/tmp/botster-hub-ui-contract
@@ -224,11 +230,17 @@ script/test-hub-flow
 ```
 
 The harness verifies the Hub checkout SHA, reads the distinct Core SHA from its
-lockfile, confirms both executables came from that checkout's target directory,
-installs/enables this packaged plugin in an isolated data directory, renders the
-real `project-pipelines.home` entry point, reads action IDs from returned nodes,
-and dispatches canonical filter, select, accepted create, and rejected create
-requests through the real worker. It asserts structured
-`plugin_action_result` frames, exact identity, submit kind, values/payload
-separation, close/replacement behavior, retained normalized values/errors, and
-the selected-workspace equality binding.
+lockfile, rebuilds both executables, confirms they came from that checkout's
+target directory, installs/enables this packaged plugin in an isolated data
+directory, renders the real `project-pipelines.home` entry point, reads action
+IDs from returned nodes, reads workspace identity from a rendered row action,
+opens the rendered dialogs, and dispatches canonical filter, select, accepted
+create, and rejected create requests through the real worker. It asserts structured
+`plugin_action_result` frames, exact identity, a client-authored submit envelope,
+values/payload separation, close/replacement behavior, retained normalized
+values/errors, and the selected-workspace equality binding.
+
+`EXPECTED_HUB_COMMIT` in `script/test-hub-flow` records the Hub revision against
+which this plugin contract was proven. Advance that pin deliberately only when
+the package is re-proven against a newer Hub commit, and update the checkout
+command above in the same change.

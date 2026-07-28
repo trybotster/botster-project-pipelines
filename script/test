@@ -619,6 +619,43 @@ local function action_request(request_id, action_id, node_id, kind, values, payl
   }
 end
 
+local before_dialog_open = tools["project_pipelines.current_context"]({})
+for _, dialog in ipairs({
+  {
+    action_id = "project_pipelines.create_ticket",
+    node_id = "project-pipelines-toolbar-create-ticket",
+    key = "project-pipelines.create-ticket-dialog",
+  },
+  {
+    action_id = "project_pipelines.record_run",
+    node_id = "project-pipelines-toolbar-record-run",
+    key = "project-pipelines.record-run-dialog",
+  },
+  {
+    action_id = "project_pipelines.activate_step",
+    node_id = "project-pipelines-toolbar-activate-step",
+    key = "project-pipelines.activate-step-dialog",
+  },
+}) do
+  local opened = handlers[dialog.action_id](action_request(
+    dialog.action_id .. "-open",
+    dialog.action_id,
+    dialog.node_id,
+    "submit",
+    nil,
+    { intent = "open_dialog" }
+  ))
+  assert(opened.state == "accepted", dialog.action_id .. " toolbar action must open its dialog")
+  assert(opened.presentation[1].kind == "set", dialog.action_id .. " toolbar action must set presentation")
+  assert(opened.presentation[1].key == dialog.key, dialog.action_id .. " toolbar action must set its scoped dialog key")
+  assert(opened.presentation[1].value == true, dialog.action_id .. " toolbar action must make its dialog key present")
+  assert(opened.replacement == nil, dialog.action_id .. " toolbar open must not emit a replacement")
+end
+local after_dialog_open = tools["project_pipelines.current_context"]({})
+assert(#after_dialog_open.tickets == #before_dialog_open.tickets, "opening dialogs must not mutate tickets")
+assert(#after_dialog_open.runs == #before_dialog_open.runs, "opening dialogs must not mutate runs")
+assert(#after_dialog_open.events == #before_dialog_open.events, "opening dialogs must not create workflow events")
+
 local invalid_values = {
   project_id = "proj_runtime_standalone",
   title = "   ",
@@ -721,7 +758,13 @@ for _, kind in ipairs({ "reset", "validate", "cancel" }) do
     ))
     assert(result.state == "rejected", mutation.handler .. " must reject " .. kind)
     assert(result.presentation == nil and result.replacement == nil, mutation.handler .. " non-submit rejection must not emit effects")
-    assert(result.normalized_values == nil or result.normalized_values.run_id == mutation.values.run_id or result.normalized_values.id == mutation.values.id, mutation.handler .. " must preserve submitted non-submit values")
+    assert(type(result.normalized_values) == "table", mutation.handler .. " must retain non-submit form values")
+    for key, value in pairs(mutation.values) do
+      assert(result.normalized_values[key] == value, mutation.handler .. " must retain submitted " .. key)
+    end
+    for key, value in pairs(result.normalized_values) do
+      assert(mutation.values[key] == value, mutation.handler .. " must not invent normalized " .. key)
+    end
   end
 end
 local after_non_submit = tools["project_pipelines.current_context"]({})
@@ -1319,13 +1362,35 @@ local function collect_contract_nodes(child, forms, dialogs, predicates)
   end
 end
 
+local function assert_unique_node_ids(child, seen)
+  if child["$kind"] ~= nil then
+    if child.node then assert_unique_node_ids(child.node, seen) end
+    if child.item_template then assert_unique_node_ids(child.item_template, seen) end
+    if child.empty_template then assert_unique_node_ids(child.empty_template, seen) end
+    return
+  end
+  if child.id then
+    assert(seen[child.id] == nil, "rendered node id must be unique: " .. child.id)
+    seen[child.id] = true
+  end
+  for _, nested in ipairs(child.children or {}) do
+    assert_unique_node_ids(nested, seen)
+  end
+  for _, slot_children in pairs(child.slots or {}) do
+    for _, nested in ipairs(slot_children) do
+      assert_unique_node_ids(nested, seen)
+    end
+  end
+end
+
 local home = handlers["project-pipelines.home"]({})
 validate_ui_child_contract(home, "home")
+assert_unique_node_ids(home, {})
 local contract_forms = {}
 local contract_dialogs = {}
 local presentation_predicates = {}
 collect_contract_nodes(home, contract_forms, contract_dialogs, presentation_predicates)
-assert(#contract_forms == 4, "home must render the feedback form and three dialog forms")
+assert(#contract_forms == 3, "home must render each dialog form exactly once")
 for _, form in ipairs(contract_forms) do
   assert(type(form.props.submit_label) == "string" and form.props.submit_label:match("%S"), "every Form must declare a nonblank submit_label")
 end
@@ -1361,6 +1426,9 @@ assert(home.children[3].id == "project-pipelines-running", "home first viewport 
 assert(home.children[4].id == "project-pipelines-ready-for-review", "home first viewport must put review before drilldown")
 assert(home_sections["project-pipelines-command-center"].children[1].type == "toolbar", "command center must use toolbar primitive")
 assert(home_sections["project-pipelines-command-center"].children[1].slots.commands[1].props.action.id == "project_pipelines.create_ticket", "toolbar must expose command actions")
+assert(home_sections["project-pipelines-command-center"].children[1].slots.commands[1].props.action.payload.intent == "open_dialog", "create toolbar action must author dialog-open intent")
+assert(home_sections["project-pipelines-command-center"].children[1].slots.commands[2].props.action.payload.intent == "open_dialog", "record toolbar action must author dialog-open intent")
+assert(home_sections["project-pipelines-command-center"].children[1].slots.actions[1].props.action.payload.intent == "open_dialog", "activate toolbar action must author dialog-open intent")
 assert(home_sections["project-pipelines-command-center"].children[2].type == "metric_grid", "command center metrics must use metric_grid primitive")
 assert(home_sections["project-pipelines-command-center"].children[2].children[1].type == "metric", "command center metrics must use metric primitive")
 assert(home_sections["project-pipelines-command-center"].children[2].children[1].props.label == "Needs attention", "attention metric must be first")
@@ -1382,7 +1450,13 @@ assert(home_sections["project-pipelines-workbench"].children[1].props.columns[1]
 assert(home_sections["project-pipelines-workbench"].children[1].props.rows[1].cells.name == "Runtime Standalone", "project table must expose current records")
 assert(home_sections["project-pipelines-workbench"].children[3].id == "project-pipelines-run-table", "workbench must include run table")
 assert(home_sections["project-pipelines-workbench"].children[3].props.selection.mode == "single", "run table must declare selection semantics")
-assert(home_sections["project-pipelines-workbench"].children[3].props.row_action.id == "project_pipelines.select_row", "run table must declare row action semantics")
+assert(home_sections["project-pipelines-workbench"].children[3].props.row_action == nil, "table-level row_action must not claim implicit row identity")
+local workspace_project_row = nil
+for _, row in ipairs(home_sections["project-pipelines-workbench"].children[1].props.rows) do
+  if row.id == "proj_runtime_workspace" then workspace_project_row = row end
+end
+assert(workspace_project_row.action.id == "project_pipelines.select_row", "workspace project row must author its select action")
+assert(workspace_project_row.action.payload.row_id == "workspace_runtime_alpha", "workspace project row must carry its workspace identity")
 local missing_dependency_row = nil
 for _, row in ipairs(home_sections["project-pipelines-workbench"].children[3].props.rows) do
   if row.id == "run_runtime_missing_dependency" then missing_dependency_row = row end
@@ -1400,10 +1474,7 @@ assert(workbench_list.children[1].item_template.type == "list_item", "bound rows
 assert(workbench_list.children[1].item_template.slots.title[1].props.text["$bind"] == "@/title", "bound row title must use hub $bind shape")
 assert(home_sections["project-pipelines-create-guidance"].type == "section", "create guidance must use section primitive")
 assert(home_sections["project-pipelines-create-guidance"].children[2].children[2].slots.subtitle[1].children[1].props.text == "project_pipelines.create_ticket", "home surface must expose create ticket action hint")
-assert(home_sections["project-pipelines-create-guidance"].children[3].type == "form", "create guidance must expose form/action feedback")
-assert(home_sections["project-pipelines-create-guidance"].children[3].children[1].type == "form_section", "action feedback must use form_section primitive")
-assert(home_sections["project-pipelines-create-guidance"].children[3].children[1].children[1].type == "form_field", "action feedback must use form_field primitive")
-assert(home_sections["project-pipelines-create-guidance"].children[3].children[1].children[3].props.action.id == "project_pipelines.activate_step", "action feedback form must route to activate_step")
+assert(#home_sections["project-pipelines-create-guidance"].children == 2, "create guidance must not duplicate the activate-step dialog form")
 
 local settings = handlers["project-pipelines.settings"]({})
 validate_ui_child_contract(settings, "settings")

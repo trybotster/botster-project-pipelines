@@ -5,6 +5,8 @@ require "timeout"
 require "tmpdir"
 
 ROOT = File.expand_path("..", __dir__)
+# This pin is the merged Hub revision for the contract proven by this package.
+# README.md documents when and how to advance it.
 EXPECTED_HUB_COMMIT = "d79403c74520fa054fb8b5996958dcf739d2fee3"
 
 def required_executable(name)
@@ -14,18 +16,24 @@ def required_executable(name)
   path
 end
 
-def run!(*command)
-  raise "command failed: #{command.join(" ")}" unless system(*command)
+def run!(*command, **options)
+  raise "command failed: #{command.join(" ")}" unless system(*command, **options)
 end
 
-hub = required_executable("BOTSTER_HUB_BIN")
-session_worker = required_executable("BOTSTER_SESSION_WORKER_BIN")
 hub_source = File.realpath(ENV.fetch("BOTSTER_HUB_SOURCE") { raise "BOTSTER_HUB_SOURCE is required" })
 hub_commit = IO.popen(["git", "-C", hub_source, "rev-parse", "HEAD"], &:read).strip
 raise "unexpected Hub provenance #{hub_commit}" unless hub_commit == EXPECTED_HUB_COMMIT
 lock = File.read(File.join(hub_source, "Cargo.lock"))
 core_commit = lock.match(%r{source = "git\+https://github\.com/trybotster/botster-core\?branch=main#([0-9a-f]{40})"})&.captures&.first
 raise "botster-core git provenance is missing from Cargo.lock" unless core_commit
+
+# Produce the binaries after verifying source identity. A checkout path and HEAD
+# alone do not prove that pre-existing target artifacts came from that revision.
+run!("cargo", "build", "--locked", chdir: hub_source)
+run!("cargo", "build", "--locked", "-p", "botster-core", "--bin", "botster-session-worker", chdir: hub_source)
+
+hub = required_executable("BOTSTER_HUB_BIN")
+session_worker = required_executable("BOTSTER_SESSION_WORKER_BIN")
 target_prefix = File.join(hub_source, "target") + File::SEPARATOR
 raise "BOTSTER_HUB_BIN was not built from BOTSTER_HUB_SOURCE" unless File.realpath(hub).start_with?(target_prefix)
 raise "BOTSTER_SESSION_WORKER_BIN was not built from BOTSTER_HUB_SOURCE" unless File.realpath(session_worker).start_with?(target_prefix)

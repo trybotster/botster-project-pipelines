@@ -914,7 +914,22 @@ local function current_context()
   })
 end
 
+local function open_dialog_action(arguments, key)
+  require_action_request(arguments)
+  local kind_rejection = rejected_action_kind(arguments)
+  if kind_rejection then return kind_rejection end
+  local payload = type(arguments.payload) == "table" and arguments.payload or {}
+  if payload.intent ~= "open_dialog" then return nil end
+  return action_result(arguments, "accepted", {
+    presentation = {
+      { kind = "set", key = key, value = true },
+    },
+  })
+end
+
 local function create_ticket_action(arguments)
+  local open_result = open_dialog_action(arguments, "project-pipelines.create-ticket-dialog")
+  if open_result then return open_result end
   return action_from_tool(arguments, create_ticket, {
     field_ids = {
       project_id = "project-pipelines-create-ticket-project-id",
@@ -934,6 +949,8 @@ local function create_ticket_action(arguments)
 end
 
 local function record_run_action(arguments)
+  local open_result = open_dialog_action(arguments, "project-pipelines.record-run-dialog")
+  if open_result then return open_result end
   return action_from_tool(arguments, record_run, {
     field_ids = {
       ticket_id = "project-pipelines-record-run-ticket-id",
@@ -953,6 +970,8 @@ local function record_run_action(arguments)
 end
 
 local function activate_step_action(arguments)
+  local open_result = open_dialog_action(arguments, "project-pipelines.activate-step-dialog")
+  if open_result then return open_result end
   return action_from_tool(arguments, activate_step, {
     field_ids = {
       run_id = "project-pipelines-action-run-id",
@@ -1188,8 +1207,8 @@ local function toolbar_node(id)
     props = { label = "Workbench actions", density = "compact", variant = "plain" },
     slots = {
       commands = {
-        button_node("project-pipelines-toolbar-create-ticket", "Create ticket", "project_pipelines.create_ticket", {}),
-        button_node("project-pipelines-toolbar-record-run", "Record run", "project_pipelines.record_run", {}),
+        button_node("project-pipelines-toolbar-create-ticket", "Create ticket", "project_pipelines.create_ticket", { intent = "open_dialog" }),
+        button_node("project-pipelines-toolbar-record-run", "Record run", "project_pipelines.record_run", { intent = "open_dialog" }),
       },
       filters = {
         button_node("project-pipelines-toolbar-filter-attention", "Needs attention", "project_pipelines.filter", { status = "attention" }, "warning"),
@@ -1197,7 +1216,7 @@ local function toolbar_node(id)
         button_node("project-pipelines-toolbar-filter-review", "Review", "project_pipelines.filter", { status = "review" }, "success"),
       },
       actions = {
-        button_node("project-pipelines-toolbar-activate-step", "Activate step", "project_pipelines.activate_step", {}),
+        button_node("project-pipelines-toolbar-activate-step", "Activate step", "project_pipelines.activate_step", { intent = "open_dialog" }),
       },
     },
   }
@@ -1320,14 +1339,21 @@ end
 local function project_rows(context)
   local rows = {}
   for _, project in ipairs(context.projects) do
-    table.insert(rows, {
+    local row = {
       id = project.id,
       cells = {
         name = project.name,
         mode = project.mode or "standalone",
         spawn_target = project.spawn_target_id or "",
       },
-    })
+    }
+    if type(project.workspace_id) == "string" and project.workspace_id ~= "" then
+      row.action = {
+        id = "project_pipelines.select_row",
+        payload = { row_id = project.workspace_id },
+      }
+    end
+    table.insert(rows, row)
   end
   return rows
 end
@@ -1393,7 +1419,6 @@ local function table_node(id, columns, rows, empty_title)
   local props = {
     columns = columns,
     selection = { mode = "single" },
-    row_action = { id = "project_pipelines.select_row" },
     empty_state = {
       type = "empty_state",
       id = id .. "-empty",
@@ -1496,8 +1521,8 @@ local function presentation_dialog(key, id, title, form)
   }
 end
 
-local function workbench_dialogs()
-  return {
+local function workbench_dialogs(context)
+  local children = {
     presentation_dialog(
       "project-pipelines.create-ticket-dialog",
       "project-pipelines-create-ticket-dialog",
@@ -1532,19 +1557,24 @@ local function workbench_dialogs()
       "Activate step",
       action_feedback_form()
     ),
-    {
-      ["$kind"] = "presentation_if",
-      predicate = {
-        kind = "equals",
-        key = "selected-workspace",
-        value = "workspace_runtime_alpha",
-      },
-      node = text_node(
-        "project-pipelines-selected-workspace",
-        "Workspace workspace_runtime_alpha selected"
-      ),
-    },
   }
+  for _, project in ipairs(context.projects) do
+    if type(project.workspace_id) == "string" and project.workspace_id ~= "" then
+      table.insert(children, {
+        ["$kind"] = "presentation_if",
+        predicate = {
+          kind = "equals",
+          key = "selected-workspace",
+          value = project.workspace_id,
+        },
+        node = text_node(
+          "project-pipelines-selected-workspace-" .. project.id,
+          "Workspace " .. project.name .. " selected"
+        ),
+      })
+    end
+  end
+  return children
 end
 
 local function drilldown_tables(context)
@@ -1722,10 +1752,9 @@ local function render_home()
           list_item("project-pipelines-record-run-action", "Record run", "project_pipelines.record_run", "tool"),
           list_item("project-pipelines-activate-step-action", "Activate step", "project_pipelines.activate_step", "tool"),
         }),
-        action_feedback_form(),
       }),
     }
-  for _, dialog in ipairs(workbench_dialogs()) do
+  for _, dialog in ipairs(workbench_dialogs(context)) do
     table.insert(children, dialog)
   end
   return panel_node("project-pipelines-home", "Project Pipelines", children)

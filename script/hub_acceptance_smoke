@@ -76,14 +76,16 @@ def find_node(root, id)
   found
 end
 
-def dispatch_action(socket, action_id:, request_id:, node_id:, values: nil, payload: nil)
+def dispatch_action(socket, action_id:, request_id:, node_id: nil, kind: "submit", values: nil, payload: nil)
+  # This harness is the client, so kind is authored here rather than observed
+  # from a Hub-generated or renderer-generated dispatch.
   action_request = {
     request_id: request_id,
     surface_id: "project-pipelines.home",
     action_id: action_id,
-    node_id: node_id,
-    kind: "submit"
+    kind: kind
   }
+  action_request[:node_id] = node_id if node_id
   action_request[:values] = values if values
   action_request[:payload] = payload if payload
   response = request(socket, {
@@ -96,11 +98,16 @@ def dispatch_action(socket, action_id:, request_id:, node_id:, values: nil, payl
   assert(result["request_id"] == request_id, "#{action_id} request identity mismatch")
   assert(result["surface_id"] == "project-pipelines.home", "#{action_id} surface identity mismatch")
   assert(result["action_id"] == action_id, "#{action_id} action identity mismatch")
-  assert(result["node_id"] == node_id, "#{action_id} node identity mismatch")
+  if node_id
+    assert(result["node_id"] == node_id, "#{action_id} node identity mismatch")
+  else
+    assert(!result.key?("node_id"), "#{action_id} must preserve absent node identity")
+  end
   result
 end
 
 project_id = "project_live_#{Process.pid}"
+workspace_id = "workspace_live_#{Process.pid}"
 created_project = call_tool(socket, "project_pipelines.create_project", {
   id: project_id,
   name: "Live contract project",
@@ -109,24 +116,45 @@ created_project = call_tool(socket, "project_pipelines.create_project", {
     name: "example/live-contract",
     remote: "https://example.invalid/live-contract.git"
   },
-  spawn_target_id: "spawn_target_live_contract"
+  spawn_target_id: "spawn_target_live_contract",
+  workspace_id: workspace_id
 })
 assert(created_project["ok"] == true, "live project setup failed")
 
 surface = render_surface(socket)
 create_form = find_node(surface, "project-pipelines-create-ticket-form")
+create_button = find_node(surface, "project-pipelines-toolbar-create-ticket")
+record_button = find_node(surface, "project-pipelines-toolbar-record-run")
+activate_button = find_node(surface, "project-pipelines-toolbar-activate-step")
 filter_button = find_node(surface, "project-pipelines-toolbar-filter-running")
-run_table = find_node(surface, "project-pipelines-run-table")
+project_table = find_node(surface, "project-pipelines-project-table")
 assert(create_form, "rendered surface missing create ticket form")
+assert(create_button && record_button && activate_button, "rendered surface missing dialog toolbar buttons")
 assert(filter_button, "rendered surface missing filter button")
-assert(run_table, "rendered surface missing selectable run table")
+assert(project_table, "rendered surface missing project table")
 
 create_action_id = create_form.dig("props", "action", "id")
 filter_action_id = filter_button.dig("props", "action", "id")
-select_action_id = run_table.dig("props", "row_action", "id")
 assert(create_action_id == "project_pipelines.create_ticket", "rendered create action mismatch")
 assert(filter_action_id == "project_pipelines.filter", "rendered filter action mismatch")
-assert(select_action_id == "project_pipelines.select_row", "rendered select action mismatch")
+
+{
+  create_button => "project-pipelines.create-ticket-dialog",
+  record_button => "project-pipelines.record-run-dialog",
+  activate_button => "project-pipelines.activate-step-dialog"
+}.each_with_index do |(button, presentation_key), index|
+  action = button.dig("props", "action")
+  opened = dispatch_action(
+    socket,
+    action_id: action.fetch("id"),
+    request_id: "live-open-dialog-#{index}",
+    node_id: button.fetch("id"),
+    payload: action.fetch("payload")
+  )
+  assert(opened["state"] == "accepted", "#{presentation_key} open action was not accepted")
+  assert(opened.dig("presentation", 0, "kind") == "set", "#{presentation_key} was not opened")
+  assert(opened.dig("presentation", 0, "key") == presentation_key, "#{presentation_key} open key mismatch")
+end
 
 filter = dispatch_action(
   socket,
@@ -140,16 +168,21 @@ assert(filter.dig("payload", "filter") == "active", "filter payload did not arri
 assert(filter.dig("presentation", 0, "kind") == "set", "filter did not set presentation")
 assert(filter.dig("presentation", 0, "key") == "project-pipelines.filter", "filter presentation key mismatch")
 
+workspace_row = project_table.fetch("props").fetch("rows").find { |row| row["id"] == project_id }
+assert(workspace_row, "rendered project table missing live workspace row")
+row_action = workspace_row.fetch("action")
+assert(row_action.fetch("id") == "project_pipelines.select_row", "workspace row select action mismatch")
+assert(row_action.dig("payload", "row_id") == workspace_id, "workspace row did not author its identity payload")
 select = dispatch_action(
   socket,
-  action_id: select_action_id,
+  action_id: row_action.fetch("id"),
   request_id: "live-select",
-  node_id: run_table.fetch("id"),
-  payload: { row_id: "workspace_runtime_alpha" }
+  payload: row_action.fetch("payload")
 )
 assert(select["state"] == "accepted", "select action was not accepted")
-assert(select.dig("payload", "row_id") == "workspace_runtime_alpha", "select payload did not arrive")
+assert(select.dig("payload", "row_id") == workspace_id, "select payload did not arrive")
 assert(select.dig("presentation", 0, "key") == "selected-workspace", "select presentation key mismatch")
+assert(select.dig("presentation", 0, "value") == workspace_id, "select presentation value mismatch")
 
 ticket_id = "ticket_live_#{Process.pid}"
 submitted_values = {
@@ -188,11 +221,15 @@ assert(rejected.dig("field_errors", "project-pipelines-create-ticket-title", 0) 
 assert(!rejected.key?("presentation"), "rejected create must preserve presentation")
 assert(!rejected.key?("replacement"), "rejected create must not replace the tree")
 
-predicates = []
+presentation_bindings = []
 each_node(surface) do |node|
-  predicates << node["predicate"] if node["$kind"] == "presentation_if"
+  presentation_bindings << node if node["$kind"] == "presentation_if"
 end
-selected = predicates.find { |predicate| predicate["kind"] == "equals" && predicate["key"] == "selected-workspace" }
-assert(selected && selected["value"] == "workspace_runtime_alpha", "selected-workspace equality predicate missing")
+selected = presentation_bindings.find do |binding|
+  binding.dig("predicate", "kind") == "equals" &&
+    binding.dig("predicate", "key") == "selected-workspace"
+end
+assert(selected && selected.dig("predicate", "value") == workspace_id, "selected-workspace equality predicate missing")
+assert(selected.dig("node", "props", "text") == "Workspace Live contract project selected", "selected workspace copy must derive from product data")
 
-puts "script/hub_acceptance_smoke: ok project_id=#{project_id} ticket_id=#{ticket_id} kind=submit"
+puts "script/hub_acceptance_smoke: ok project_id=#{project_id} ticket_id=#{ticket_id} client_authored_kind=submit"
