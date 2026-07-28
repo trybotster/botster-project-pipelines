@@ -1,14 +1,16 @@
 # Project Pipelines Domain Contract
 
-This repository defines and implements the first Project Pipelines plugin
-domain path. Pipeline workflow state is plugin-owned, while PTY execution is
+This repository is the sole source and runtime authority for the Project
+Pipelines plugin and sourced Botster Stack Delivery workflow. Pipeline workflow
+state is plugin-owned, while PTY execution is
 delegated to hub-owned session templates. The runtime package is declared by
 `botster-package.json` and wired through the `plugin.lua` entrypoint.
 
 `botster-package.json` is the source of truth for package descriptors:
 
 - package name: `project-pipelines`
-- capabilities: `surfaces`, `mcp`, and `plugin_db`
+- capabilities: `surfaces`, `mcp`, `plugin_db`, and narrowly scoped
+  `session_actions/session_template_managed_git_spawn`
 - Lua entrypoint: `plugin.lua`
 - configuration schema: default spawn target, default session template selector,
   default pipeline mode, and optional workspace id
@@ -20,7 +22,7 @@ delegated to hub-owned session templates. The runtime package is declared by
 
 ## Runtime Disposition
 
-The current production path is local workflow CRUD plus PTY-backed step
+The production path is the checked-in workflow engine plus PTY-backed step
 activation through hub session templates. `plugin.lua` is self-contained because
 the installed Lua package runtime does not expose the standard module loader. It
 registers MCP-style tools for project, ticket, pipeline definition, run, step
@@ -38,18 +40,19 @@ hub-admitted route descriptors and clients.
 Project Pipelines does not create an agent runtime. For a PTY-backed step with a
 `session_template_id`, `session_template_name`/`template_name`, or
 `session_template_capability`/`session_capability`,
-`project_pipelines.activate_step` resolves the hub template selector and builds a
-`DaemonSessionTemplateRequest`-shaped payload. The request uses the hub-client
-field names: `template_id`, optional `session_id`, `target_id`, optional `cwd`,
-optional `environment`, and `context` containing `worktree_path`, `repo_path`,
-`branch_name`, `prompt`, `ticket_id`, optional `workspace_id`, and `metadata`.
-`environment` and `metadata` are string-keyed string maps to match the hub DTO
-contract. Existing ID selection is direct. Name and capability selectors use the
+`project_pipelines.activate_step` resolves the Hub template selector and builds a
+managed-worktree payload. The request carries only semantic caller inputs:
+`template_id`, `target_id`, `branch`, optional environment, and `context`
+containing `prompt`, `ticket_id`, optional `workspace_id`, and metadata.
+Session ID, worktree/repository paths, base ref, and resolved branch facts are
+trusted Hub outputs and are never caller-supplied. Existing ID selection is
+direct. Name and capability selectors use the
 hub `session_templates.resolve` capability when available, then
 `session_templates.list` as a deterministic registry fallback. If neither
 resolution path is available, Project Pipelines persists a blocked diagnostic
 instead of falling back silently. PTY-backed activation sends one resolved
-request table to the hub `session_templates.spawn` plugin capability and
+request table to the Hub `session_templates.ensure_worktree_and_spawn`
+capability and
 persists the request summary and returned session/context references. Hub spawn
 rejections are normalized into a failed session request before returning a
 structured activation error. Manual, human, command, and other non-PTY steps do
@@ -165,15 +168,17 @@ instead of copied into plugin source files.
 
 ## Persistence Boundaries
 
-Plugin-owned durable records belong in Project Pipelines runtime storage, such
-as `plugin-data/project-pipelines/db.sqlite` when the runtime engine is added.
-Mutable runtime records must not be written under the plugin source tree. The
-minimal implementation stores one versioned plugin-owned state document through
-the Botster plugin database capability.
+Plugin-owned durable records use the Hub's scoped plugin database capability and
+versioned, prefix-addressable keys (`v2/<family>/<id>`). Mutable runtime records
+never live under the plugin source tree. The package does not read the retired
+all-domain blob or any catalog/runtime compatibility source. Records are
+independently retryable; counters are reserved before domain writes so an
+interrupted multi-key operation can leave an observable ID gap but cannot reuse
+an ID or overwrite a partially written record.
 
 Provider-owned facts remain external facts. Project Pipelines may cache stable
 references and lifecycle observations, but provider APIs, OAuth, webhooks, and
-pull-request mutations belong to provider implementations outside this scaffold.
+pull-request mutations belong to provider implementations outside this package.
 
 Workspace integration is optional. Standalone Project Pipelines records must be
 complete with explicit repository and spawn-target configuration. When a
@@ -258,7 +263,7 @@ ticket/provider diagnostics, and PII/raw-path absence.
 prove CRUD persistence survives an entrypoint reload, PTY-backed step activation
 builds and stores the real hub DTO field names, template ID/name/capability
 selectors resolve before spawn, optional workspace IDs stay metadata only,
-PTY-backed steps call `session_templates.spawn`, open dependencies added to an
+PTY-backed steps call `session_templates.ensure_worktree_and_spawn`, open dependencies added to an
 active run block before transition/session/spawn side effects, close/removal
 requires an explicit retry, retries deduplicate agent activation, missing
 references fail safe, non-PTY planning exemptions preserve existing behavior,

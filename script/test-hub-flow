@@ -3,11 +3,13 @@
 
 require "timeout"
 require "tmpdir"
+require "fileutils"
+require "json"
 
 ROOT = File.expand_path("..", __dir__)
 # This pin is the merged Hub revision for the contract proven by this package.
 # README.md documents when and how to advance it.
-EXPECTED_HUB_COMMIT = "d79403c74520fa054fb8b5996958dcf739d2fee3"
+EXPECTED_HUB_COMMIT = "35e92f46a98c445765b6ba7755e029f5dde702f8"
 
 def required_executable(name)
   path = File.expand_path(ENV.fetch(name) { raise "#{name} must point at an executable" }, ROOT)
@@ -42,6 +44,40 @@ raise "BOTSTER_SESSION_WORKER_BIN was not built from BOTSTER_HUB_SOURCE" unless 
 
 temporary_root = Dir.exist?("/private/tmp") ? "/private/tmp" : Dir.tmpdir
 Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
+  downstream_root = File.join(data_dir, "downstream-tui-kit")
+  FileUtils.mkdir_p(downstream_root)
+  run!("git", "init", "-b", "main", downstream_root)
+  run!("git", "-C", downstream_root, "config", "user.email", "botster@example.invalid")
+  run!("git", "-C", downstream_root, "config", "user.name", "Botster Acceptance")
+  File.write(File.join(downstream_root, "README.md"), "# downstream TUI-kit acceptance\n")
+  run!("git", "-C", downstream_root, "add", "README.md")
+  run!("git", "-C", downstream_root, "commit", "-m", "Initialize downstream acceptance repository")
+
+  template_root = File.join(data_dir, "downstream-plan-template")
+  FileUtils.mkdir_p(File.join(template_root, "bin"))
+  File.write(File.join(template_root, "plugin.lua"), "return botster.register({})\n")
+  plan_script = File.join(template_root, "bin", "plan.sh")
+  File.write(plan_script, "#!/bin/sh\nprintf 'downstream-plan\\n' > downstream-plan-ran.txt\n")
+  File.chmod(0o755, plan_script)
+  File.write(
+    File.join(template_root, "botster-package.json"),
+    JSON.pretty_generate({
+      name: "downstream-plan.fixture",
+      version: "1.0.0",
+      kind: "plugin",
+      botster: ">=0.1.0",
+      source: { type: "path", path: "." },
+      capabilities: [{ surface: "surfaces" }],
+      entrypoints: [{ runtime: "lua", path: "plugin.lua", bootstrap: false }],
+      session_templates: [{
+        id: "plan",
+        command: "bin/plan.sh",
+        target_id: "tgt_3dfae49c02454037bf13554f552baf7f",
+        context: %w[prompt ticket_id]
+      }]
+    })
+  )
+
   socket_path = File.join(data_dir, "botster-hub.sock")
   log_path = File.join(data_dir, "botster-hub.log")
   log = File.open(log_path, "w")
@@ -70,9 +106,42 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
       end
     end
 
+    run!(hub, "packages", "install", "--data-dir", data_dir, "--path", template_root)
+    run!(hub, "packages", "enable", "--data-dir", data_dir, "downstream-plan.fixture")
     run!(hub, "packages", "install", "--data-dir", data_dir, "--path", ROOT)
     run!(hub, "packages", "enable", "--data-dir", data_dir, "project-pipelines")
-    run!(File.join(ROOT, "script", "hub_acceptance_smoke"), socket_path)
+    run!(File.join(ROOT, "script", "hub_acceptance_smoke"), socket_path, "primary", downstream_root)
+
+    run!(hub, "shutdown", "--data-dir", data_dir)
+    Timeout.timeout(10) do
+      Process.waitpid(hub_pid)
+      hub_status = $?
+    end
+    raise "isolated hub failed before restart" unless hub_status.success?
+    hub_status = nil
+    File.delete(socket_path) if File.exist?(socket_path)
+
+    hub_pid = Process.spawn(
+      hub,
+      "start",
+      "--data-dir",
+      data_dir,
+      "--session-worker-bin",
+      session_worker,
+      out: log,
+      err: log
+    )
+    Timeout.timeout(20) do
+      until File.socket?(socket_path)
+        if Process.waitpid(hub_pid, Process::WNOHANG)
+          hub_status = $?
+          log.flush
+          raise "isolated hub exited during restart:\n#{File.read(log_path)}"
+        end
+        sleep 0.05
+      end
+    end
+    run!(File.join(ROOT, "script", "hub_acceptance_smoke"), socket_path, "verify_restart", downstream_root)
   rescue StandardError => error
     failure = error
   ensure

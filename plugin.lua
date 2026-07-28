@@ -1,4 +1,25 @@
-local STATE_KEY = "state"
+local STORE_SCHEMA_VERSION = 2
+local STORE_ROOT = "v2/"
+local SOURCE_REVISION = "botster-stack-delivery/2026-07-28.1"
+
+local RECORD_FAMILIES = {
+  "projects",
+  "tickets",
+  "pipeline_definitions",
+  "runs",
+  "gate_results",
+  "reviews",
+  "findings",
+  "artifacts",
+  "checklists",
+  "checklist_items",
+  "questions",
+  "answers",
+  "pr_links",
+  "events",
+  "session_requests",
+  "advance_requests",
+}
 
 local function empty_schema()
   return { type = "object", properties = {}, additionalProperties = false }
@@ -42,6 +63,18 @@ local function copy(value)
     result[key] = copy(nested)
   end
   return result
+end
+
+local function deep_equal(left, right)
+  if type(left) ~= type(right) then return false end
+  if type(left) ~= "table" then return left == right end
+  for key, value in pairs(left) do
+    if not deep_equal(value, right[key]) then return false end
+  end
+  for key in pairs(right) do
+    if left[key] == nil then return false end
+  end
+  return true
 end
 
 local function ok(payload)
@@ -149,54 +182,137 @@ end
 
 local function default_state()
   return {
-    schema_version = 1,
+    schema_version = STORE_SCHEMA_VERSION,
     counters = {
       project = 0,
       ticket = 0,
       pipeline_definition = 0,
       run = 0,
+      gate_result = 0,
+      review = 0,
+      finding = 0,
       artifact = 0,
+      checklist = 0,
+      checklist_item = 0,
       question = 0,
+      answer = 0,
+      pr_link = 0,
       event = 0,
       session_request = 0,
+      advance_request = 0,
     },
     projects = {},
     tickets = {},
     pipeline_definitions = {},
     runs = {},
+    gate_results = {},
+    reviews = {},
+    findings = {},
     artifacts = {},
+    checklists = {},
+    checklist_items = {},
     questions = {},
+    answers = {},
+    pr_links = {},
     events = {},
     session_requests = {},
+    advance_requests = {},
+    _original_counters = {},
+    _originals = {},
+    _positions = {},
   }
 end
 
+local function store()
+  return botster and botster.capabilities and botster.capabilities.plugin_db
+end
+
+local function record_key(family, id)
+  return STORE_ROOT .. family .. "/" .. id
+end
+
+local function record_payload(response)
+  if type(response) ~= "table" or type(response.record) ~= "table" then return nil end
+  return type(response.record.payload) == "table" and response.record.payload or nil
+end
+
+local function list_entries(response)
+  if type(response) ~= "table" then return {} end
+  return type(response.entries) == "table" and response.entries or {}
+end
+
 local function load_state()
-  local plugin_db = botster and botster.capabilities and botster.capabilities.plugin_db
-  if not plugin_db or type(plugin_db.get) ~= "function" then return default_state() end
-  local loaded = plugin_db.get({ key = STATE_KEY })
-  if type(loaded) ~= "table" or type(loaded.record) ~= "table" or type(loaded.record.payload) ~= "table" then
-    return default_state()
+  local plugin_db = store()
+  local state = default_state()
+  if not plugin_db or type(plugin_db.get) ~= "function" or type(plugin_db.list) ~= "function" then
+    return state
   end
-  local state = copy(loaded.record.payload)
-  state.counters = state.counters or {}
-  state.projects = state.projects or {}
-  state.tickets = state.tickets or {}
-  state.pipeline_definitions = state.pipeline_definitions or {}
-  state.runs = state.runs or {}
-  state.artifacts = state.artifacts or {}
-  state.questions = state.questions or {}
-  state.events = state.events or {}
-  state.session_requests = state.session_requests or {}
+
+  local counters = record_payload(plugin_db.get({ key = STORE_ROOT .. "meta/counters" }))
+  if counters then state.counters = counters end
+  state._original_counters = copy(state.counters)
+  for _, family in ipairs(RECORD_FAMILIES) do
+    state._originals[family] = {}
+    state._positions[family] = {}
+    local listed = plugin_db.list({ prefix = STORE_ROOT .. family .. "/" })
+    for _, entry in ipairs(list_entries(listed)) do
+      if type(entry.key) == "string" then
+        local payload = record_payload(plugin_db.get({ key = entry.key }))
+        if payload then
+          state._positions[family][payload.id] = payload._store_position
+          table.insert(state[family], payload)
+        end
+      end
+    end
+    table.sort(state[family], function(left, right)
+      local left_position = left._store_position
+      local right_position = right._store_position
+      if type(left_position) == "number" and type(right_position) == "number" then
+        return left_position < right_position
+      end
+      return tostring(left.id) < tostring(right.id)
+    end)
+    for _, record in ipairs(state[family]) do
+      record._store_position = nil
+      state._originals[family][record.id] = copy(record)
+    end
+  end
   return state
 end
 
 local function save_state(state)
-  local plugin_db = botster and botster.capabilities and botster.capabilities.plugin_db
+  local plugin_db = store()
   if not plugin_db or type(plugin_db.set) ~= "function" then
     return failure("persist_failed", "plugin_db capability is unavailable")
   end
-  plugin_db.set({ key = STATE_KEY, schema_version = 1, payload = state })
+
+  -- Records are independently addressable. Counters are reserved first so an
+  -- interrupted multi-key mutation may leave an observable id gap, but a retry
+  -- cannot reuse an id or overwrite a partially written record.
+  if not deep_equal(state.counters, state._original_counters or {}) then
+    plugin_db.set({
+      key = STORE_ROOT .. "meta/counters",
+      schema_version = STORE_SCHEMA_VERSION,
+      payload = state.counters,
+    })
+  end
+  for _, family in ipairs(RECORD_FAMILIES) do
+    for position, record in ipairs(state[family] or {}) do
+      local original = state._originals and state._originals[family] and state._originals[family][record.id]
+      if not original or not deep_equal(record, original) then
+        local payload = copy(record)
+        payload._store_position = state._positions
+          and state._positions[family]
+          and state._positions[family][record.id]
+          or position
+        plugin_db.set({
+          key = record_key(family, record.id),
+          schema_version = STORE_SCHEMA_VERSION,
+          payload = payload,
+        })
+      end
+    end
+  end
   return nil
 end
 
@@ -233,6 +349,174 @@ local function find_pipeline_step(pipeline, step_id)
     if step.id == step_id then return step end
   end
   return nil
+end
+
+local REPOSITORY_PLAYBOOKS = {
+  ["botster-core"] = "[[botster-core-playbook]]",
+  ["botster-hub"] = "[[botster-hub-playbook]]",
+  ["botster-hub-client"] = "[[botster-hub-client-playbook]]",
+  ["botster-web"] = "[[botster-web-playbook]]",
+  ["botster-tui"] = "[[botster-tui-playbook]]",
+  ["botster-tui-kit"] = "[[botster-tui-kit-playbook]]",
+  ["botster-terminal-ghostty"] = "[[botster-terminal-ghostty-playbook]]",
+}
+
+local function project_pipelines_path(path)
+  if type(path) ~= "string" then return false end
+  return path == "plugin.lua"
+    or path == "botster-package.json"
+    or path:match("^project[_%-]pipelines/")
+    or path:match("^fixtures/project_pipelines/")
+end
+
+local function resolve_repository_playbook(arguments)
+  arguments = arguments or {}
+  local repository = trim(arguments.repository)
+    or trim(arguments.repository_name)
+    or trim(arguments.name)
+  local path = trim(arguments.path)
+  local matches = {}
+  if repository then
+    local slug = repository:match("([^/]+)$") or repository
+    if REPOSITORY_PLAYBOOKS[slug] then
+      table.insert(matches, REPOSITORY_PLAYBOOKS[slug])
+    end
+    if slug == "botster-project-pipelines" then
+      table.insert(matches, "[[project-pipelines-playbook]]")
+    end
+  end
+  if project_pipelines_path(path) then
+    table.insert(matches, "[[project-pipelines-playbook]]")
+  end
+  local unique = {}
+  local charters = {}
+  for _, charter in ipairs(matches) do
+    if not unique[charter] then
+      unique[charter] = true
+      table.insert(charters, charter)
+    end
+  end
+  if #charters == 0 then
+    return failure("routing_question_required", "repository does not resolve to a supported ownership charter")
+  end
+  if #charters > 1 then
+    return failure("routing_question_required", "repository routing resolved to multiple ownership charters")
+  end
+  return ok({ repository = repository, path = path, playbook = charters[1] })
+end
+
+local ROUTING_PROMPT = [=[
+Resolve target_id to the authoritative repository before acting. Load exactly
+one repository charter: botster-core -> [[botster-core-playbook]];
+botster-hub -> [[botster-hub-playbook]]; botster-hub-client ->
+[[botster-hub-client-playbook]]; botster-web -> [[botster-web-playbook]];
+botster-tui -> [[botster-tui-playbook]]; botster-tui-kit ->
+[[botster-tui-kit-playbook]]; botster-terminal-ghostty ->
+[[botster-terminal-ghostty-playbook]]. Project Pipelines package/plugin paths
+load [[project-pipelines-playbook]]. Zero or multiple matches require a routing
+question; never substitute a generic charter or load every charter.
+]=]
+
+local function sourced_step(id, name, position, agent_name, role_prompt, options)
+  options = options or {}
+  return {
+    id = id,
+    name = name,
+    position = position,
+    kind = options.kind or "pty",
+    session_template_capability = options.session_template_capability or "botster.pipeline.agent",
+    agent_name = agent_name,
+    prompt = role_prompt .. "\n\n" .. ROUTING_PROMPT,
+    allows_open_ticket_dependencies = options.allows_open_ticket_dependencies == true,
+    gates = options.gates or {},
+    next_step_id = options.next_step_id,
+    source_revision = SOURCE_REVISION,
+  }
+end
+
+local function botster_stack_delivery_source()
+  return {
+    id = "botster_stack_delivery",
+    source_id = "botster_stack_delivery",
+    source_revision = SOURCE_REVISION,
+    source_authority = "trybotster/botster-project-pipelines:plugin.lua",
+    name = "Botster Stack Delivery",
+    merge_policy = "pr",
+    steps = {
+      sourced_step("botster_stack_plan", "Plan", 1, "codex", "Create a repository-specific implementation plan and persist a reviewable plan artifact.", {
+        allows_open_ticket_dependencies = true,
+        next_step_id = "botster_stack_plan_review",
+        gates = {
+          { id = "plan_artifact", required = true, prompt = "Persist the approved plan and vault workflow evidence." },
+        },
+      }),
+      sourced_step("botster_stack_plan_review", "Plan Review", 2, "claude", "Independently verify repository routing, ownership, risks, and executable acceptance checks.", {
+        allows_open_ticket_dependencies = true,
+        next_step_id = "botster_stack_implement",
+        gates = {
+          { id = "plan_review", required = true, prompt = "Submit an approved plan review with no open blocker findings." },
+        },
+      }),
+      sourced_step("botster_stack_implement", "Implement", 3, "codex", "Implement the approved plan in the routed run worktree and prove the production entry point.", {
+        next_step_id = "botster_stack_review",
+        gates = {
+          { id = "implementation", required = true, prompt = "Provide committed diff evidence, tests, a report artifact, and a linked PR." },
+        },
+      }),
+      sourced_step("botster_stack_review", "Review", 4, "claude", "Review correctness, regressions, architecture fit, tests, docs, dead paths, and hidden assumptions.", {
+        next_step_id = "botster_stack_verify",
+        gates = {
+          { id = "review", required = true, prompt = "Submit an approved review with no open findings." },
+        },
+      }),
+      sourced_step("botster_stack_verify", "Verify", 5, "codex", "Rerun live-worktree evidence and recheck every resolved blocker against observed state.", {
+        next_step_id = "botster_stack_merge",
+        gates = {
+          { id = "verification", required = true, prompt = "Attach fresh live-worktree command evidence for tests and resolved findings." },
+        },
+      }),
+      sourced_step("botster_stack_merge", "Merge", 6, "codex", "Confirm the linked pull request is merge-ready and record the terminal disposition.", {
+        kind = "manual",
+        gates = {
+          { id = "merge_ready", required = true, prompt = "Confirm the linked PR is ready and all required gates are durable." },
+        },
+      }),
+    },
+  }
+end
+
+local function same_source_revision(pipeline)
+  return pipeline
+    and pipeline.source_id == "botster_stack_delivery"
+    and pipeline.source_revision == SOURCE_REVISION
+end
+
+local function reconcile_sourced_pipeline()
+  local state = load_state()
+  local source = botster_stack_delivery_source()
+  local existing = find_by_id(state.pipeline_definitions, source.id)
+  if same_source_revision(existing) then return existing end
+
+  if existing then
+    local selected_agents = {}
+    for _, step in ipairs(array(existing.steps)) do
+      if type(step.agent_name) == "string" and step.agent_name ~= "" then
+        selected_agents[step.id] = step.agent_name
+      end
+    end
+    for _, step in ipairs(source.steps) do
+      step.agent_name = selected_agents[step.id] or step.agent_name
+    end
+    for key in pairs(existing) do existing[key] = nil end
+    for key, value in pairs(source) do existing[key] = copy(value) end
+    push_event(state, "pipeline_source_reconciled", nil, source.id, { source_revision = SOURCE_REVISION })
+  else
+    table.insert(state.pipeline_definitions, source)
+    push_event(state, "pipeline_source_initialized", nil, source.id, { source_revision = SOURCE_REVISION })
+  end
+  local err = save_state(state)
+  if err then error(err.error and err.error.message or "failed to reconcile sourced pipeline") end
+  return source
 end
 
 local function step_uses_session_template(step)
@@ -326,7 +610,7 @@ local function resolve_from_list(selector, templates)
   return nil
 end
 
-local function resolve_session_template(selector, step, capabilities)
+local function resolve_session_template(selector, step, capabilities, target_id)
   local dependency = first_required_provider_dependency(step)
   if dependency and not provider_dependency_available(dependency, capabilities) then
     return blocked_diagnostic("provider_dependency_missing", "required provider dependency is unavailable", {
@@ -368,7 +652,7 @@ local function resolve_session_template(selector, step, capabilities)
   end
 
   if type(session_templates.list) == "function" then
-    local ok_response, response = pcall(session_templates.list, {})
+    local ok_response, response = pcall(session_templates.list, { target_id = target_id })
     if not ok_response then
       return blocked_diagnostic("session_template_resolution_failed", tostring(response), {
         template_selector = selector,
@@ -446,20 +730,37 @@ local function build_session_template_request(arguments, run, ticket, project, s
   }
 end
 
-local function spawn_session_template(resolved_template, session_id, request)
+local function spawn_session_template(resolved_template, request)
   local capabilities = botster and botster.capabilities or {}
   local session_templates = capabilities.session_templates
-  if not session_templates or type(session_templates.spawn) ~= "function" then
+  if not session_templates then
     return failure("session_templates_unavailable", "hub session template spawn capability is unavailable")
   end
 
-  request.template_id = resolved_template.template_id
-  request.session_id = session_id
-  local ok_response, response = pcall(session_templates.spawn, request)
-  if not ok_response then
-    return failure("session_template_spawn_failed", tostring(response))
+  if type(session_templates.ensure_worktree_and_spawn) ~= "function" then
+    return failure("session_templates_unavailable", "managed session template spawn capability is unavailable")
   end
-  return response
+  local operation = session_templates.ensure_worktree_and_spawn
+  local dispatched_request = {
+    template_id = resolved_template.template_id,
+    target_id = request.target_id,
+    branch = request.context and request.context.branch_name,
+    environment = request.environment,
+    context = {
+      prompt = request.context and request.context.prompt,
+      ticket_id = request.context and request.context.ticket_id,
+      workspace_id = request.context and request.context.workspace_id,
+      metadata = request.context and request.context.metadata,
+    },
+  }
+  local ok_response, response = pcall(operation, dispatched_request)
+  if not ok_response then
+    return failure("session_template_spawn_failed", tostring(response)), dispatched_request
+  end
+  if type(response) == "table" and response.ok == true and type(response.result) == "table" then
+    return response.result, dispatched_request
+  end
+  return response, dispatched_request
 end
 
 local function repository_from(arguments)
@@ -788,13 +1089,19 @@ local function activate_step(arguments)
   end
 
   local request_id = string_arg(arguments, "request_id") or next_id(state, "session_request")
-  local session_id = string_arg(arguments, "session_id")
   local request = build_session_template_request(arguments, run, ticket, project, step)
   if not request.target_id or request.target_id == "" then
     return failure("validation_failed", "spawn target is required for session-template activation", { "target_id" })
   end
   local selector = session_template_selector(step)
-  local resolved = resolve_session_template(selector, step, botster and botster.capabilities or {})
+  if string_arg(arguments, "session_template_id") then
+    selector = {
+      kind = "id",
+      template_id = string_arg(arguments, "session_template_id"),
+      value = string_arg(arguments, "session_template_id"),
+    }
+  end
+  local resolved = resolve_session_template(selector, step, botster and botster.capabilities or {}, request.target_id)
   if resolved and resolved.ok == false then
     local session_request = {
       id = request_id,
@@ -803,7 +1110,7 @@ local function activate_step(arguments)
       ticket_id = ticket.id,
       template_id = selector and selector.template_id,
       template_selector = selector,
-      session_id = session_id,
+      session_id = nil,
       status = "blocked",
       request = request,
       result = resolved,
@@ -824,7 +1131,8 @@ local function activate_step(arguments)
     return resolved
   end
 
-  local response = spawn_session_template(resolved, session_id, request)
+  local response, dispatched_request = spawn_session_template(resolved, request)
+  request = dispatched_request or request
   local status = response and response.ok == false and "failed" or "spawn_requested"
   local session_request = {
     id = request_id,
@@ -833,7 +1141,7 @@ local function activate_step(arguments)
     ticket_id = ticket.id,
     template_id = resolved.template_id,
     template_selector = selector,
-    session_id = session_id or response and (response.session_id or response.session_uuid),
+    session_id = response and (response.session_id or response.session_uuid),
     status = status,
     request = request,
     result = response,
@@ -869,6 +1177,7 @@ local function record_artifact(arguments)
     kind = string_arg(arguments, "kind") or "report",
     summary = string_arg(arguments, "summary"),
     uri = string_arg(arguments, "uri"),
+    payload = type(arguments.payload) == "table" and copy(arguments.payload) or nil,
   }
   table.insert(state.artifacts, artifact)
   push_event(state, "artifact_added", run_id, artifact.id)
@@ -891,6 +1200,8 @@ local function record_question(arguments)
     ticket_id = string_arg(arguments, "ticket_id"),
     step_id = string_arg(arguments, "step_id"),
     status = string_arg(arguments, "status") or "open",
+    blocking = arguments.blocking == true,
+    asked_by = string_arg(arguments, "asked_by"),
     question = question_text,
   }
   table.insert(state.questions, question)
@@ -900,17 +1211,363 @@ local function record_question(arguments)
   return ok({ question = question })
 end
 
-local function current_context()
+local function answer_question(arguments)
+  arguments = arguments or {}
+  local question_id = string_arg(arguments, "question_id")
+  local text = trim(arguments.answer)
+  if not question_id then return failure("validation_failed", "question_id is required", { "question_id" }) end
+  if not text or text == "" then return failure("validation_failed", "answer is required", { "answer" }) end
   local state = load_state()
+  local question = find_by_id(state.questions, question_id)
+  if not question then return failure("not_found", "question not found: " .. question_id) end
+  if question.status == "answered" then
+    for _, existing in ipairs(state.answers) do
+      if existing.question_id == question_id then return ok({ answer = existing, question = question }) end
+    end
+  end
+  local answer = {
+    id = string_arg(arguments, "id") or next_id(state, "answer"),
+    question_id = question_id,
+    run_id = question.run_id,
+    answered_by = string_arg(arguments, "answered_by"),
+    answer = text,
+  }
+  table.insert(state.answers, answer)
+  question.status = "answered"
+  question.answer_id = answer.id
+  push_event(state, "question_answered", question.run_id, question.id, { answer_id = answer.id })
+  local err = save_state(state)
+  if err then return err end
+  return ok({ answer = answer, question = question })
+end
+
+local function submit_gate(arguments)
+  arguments = arguments or {}
+  local run_id = string_arg(arguments, "run_id")
+  local step_id = string_arg(arguments, "step_id")
+  local gate_id = string_arg(arguments, "gate_id")
+  if not run_id then return failure("validation_failed", "run_id is required", { "run_id" }) end
+  if not step_id then return failure("validation_failed", "step_id is required", { "step_id" }) end
+  if not gate_id then return failure("validation_failed", "gate_id is required", { "gate_id" }) end
+  local state = load_state()
+  local run = find_by_id(state.runs, run_id)
+  if not run then return failure("not_found", "run not found: " .. run_id) end
+  local pipeline = find_by_id(state.pipeline_definitions, run.pipeline_definition_id)
+  local step = find_pipeline_step(pipeline, step_id)
+  if not step then return failure("not_found", "step not found: " .. step_id) end
+  local gate
+  for _, candidate in ipairs(array(step.gates)) do
+    if candidate.id == gate_id then gate = candidate end
+  end
+  if not gate then return failure("not_found", "gate not found: " .. gate_id) end
+  local result
+  for _, candidate in ipairs(state.gate_results) do
+    if candidate.run_id == run_id and candidate.step_id == step_id and candidate.gate_id == gate_id then
+      result = candidate
+    end
+  end
+  if not result then
+    result = {
+      id = string_arg(arguments, "id") or next_id(state, "gate_result"),
+      run_id = run_id,
+      step_id = step_id,
+      gate_id = gate_id,
+    }
+    table.insert(state.gate_results, result)
+  end
+  result.status = string_arg(arguments, "status") or "passed"
+  result.summary = string_arg(arguments, "summary")
+  result.evidence = type(arguments.evidence) == "table" and copy(arguments.evidence) or {}
+  push_event(state, "gate_submitted", run_id, result.id, {
+    step_id = step_id,
+    gate_id = gate_id,
+    status = result.status,
+  })
+  local err = save_state(state)
+  if err then return err end
+  return ok({ gate_result = result })
+end
+
+local function submit_review(arguments)
+  arguments = arguments or {}
+  local run_id = string_arg(arguments, "run_id")
+  local step_id = string_arg(arguments, "step_id")
+  local verdict = string_arg(arguments, "verdict")
+  if not run_id then return failure("validation_failed", "run_id is required", { "run_id" }) end
+  if not step_id then return failure("validation_failed", "step_id is required", { "step_id" }) end
+  if verdict ~= "approved" and verdict ~= "changes_required" and verdict ~= "blocked" then
+    return failure("validation_failed", "verdict must be approved, changes_required, or blocked", { "verdict" })
+  end
+  local state = load_state()
+  if not find_by_id(state.runs, run_id) then return failure("not_found", "run not found: " .. run_id) end
+  local review = {
+    id = string_arg(arguments, "id") or next_id(state, "review"),
+    run_id = run_id,
+    step_id = step_id,
+    verdict = verdict,
+    summary = string_arg(arguments, "summary"),
+  }
+  table.insert(state.reviews, review)
+  for _, input in ipairs(array(arguments.findings)) do
+    local finding = {
+      id = input.id or next_id(state, "finding"),
+      review_id = review.id,
+      run_id = run_id,
+      step_id = step_id,
+      severity = input.severity or "medium",
+      status = input.status or "open",
+      title = input.title or "Review finding",
+      details = input.details,
+      file = input.file,
+      line = input.line,
+      suggested_fix = input.suggested_fix,
+    }
+    table.insert(state.findings, finding)
+    push_event(state, "finding_opened", run_id, finding.id, { review_id = review.id })
+  end
+  push_event(state, "review_submitted", run_id, review.id, { verdict = verdict })
+  local err = save_state(state)
+  if err then return err end
+  return ok({ review = review })
+end
+
+local function resolve_finding(arguments)
+  arguments = arguments or {}
+  local finding_id = string_arg(arguments, "finding_id")
+  if not finding_id then return failure("validation_failed", "finding_id is required", { "finding_id" }) end
+  local state = load_state()
+  local finding = find_by_id(state.findings, finding_id)
+  if not finding then return failure("not_found", "finding not found: " .. finding_id) end
+  finding.status = "resolved"
+  finding.resolution = string_arg(arguments, "resolution")
+  push_event(state, "finding_resolved", finding.run_id, finding.id)
+  local err = save_state(state)
+  if err then return err end
+  return ok({ finding = finding })
+end
+
+local function create_checklist(arguments)
+  arguments = arguments or {}
+  local run_id = string_arg(arguments, "run_id")
+  local name = trim(arguments.name)
+  if not run_id then return failure("validation_failed", "run_id is required", { "run_id" }) end
+  if not name or name == "" then return failure("validation_failed", "name is required", { "name" }) end
+  local state = load_state()
+  if not find_by_id(state.runs, run_id) then return failure("not_found", "run not found: " .. run_id) end
+  local checklist = {
+    id = string_arg(arguments, "id") or next_id(state, "checklist"),
+    run_id = run_id,
+    step_id = string_arg(arguments, "step_id"),
+    source = string_arg(arguments, "source") or "pipeline",
+    name = name,
+    description = string_arg(arguments, "description"),
+  }
+  table.insert(state.checklists, checklist)
+  push_event(state, "checklist_created", run_id, checklist.id)
+  local err = save_state(state)
+  if err then return err end
+  return ok({ checklist = checklist })
+end
+
+local function add_checklist_item(arguments)
+  arguments = arguments or {}
+  local checklist_id = string_arg(arguments, "checklist_id")
+  local text = trim(arguments.text)
+  if not checklist_id then return failure("validation_failed", "checklist_id is required", { "checklist_id" }) end
+  if not text or text == "" then return failure("validation_failed", "text is required", { "text" }) end
+  local state = load_state()
+  local checklist = find_by_id(state.checklists, checklist_id)
+  if not checklist then return failure("not_found", "checklist not found: " .. checklist_id) end
+  local item = {
+    id = string_arg(arguments, "id") or next_id(state, "checklist_item"),
+    checklist_id = checklist_id,
+    run_id = checklist.run_id,
+    text = text,
+    status = string_arg(arguments, "status") or "completed",
+    evidence = type(arguments.evidence) == "table" and copy(arguments.evidence) or nil,
+  }
+  table.insert(state.checklist_items, item)
+  push_event(state, "checklist_item_added", checklist.run_id, item.id, { checklist_id = checklist_id })
+  local err = save_state(state)
+  if err then return err end
+  return ok({ checklist_item = item })
+end
+
+local function link_pr(arguments)
+  arguments = arguments or {}
+  local run_id = string_arg(arguments, "run_id")
+  local url = trim(arguments.url)
+  if not run_id then return failure("validation_failed", "run_id is required", { "run_id" }) end
+  if not url or url == "" then return failure("validation_failed", "url is required", { "url" }) end
+  local state = load_state()
+  local run = find_by_id(state.runs, run_id)
+  if not run then return failure("not_found", "run not found: " .. run_id) end
+  for _, existing in ipairs(state.pr_links) do
+    if existing.run_id == run_id and existing.url == url then return ok({ pr_link = existing }) end
+  end
+  local link = {
+    id = string_arg(arguments, "id") or next_id(state, "pr_link"),
+    run_id = run_id,
+    ticket_id = run.ticket_id,
+    url = url,
+    provider = string_arg(arguments, "provider") or "github",
+    status = string_arg(arguments, "status") or "open",
+  }
+  table.insert(state.pr_links, link)
+  push_event(state, "pr_linked", run_id, link.id)
+  local err = save_state(state)
+  if err then return err end
+  return ok({ pr_link = link })
+end
+
+local function gate_result_for(state, run_id, step_id, gate_id)
+  local selected
+  for _, result in ipairs(state.gate_results) do
+    if result.run_id == run_id and result.step_id == step_id and result.gate_id == gate_id then
+      selected = result
+    end
+  end
+  return selected
+end
+
+local function transition_blockers(state, run, pipeline, step)
+  local blockers = {}
+  for _, gate in ipairs(array(step.gates)) do
+    local result = gate_result_for(state, run.id, step.id, gate.id)
+    if gate.required ~= false and (not result or result.status ~= "passed") then
+      table.insert(blockers, { kind = "gate", gate_id = gate.id })
+    end
+  end
+  local latest_review
+  for _, review in ipairs(state.reviews) do
+    if review.run_id == run.id and review.step_id == step.id then latest_review = review end
+  end
+  if latest_review and latest_review.verdict ~= "approved" then
+    table.insert(blockers, { kind = "review", review_id = latest_review.id, verdict = latest_review.verdict })
+  end
+  for _, finding in ipairs(state.findings) do
+    if finding.run_id == run.id and finding.status ~= "resolved" and finding.status ~= "waived" then
+      table.insert(blockers, { kind = "finding", finding_id = finding.id, severity = finding.severity })
+    end
+  end
+  if step.id == "botster_stack_implement" then
+    local result = gate_result_for(state, run.id, step.id, "implementation")
+    local evidence = result and result.evidence or {}
+    if type(evidence.commit_sha) ~= "string" or evidence.commit_sha == "" then
+      table.insert(blockers, { kind = "implementation_commit" })
+    end
+    if type(evidence.diff_against_base) ~= "string" or evidence.diff_against_base == "" then
+      table.insert(blockers, { kind = "implementation_diff" })
+    end
+    local linked = false
+    for _, pr_link in ipairs(state.pr_links) do
+      if pr_link.run_id == run.id and type(pr_link.url) == "string" and pr_link.url ~= "" then linked = true end
+    end
+    if pipeline.merge_policy == "pr" and not linked then
+      table.insert(blockers, { kind = "pr_link" })
+    end
+  end
+  if step.id == "botster_stack_verify" then
+    local result = gate_result_for(state, run.id, step.id, "verification")
+    local verified = result and result.evidence and result.evidence.resolved_finding_ids or {}
+    for _, finding in ipairs(state.findings) do
+      if finding.run_id == run.id
+        and finding.status == "resolved"
+        and (finding.severity == "blocker" or finding.severity == "high")
+        and not table_contains(verified, finding.id)
+      then
+        table.insert(blockers, { kind = "resolved_finding_evidence", finding_id = finding.id })
+      end
+    end
+  end
+  return blockers
+end
+
+local function request_step_advance(arguments)
+  arguments = arguments or {}
+  local run_id = string_arg(arguments, "run_id")
+  if not run_id then return failure("validation_failed", "run_id is required", { "run_id" }) end
+  local state = load_state()
+  local run = find_by_id(state.runs, run_id)
+  if not run then return failure("not_found", "run not found: " .. run_id) end
+  local request_id = string_arg(arguments, "request_id")
+  if request_id then
+    for _, request in ipairs(state.advance_requests) do
+      if request.request_id == request_id then return copy(request.result) end
+    end
+  end
+  local pipeline = find_by_id(state.pipeline_definitions, run.pipeline_definition_id)
+  if not pipeline then return failure("not_found", "pipeline definition not found: " .. run.pipeline_definition_id) end
+  local current_step = find_pipeline_step(pipeline, run.current_step_id)
+  if not current_step then return failure("not_found", "current step not found: " .. tostring(run.current_step_id)) end
+  local next_step_id = string_arg(arguments, "next_step_id") or current_step.next_step_id
+  if not next_step_id then return failure("terminal_step", "current step has no next step") end
+  local next_step = find_pipeline_step(pipeline, next_step_id)
+  if not next_step then return failure("not_found", "next step not found: " .. next_step_id) end
+  local blockers = transition_blockers(state, run, pipeline, current_step)
+  local ticket = find_by_id(state.tickets, run.ticket_id)
+  if next_step.allows_open_ticket_dependencies ~= true then
+    for _, dependency in ipairs(unmet_ticket_dependencies(state, ticket)) do
+      table.insert(blockers, { kind = "ticket_dependency", dependency = dependency })
+    end
+  end
+  if #blockers > 0 then
+    return diagnostic_failure("transition_blocked", "step transition has unmet requirements", {
+      status = "blocked",
+      run_id = run.id,
+      step_id = current_step.id,
+      next_step_id = next_step_id,
+      blockers = blockers,
+    })
+  end
+  run.current_step_id = next_step_id
+  run.status = "active"
+  push_event(state, "step_advanced", run.id, next_step_id, { from_step_id = current_step.id })
+  local response = ok({ run = copy(run), previous_step_id = current_step.id, step_id = next_step_id })
+  if request_id then
+    table.insert(state.advance_requests, {
+      id = next_id(state, "advance_request"),
+      request_id = request_id,
+      run_id = run.id,
+      result = copy(response),
+    })
+  end
+  local err = save_state(state)
+  if err then return err end
+  return response
+end
+
+local function records_for_run(records, run_id)
+  if not run_id then return records end
+  local selected = {}
+  for _, record in ipairs(records) do
+    if record.run_id == run_id then table.insert(selected, record) end
+  end
+  return selected
+end
+
+local function current_context(arguments)
+  arguments = arguments or {}
+  local state = load_state()
+  local run_id = string_arg(arguments, "run_id")
   return ok({
     projects = state.projects,
     tickets = state.tickets,
     pipeline_definitions = state.pipeline_definitions,
-    runs = state.runs,
-    artifacts = state.artifacts,
-    questions = state.questions,
-    events = state.events,
-    session_requests = state.session_requests,
+    runs = records_for_run(state.runs, run_id),
+    gate_results = records_for_run(state.gate_results, run_id),
+    reviews = records_for_run(state.reviews, run_id),
+    findings = records_for_run(state.findings, run_id),
+    artifacts = records_for_run(state.artifacts, run_id),
+    checklists = records_for_run(state.checklists, run_id),
+    checklist_items = records_for_run(state.checklist_items, run_id),
+    questions = records_for_run(state.questions, run_id),
+    answers = records_for_run(state.answers, run_id),
+    pr_links = records_for_run(state.pr_links, run_id),
+    events = records_for_run(state.events, run_id),
+    session_requests = records_for_run(state.session_requests, run_id),
+    source_revision = SOURCE_REVISION,
+    source_authority = "trybotster/botster-project-pipelines:plugin.lua",
   })
 end
 
@@ -1049,6 +1706,13 @@ local function entities()
   emit("ticket", context.tickets)
   emit("pipeline_definition", context.pipeline_definitions)
   emit("run", context.runs)
+  emit("gate_result", context.gate_results)
+  emit("review", context.reviews)
+  emit("finding", context.findings)
+  emit("artifact", context.artifacts)
+  emit("checklist", context.checklists)
+  emit("question", context.questions)
+  emit("pr_link", context.pr_links)
   emit("session_request", context.session_requests)
   return ok({ frames = frames })
 end
@@ -1792,6 +2456,8 @@ local function render_settings()
     })
 end
 
+reconcile_sourced_pipeline()
+
 return botster.register({
   tools = {
     { name = "project_pipelines.create_project", description = "Create a Project Pipelines project.", input_schema = object_schema({ name = { type = "string" }, repository = { type = "object" }, repository_id = { type = "string" }, repository_name = { type = "string" }, repository_remote = { type = "string" }, spawn_target_id = { type = "string" }, workspace_id = { type = "string" } }, { "name", "spawn_target_id" }), handler = "create_project", call = create_project },
@@ -1807,10 +2473,19 @@ return botster.register({
     { name = "project_pipelines.list_pipeline_definitions", description = "List Project Pipelines templates.", input_schema = empty_schema(), handler = "list_pipeline_definitions", call = list_pipeline_definitions },
     { name = "project_pipelines.show_pipeline_definition", description = "Show one Project Pipelines template.", input_schema = object_schema({ pipeline_definition_id = { type = "string" } }, { "pipeline_definition_id" }), handler = "show_pipeline_definition", call = show_pipeline_definition },
     { name = "project_pipelines.record_run", description = "Record a Project Pipelines run skeleton.", input_schema = object_schema({ ticket_id = { type = "string" }, pipeline_definition_id = { type = "string" }, current_step_id = { type = "string" }, status = { type = "string" }, workspace_session_group_id = { type = "string" }, workspace_id = { type = "string" }, repository = { type = "object" }, spawn_target_id = { type = "string" }, branch = { type = "string" }, base_ref = { type = "string" }, worktree = { type = "object" }, worktree_id = { type = "string" } }, { "ticket_id", "pipeline_definition_id" }), handler = "record_run", call = record_run },
-    { name = "project_pipelines.activate_step", description = "Activate a run step and spawn a hub session template for PTY-backed steps.", input_schema = object_schema({ run_id = { type = "string" }, step_id = { type = "string" }, request_id = { type = "string" }, session_id = { type = "string" }, repository = { type = "object" }, spawn_target_id = { type = "string" }, branch = { type = "string" }, worktree = { type = "object" }, workspace_id = { type = "string" }, prompt = { type = "string" }, cwd = { type = "string" }, environment = { type = "object" }, metadata = { type = "object" } }, { "run_id" }), handler = "activate_step", call = activate_step },
-    { name = "project_pipelines.record_artifact", description = "Record a Project Pipelines artifact.", input_schema = object_schema({ run_id = { type = "string" }, step_id = { type = "string" }, kind = { type = "string" }, summary = { type = "string" }, uri = { type = "string" } }, { "run_id" }), handler = "record_artifact", call = record_artifact },
-    { name = "project_pipelines.record_question", description = "Record a Project Pipelines question.", input_schema = object_schema({ run_id = { type = "string" }, ticket_id = { type = "string" }, step_id = { type = "string" }, status = { type = "string" }, question = { type = "string" } }, { "run_id", "question" }), handler = "record_question", call = record_question },
-    { name = "project_pipelines.current_context", description = "Return persisted Project Pipelines context.", input_schema = empty_schema(), handler = "current_context", call = current_context },
+    { name = "project_pipelines.activate_step", description = "Activate a run step and atomically ensure a managed Git worktree and Hub session template.", input_schema = object_schema({ run_id = { type = "string" }, step_id = { type = "string" }, request_id = { type = "string" }, session_template_id = { type = "string" }, repository = { type = "object" }, spawn_target_id = { type = "string" }, branch = { type = "string" }, worktree = { type = "object" }, workspace_id = { type = "string" }, prompt = { type = "string" }, environment = { type = "object" }, metadata = { type = "object" } }, { "run_id" }), handler = "activate_step", call = activate_step },
+    { name = "project_pipelines.submit_gate", description = "Persist gate evidence for one run step.", input_schema = object_schema({ run_id = { type = "string" }, step_id = { type = "string" }, gate_id = { type = "string" }, status = { type = "string" }, summary = { type = "string" }, evidence = { type = "object" } }, { "run_id", "step_id", "gate_id" }), handler = "submit_gate", call = submit_gate },
+    { name = "project_pipelines.submit_review", description = "Persist a review and its findings.", input_schema = object_schema({ run_id = { type = "string" }, step_id = { type = "string" }, verdict = { type = "string" }, summary = { type = "string" }, findings = { type = "array" } }, { "run_id", "step_id", "verdict" }), handler = "submit_review", call = submit_review },
+    { name = "project_pipelines.resolve_finding", description = "Resolve one durable review finding.", input_schema = object_schema({ finding_id = { type = "string" }, resolution = { type = "string" } }, { "finding_id" }), handler = "resolve_finding", call = resolve_finding },
+    { name = "project_pipelines.record_artifact", description = "Record a Project Pipelines artifact.", input_schema = object_schema({ run_id = { type = "string" }, step_id = { type = "string" }, kind = { type = "string" }, summary = { type = "string" }, uri = { type = "string" }, payload = { type = "object" } }, { "run_id" }), handler = "record_artifact", call = record_artifact },
+    { name = "project_pipelines.create_checklist", description = "Create a durable pipeline or vault checklist.", input_schema = object_schema({ run_id = { type = "string" }, step_id = { type = "string" }, source = { type = "string" }, name = { type = "string" }, description = { type = "string" } }, { "run_id", "name" }), handler = "create_checklist", call = create_checklist },
+    { name = "project_pipelines.add_checklist_item", description = "Add evidence to a durable checklist.", input_schema = object_schema({ checklist_id = { type = "string" }, text = { type = "string" }, status = { type = "string" }, evidence = { type = "object" } }, { "checklist_id", "text" }), handler = "add_checklist_item", call = add_checklist_item },
+    { name = "project_pipelines.record_question", description = "Record a Project Pipelines question.", input_schema = object_schema({ run_id = { type = "string" }, ticket_id = { type = "string" }, step_id = { type = "string" }, status = { type = "string" }, blocking = { type = "boolean" }, asked_by = { type = "string" }, question = { type = "string" } }, { "run_id", "question" }), handler = "record_question", call = record_question },
+    { name = "project_pipelines.answer_question", description = "Answer one durable Project Pipelines question.", input_schema = object_schema({ question_id = { type = "string" }, answer = { type = "string" }, answered_by = { type = "string" } }, { "question_id", "answer" }), handler = "answer_question", call = answer_question },
+    { name = "project_pipelines.link_pr", description = "Link a pull request to a run.", input_schema = object_schema({ run_id = { type = "string" }, url = { type = "string" }, provider = { type = "string" }, status = { type = "string" } }, { "run_id", "url" }), handler = "link_pr", call = link_pr },
+    { name = "project_pipelines.request_step_advance", description = "Advance a run when durable gates, reviews, findings, dependencies, commit evidence, and PR linkage allow it.", input_schema = object_schema({ run_id = { type = "string" }, next_step_id = { type = "string" }, request_id = { type = "string" } }, { "run_id" }), handler = "request_step_advance", call = request_step_advance },
+    { name = "project_pipelines.resolve_repository_playbook", description = "Resolve exactly one supported repository ownership charter.", input_schema = object_schema({ repository = { type = "string" }, repository_name = { type = "string" }, name = { type = "string" }, path = { type = "string" } }), handler = "resolve_repository_playbook", call = resolve_repository_playbook },
+    { name = "project_pipelines.current_context", description = "Return persisted Project Pipelines context.", input_schema = object_schema({ run_id = { type = "string" } }), handler = "current_context", call = current_context },
     { name = "project_pipelines.entities", description = "Return Project Pipelines entity frames.", input_schema = empty_schema(), handler = "entities", call = entities },
   },
   handlers = {

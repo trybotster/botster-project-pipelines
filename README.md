@@ -2,11 +2,14 @@
 
 First-party Botster Project Pipelines plugin.
 
-This package is intended to own project pipeline state, tickets, runs, gates,
-questions, artifacts, findings, and provider-mediated PR lifecycle behavior as a
-self-contained Botster plugin.
+This standalone package is the only runtime and source authority for Project
+Pipelines and the sourced Botster Stack Delivery workflow. It owns the durable
+record schema, engine policy, MCP tools, routing allowlist, workflow definitions,
+questions, gates, reviews/findings, artifacts/checklists, PR links, entity
+projections, and operator surfaces. It does not read catalog code or rows, a
+legacy CLI, sibling checkouts, or compatibility sources.
 
-This repository is a production-shaped Project Pipelines plugin. It declares the
+This repository is the production Project Pipelines plugin. It declares the
 package identity, compatibility, Lua entrypoint, package configuration schema,
 MCP/plugin database capabilities, navigation, and app/settings surface
 descriptors needed for local package install and discovery. Workflow state stays
@@ -43,21 +46,50 @@ and proves each run spawns only once. Missing referenced tickets fail safe and
 planning steps remain available only when they explicitly set
 `allows_open_ticket_dependencies=true`.
 
-Runtime behavior is intentionally narrow in this pass: `plugin.lua` registers
-workflow CRUD tools, a `project_pipelines.activate_step` tool, and app/settings
-surface handlers. PTY-backed steps with `session_template_id`,
+`plugin.lua` is the single production entrypoint consumed by the current Hub
+worker sandbox. It contains the versioned prefix-addressable record repository,
+the checked-in Botster Stack Delivery source/reconciliation policy, exact
+repository-charter routing, gate/review/question/checklist/PR/advance handlers,
+workflow CRUD, entity projections, and app/settings surface handlers.
+PTY-backed steps with `session_template_id`,
 `session_template_name`/`template_name`, or
 `session_template_capability`/`session_capability` build and persist
-`DaemonSessionTemplateRequest` field names, add resolved `template_id` and
-optional `session_id`, and call the hub `session_templates.spawn` plugin
-capability. Existing ID selection is direct; name and capability selection use
+the semantic inputs accepted by
+`session_templates.ensure_worktree_and_spawn`: `target_id`, `branch`,
+`template_id`, environment, and untrusted prompt/ticket/workspace metadata.
+Hub-owned session, worktree, base-ref, and repository facts are never supplied
+by the caller. Existing ID selection is direct; name and capability selection use
 `session_templates.resolve` or `session_templates.list`. If a selector cannot be
 resolved, or a declared dependency such as `github_auth` is unavailable,
 activation persists `status="blocked"` with a structured diagnostic and emits
 `session_template_spawn_blocked`. Manual, human, command, and other non-PTY
-steps do not spawn sessions. The manifest configuration schema is intentionally
-limited to package defaults, and provider or workspace integrations are contract
-references rather than runtime imports.
+steps do not spawn sessions. The manifest configuration schema is limited to
+package defaults. The `session_actions/session_template_managed_git_spawn`
+capability is the narrow host grant used for correlated managed sessions;
+targets, worktrees, sessions, persistence, MCP registration, workers, and
+UiNode validation remain Hub-owned.
+
+On an empty plugin database, package initialization reconciles exactly one
+`botster_stack_delivery` definition and one of each sourced step/gate. Reload,
+disable/enable, and Hub restart reuse those stable IDs. Checked-in source owns
+metadata, prompts, transitions, gates, routing text, and `source_revision`; an
+existing step's operator-selected `agent_name` remains device policy. Runtime
+records live under `v2/<family>/<id>` plugin-db keys; the retired all-domain
+state blob is neither read nor written.
+
+Every delivery role uses the same exact routing source:
+
+- `botster-core` → `[[botster-core-playbook]]`
+- `botster-hub` → `[[botster-hub-playbook]]`
+- `botster-hub-client` → `[[botster-hub-client-playbook]]`
+- `botster-web` → `[[botster-web-playbook]]`
+- `botster-tui` → `[[botster-tui-playbook]]`
+- `botster-tui-kit` → `[[botster-tui-kit-playbook]]`
+- `botster-terminal-ghostty` → `[[botster-terminal-ghostty-playbook]]`
+- Project Pipelines package/plugin paths → `[[project-pipelines-playbook]]`
+
+Zero or multiple matches return `routing_question_required`; there is no
+generic fallback or load-all behavior.
 
 Ticket dependencies use `ticket.dependency_ticket_ids` as their sole canonical
 representation. `project_pipelines.add_ticket_dependency`,
@@ -220,7 +252,7 @@ proof.
 
 ```sh
 git clone https://github.com/trybotster/botster-hub.git /private/tmp/botster-hub-ui-contract
-git -C /private/tmp/botster-hub-ui-contract checkout d79403c74520fa054fb8b5996958dcf739d2fee3
+git -C /private/tmp/botster-hub-ui-contract checkout 35e92f46a98c445765b6ba7755e029f5dde702f8
 cargo build --locked --manifest-path /private/tmp/botster-hub-ui-contract/Cargo.toml
 cargo build --locked --manifest-path /private/tmp/botster-hub-ui-contract/Cargo.toml -p botster-core --bin botster-session-worker
 BOTSTER_HUB_SOURCE=/private/tmp/botster-hub-ui-contract \
@@ -238,7 +270,12 @@ row action, opens the rendered dialogs, and dispatches canonical filter, select,
 accepted create, and rejected create requests through the real worker. It asserts
 structured `plugin_action_result` frames, exact identity, a client-authored
 submit envelope, values/payload separation, close/replacement behavior, retained
-normalized values/errors, and the selected-workspace equality binding.
+normalized values/errors, and the selected-workspace equality binding. It also
+admits a deterministic Git target using the real TUI-kit target id, installs a
+test Plan template, activates the production sourced Plan through
+`ensure_worktree_and_spawn`, proves its prompt resolves
+`[[botster-tui-kit-playbook]]` without a routing question, exercises the public
+workflow tools, restarts Hub, and rechecks the same durable workflow identity.
 
 `EXPECTED_HUB_COMMIT` in `script/test-hub-flow` records the Hub revision against
 which this plugin contract was proven. Advance that pin deliberately only when
