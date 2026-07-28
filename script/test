@@ -74,7 +74,7 @@ assert contract["contract_version"] == 2
 assert contract["fixture_role"] == {
     "authority": "schema_example_only",
     "production_source": "plugin.lua",
-    "source_revision": "botster-stack-delivery/2026-07-28.2",
+    "source_revision": "botster-stack-delivery/2026-07-28.3",
 }
 anchors = contract["manifest_anchors"]
 assert anchors["package_name"] == manifest["name"]
@@ -573,9 +573,16 @@ end
 assert(sourced_pipelines == 1, "empty store must initialize exactly one sourced Stack Delivery pipeline")
 assert(stack_delivery.source_authority == "trybotster/botster-project-pipelines:plugin.lua", "standalone plugin source must be authoritative")
 assert(#stack_delivery.steps == 6, "Stack Delivery must initialize each sourced step exactly once")
+local sourced_review_gate = nil
 for _, step in ipairs(stack_delivery.steps) do
   assert(step.prompt:find("[[botster-tui-kit-playbook]]", 1, true), "every delivery role must carry the TUI-kit route")
+  if step.id == "botster_stack_review" then sourced_review_gate = step.gates[1] end
 end
+assert(
+  sourced_review_gate
+    and sourced_review_gate.prompt == "Submit an approved review with no open blocker/high findings.",
+  "sourced Review gate prompt must match the blocker/high transition policy"
+)
 assert(
   not string.find("[[botster-core-playbook]]", "[[botster-tui-kit-playbook]]", 1, true),
   "routing assertion positive control must reject a prompt without the TUI-kit route"

@@ -1,9 +1,11 @@
 local STORE_SCHEMA_VERSION = 2
 local STORE_ROOT = "v2/"
-local SOURCE_REVISION = "botster-stack-delivery/2026-07-28.2"
+local SOURCE_REVISION = "botster-stack-delivery/2026-07-28.3"
 local MAX_STORE_KEYS = 1024
 local STORE_KEY_HEADROOM = 64
 local MAX_EVENTS = 256
+local BLOCKING_FINDING_SEVERITIES = { blocker = true, high = true }
+local BLOCKING_FINDING_POLICY = "blocker/high"
 
 local RECORD_FAMILIES = {
   -- Correlation records must become durable before the run records whose
@@ -582,7 +584,11 @@ local function botster_stack_delivery_source()
       sourced_step("botster_stack_review", "Review", 4, "claude", "Review correctness, regressions, architecture fit, tests, docs, dead paths, and hidden assumptions.", {
         next_step_id = "botster_stack_verify",
         gates = {
-          { id = "review", required = true, prompt = "Submit an approved review with no open findings." },
+          {
+            id = "review",
+            required = true,
+            prompt = "Submit an approved review with no open " .. BLOCKING_FINDING_POLICY .. " findings.",
+          },
         },
       }),
       sourced_step("botster_stack_verify", "Verify", 5, "codex", "Rerun live-worktree evidence and recheck every resolved blocker against observed state.", {
@@ -1589,7 +1595,7 @@ local function transition_blockers(state, run, pipeline, step)
     if finding.run_id == run.id
       and finding.status ~= "resolved"
       and finding.status ~= "waived"
-      and (finding.severity == "blocker" or finding.severity == "high")
+      and BLOCKING_FINDING_SEVERITIES[finding.severity] == true
     then
       table.insert(blockers, { kind = "finding", finding_id = finding.id, severity = finding.severity })
     end
