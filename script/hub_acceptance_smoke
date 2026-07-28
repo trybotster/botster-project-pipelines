@@ -3,11 +3,15 @@
 
 require "json"
 require "socket"
+require "timeout"
 
 socket_path = ARGV.fetch(0) do
-  warn "usage: script/hub_acceptance_smoke <botster-hub.sock>"
+  warn "usage: script/hub_acceptance_smoke <botster-hub.sock> [verify_restart]"
   exit 1
 end
+
+restart_verification = ARGV[1] == "verify_restart"
+downstream_root = ARGV[2]
 
 def assert(condition, message)
   raise message unless condition
@@ -106,8 +110,46 @@ def dispatch_action(socket, action_id:, request_id:, node_id: nil, kind: "submit
   result
 end
 
-project_id = "project_live_#{Process.pid}"
-workspace_id = "workspace_live_#{Process.pid}"
+unless restart_verification
+  raise "downstream target root is required" unless downstream_root
+  target = request(socket, {
+    type: "create_spawn_target",
+    target_id: "tgt_3dfae49c02454037bf13554f552baf7f",
+    label: "Downstream TUI-kit acceptance",
+    root: downstream_root,
+    enabled: true,
+    kind: "git",
+    base_ref: "main",
+    metadata: { repository: "trybotster/botster-tui-kit" }
+  })
+  assert(target["kind"] == "spawn_targets", "downstream TUI-kit target admission failed")
+end
+
+initial_context = call_tool(socket, "project_pipelines.current_context", {})
+stack_definitions = initial_context.fetch("pipeline_definitions").select { |definition| definition["source_id"] == "botster_stack_delivery" }
+assert(stack_definitions.length == 1, "clean package must reconcile exactly one Stack Delivery definition")
+assert(stack_definitions.first["source_authority"] == "trybotster/botster-project-pipelines:plugin.lua", "standalone source authority mismatch")
+assert(stack_definitions.first.fetch("steps").length == 6, "sourced Stack Delivery step count mismatch")
+assert(stack_definitions.first.fetch("steps").all? { |step| step.fetch("prompt").include?("[[botster-tui-kit-playbook]]") }, "every sourced role must carry TUI-kit routing")
+
+if restart_verification
+  persisted_run = initial_context.fetch("runs").find { |run| run["id"] == "run_live_authority" }
+  assert(persisted_run, "workflow run did not survive Hub restart")
+  assert(persisted_run["current_step_id"] == "botster_stack_review", "advanced workflow identity did not survive Hub restart")
+  initialization_events = initial_context.fetch("events").count { |event| event["kind"] == "pipeline_source_initialized" }
+  assert(initialization_events == 1, "Hub restart duplicated source initialization events")
+  assert(initial_context.fetch("gate_results").length >= 3, "gate evidence did not survive Hub restart")
+  assert(initial_context.fetch("reviews").length >= 2, "reviews did not survive Hub restart")
+  assert(initial_context.fetch("questions").any? { |question| question["status"] == "answered" }, "question answer did not survive Hub restart")
+  assert(initial_context.fetch("checklists").any?, "checklist did not survive Hub restart")
+  assert(initial_context.fetch("pr_links").any?, "PR link did not survive Hub restart")
+  render_surface(socket)
+  puts "script/hub_acceptance_smoke: restart persistence verified"
+  exit 0
+end
+
+project_id = "project_live_authority"
+workspace_id = "workspace_live_authority"
 created_project = call_tool(socket, "project_pipelines.create_project", {
   id: project_id,
   name: "Live contract project",
@@ -184,7 +226,7 @@ assert(select.dig("payload", "row_id") == workspace_id, "select payload did not 
 assert(select.dig("presentation", 0, "key") == "selected-workspace", "select presentation key mismatch")
 assert(select.dig("presentation", 0, "value") == workspace_id, "select presentation value mismatch")
 
-ticket_id = "ticket_live_#{Process.pid}"
+ticket_id = "ticket_live_authority"
 submitted_values = {
   id: ticket_id,
   project_id: project_id,
@@ -231,5 +273,154 @@ selected = presentation_bindings.find do |binding|
 end
 assert(selected && selected.dig("predicate", "value") == workspace_id, "selected-workspace equality predicate missing")
 assert(selected.dig("node", "props", "text") == "Workspace Live contract project selected", "selected workspace copy must derive from product data")
+
+run_id = "run_live_authority"
+run = call_tool(socket, "project_pipelines.record_run", {
+  id: run_id,
+  ticket_id: ticket_id,
+  pipeline_definition_id: "botster_stack_delivery",
+  spawn_target_id: "tgt_3dfae49c02454037bf13554f552baf7f",
+  branch: "project-pipelines/live-authority",
+  base_ref: "main",
+  worktree: { kind: "provider_owned_reference", id: "worktree_live_authority" }
+})
+assert(run["ok"] == true && run.dig("run", "current_step_id") == "botster_stack_plan", "sourced run did not start at Plan")
+
+blocked_plan = call_tool(socket, "project_pipelines.request_step_advance", {
+  run_id: run_id,
+  request_id: "live-plan-before-gate"
+})
+assert(blocked_plan["ok"] == false && blocked_plan.dig("error", "code") == "transition_blocked", "missing Plan evidence must block")
+
+plan_activation = call_tool(socket, "project_pipelines.activate_step", {
+  run_id: run_id,
+  step_id: "botster_stack_plan",
+  request_id: "session_request_live_downstream_plan",
+  session_template_id: "downstream-plan.fixture/plan"
+})
+assert(plan_activation["ok"] == true, "downstream TUI-kit Plan managed spawn failed: #{plan_activation.inspect}")
+assert(plan_activation.dig("activation", "status") == "spawn_requested", "downstream Plan did not persist a spawn request")
+assert(plan_activation.dig("activation", "request", "target_id") == "tgt_3dfae49c02454037bf13554f552baf7f", "downstream Plan used the wrong target")
+assert(plan_activation.dig("activation", "result", "worktree_path"), "downstream Plan did not create a managed worktree")
+assert(plan_activation.dig("activation", "result", "session_id"), "downstream Plan did not create a managed session")
+assert(plan_activation.dig("activation", "request", "context", "prompt").include?("[[botster-tui-kit-playbook]]"), "production Plan prompt did not carry the TUI-kit charter")
+
+managed_worktree = plan_activation.dig("activation", "result", "worktree_path")
+agent_result_path = File.join(managed_worktree, "downstream-plan-ran.json")
+Timeout.timeout(15) do
+  sleep 0.05 until File.file?(agent_result_path)
+end
+agent_result = JSON.parse(File.read(agent_result_path))
+assert(agent_result["repository_playbook"] == "[[botster-tui-kit-playbook]]", "spawned Plan agent did not resolve the TUI-kit charter")
+assert(agent_result["artifact_id"] == "artifact_live_plan_agent", "spawned Plan agent did not submit its artifact")
+assert(agent_result["gate_id"] == "plan_artifact", "spawned Plan agent did not submit its gate")
+assert(agent_result["step_id"] == "botster_stack_plan_review", "spawned Plan agent did not advance to Plan Review")
+
+plan_advance = call_tool(socket, "project_pipelines.request_step_advance", {
+  run_id: run_id,
+  request_id: "live-plan-agent-advance"
+})
+assert(plan_advance["ok"] == true && plan_advance["step_id"] == "botster_stack_plan_review", "spawned Plan result was not durable")
+duplicate_advance = call_tool(socket, "project_pipelines.request_step_advance", {
+  run_id: run_id,
+  request_id: "live-plan-agent-advance"
+})
+assert(duplicate_advance == plan_advance, "duplicate advance request did not reuse durable result")
+
+call_tool(socket, "project_pipelines.submit_gate", {
+  run_id: run_id,
+  step_id: "botster_stack_plan_review",
+  gate_id: "plan_review",
+  status: "passed"
+})
+call_tool(socket, "project_pipelines.submit_review", {
+  run_id: run_id,
+  step_id: "botster_stack_plan_review",
+  verdict: "changes_required",
+  findings: [{ id: "finding_live_review", severity: "high", title: "Live review finding" }]
+})
+review_block = call_tool(socket, "project_pipelines.request_step_advance", {
+  run_id: run_id,
+  request_id: "live-review-block"
+})
+assert(review_block["ok"] == false, "changes-required review must block public advance")
+call_tool(socket, "project_pipelines.resolve_finding", {
+  finding_id: "finding_live_review",
+  resolution: "corrected in live flow"
+})
+call_tool(socket, "project_pipelines.submit_review", {
+  run_id: run_id,
+  step_id: "botster_stack_plan_review",
+  verdict: "approved"
+})
+review_advance = call_tool(socket, "project_pipelines.request_step_advance", {
+  run_id: run_id,
+  request_id: "live-review-advance"
+})
+assert(review_advance["ok"] == true && review_advance["step_id"] == "botster_stack_implement", "approved review did not advance")
+
+call_tool(socket, "project_pipelines.record_artifact", {
+  id: "artifact_live_report",
+  run_id: run_id,
+  step_id: "botster_stack_implement",
+  kind: "report",
+  summary: "Live implementation report",
+  payload: { files_changed: ["plugin.lua"], deviations_from_plan: [] }
+})
+checklist = call_tool(socket, "project_pipelines.create_checklist", {
+  id: "checklist_live_vault",
+  run_id: run_id,
+  step_id: "botster_stack_implement",
+  source: "vault",
+  name: "Live vault discipline"
+})
+call_tool(socket, "project_pipelines.add_checklist_item", {
+  checklist_id: checklist.dig("checklist", "id"),
+  text: "Repository charter and targeted notes constrained the work",
+  status: "completed"
+})
+question = call_tool(socket, "project_pipelines.record_question", {
+  id: "question_live_authority",
+  run_id: run_id,
+  ticket_id: ticket_id,
+  step_id: "botster_stack_implement",
+  blocking: true,
+  question: "Is the live workflow durable?"
+})
+call_tool(socket, "project_pipelines.answer_question", {
+  question_id: question.dig("question", "id"),
+  answer: "Yes; restart verification checks it."
+})
+call_tool(socket, "project_pipelines.submit_gate", {
+  run_id: run_id,
+  step_id: "botster_stack_implement",
+  gate_id: "implementation",
+  status: "passed",
+  evidence: { commit_sha: "live-test-commit", diff_against_base: "plugin.lua changed" }
+})
+pr_block = call_tool(socket, "project_pipelines.request_step_advance", {
+  run_id: run_id,
+  request_id: "live-implement-without-pr"
+})
+assert(pr_block["ok"] == false, "Implement must not advance without linked PR")
+call_tool(socket, "project_pipelines.link_pr", {
+  run_id: run_id,
+  url: "https://example.invalid/project-pipelines/pull/1",
+  provider: "test"
+})
+implement_advance = call_tool(socket, "project_pipelines.request_step_advance", {
+  run_id: run_id,
+  request_id: "live-implement-advance"
+})
+assert(implement_advance["ok"] == true && implement_advance["step_id"] == "botster_stack_review", "committed PR-backed implementation did not advance")
+
+final_context = call_tool(socket, "project_pipelines.current_context", {})
+assert(final_context.fetch("runs").any? { |record| record["id"] == run_id }, "current context missing live run")
+assert(final_context.fetch("gate_results").count { |record| record["run_id"] == run_id } == 3, "run gate results missing")
+assert(final_context.fetch("reviews").count { |record| record["run_id"] == run_id } == 2, "run reviews missing")
+assert(final_context.fetch("findings").any? { |record| record["run_id"] == run_id && record["status"] == "resolved" }, "resolved finding missing")
+assert(final_context.fetch("questions").any? { |record| record["run_id"] == run_id && record["status"] == "answered" }, "answered question missing")
+assert(final_context.fetch("pr_links").count { |record| record["run_id"] == run_id } == 1, "PR link missing")
+assert(final_context.fetch("questions").none? { |record| record["question"].to_s.downcase.include?("routing") }, "downstream Plan asked a repository routing question")
 
 puts "script/hub_acceptance_smoke: ok project_id=#{project_id} ticket_id=#{ticket_id} client_authored_kind=submit"

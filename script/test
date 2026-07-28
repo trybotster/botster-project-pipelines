@@ -55,6 +55,7 @@ assert {capability["surface"] for capability in manifest["capabilities"]} == {
     "surfaces",
     "mcp",
     "plugin_db",
+    "session_actions",
 }
 PY
 
@@ -69,6 +70,12 @@ manifest = json.loads(Path("botster-package.json").read_text())
 contract = json.loads(Path("fixtures/project_pipelines/domain_contract.json").read_text())
 docs = Path("docs/domain-contract.md").read_text()
 
+assert contract["contract_version"] == 2
+assert contract["fixture_role"] == {
+    "authority": "schema_example_only",
+    "production_source": "plugin.lua",
+    "source_revision": "botster-stack-delivery/2026-07-28.4",
+}
 anchors = contract["manifest_anchors"]
 assert anchors["package_name"] == manifest["name"]
 assert anchors["capabilities"] == [capability["surface"] for capability in manifest["capabilities"]]
@@ -110,6 +117,9 @@ required_domain_objects = {
     "step",
     "gate",
     "artifact",
+    "checklist",
+    "gate_result",
+    "review",
     "finding",
     "question",
     "answer",
@@ -266,7 +276,7 @@ for event in contract["events"]:
         "run_completed",
     }
 
-assert contract["persistence_boundaries"]["runtime_storage_namespace"] == "plugin-data/project-pipelines"
+assert contract["persistence_boundaries"]["runtime_storage_namespace"] == "v2/<family>/<id>"
 assert "botster-workspaces" in contract["provider_capabilities"][0]["forbidden_runtime_imports"]
 assert "botster-agents" in contract["provider_capabilities"][0]["forbidden_runtime_imports"]
 assert "github" in contract["provider_capabilities"][0]["forbidden_runtime_imports"]
@@ -276,7 +286,7 @@ required_doc_phrases = [
     "standalone",
     "workspace-linked mode is additive",
     "Provider Capability Contract",
-    "plugin-data/project-pipelines",
+    "v2/<family>/<id>",
     "project-pipelines.home",
     "project-pipelines.settings",
     "navigation",
@@ -284,13 +294,13 @@ required_doc_phrases = [
     "hub-admitted route descriptors",
     "route path fields",
     "project-pipelines-provider-dependency-status",
-    "session_templates.spawn",
+    "session_templates.ensure_worktree_and_spawn",
     "session_templates.resolve",
     "session_templates.list",
     "session_template_spawn_blocked",
     "status: \"blocked\"",
     "github_auth",
-    "DaemonSessionTemplateRequest",
+    "managed-worktree payload",
     "plugin database capability",
 ]
 for phrase in required_doc_phrases:
@@ -361,6 +371,8 @@ cat > "$lua_test" <<'LUA'
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
 local durable_store = {}
+local fail_set_key_prefix = nil
+local conflict_set_key_prefix = nil
 
 local function deep_copy(value)
   if type(value) ~= "table" then return value end
@@ -392,10 +404,46 @@ botster = {
         return { record = deep_copy(record) }
       end,
       set = function(args)
+        if fail_set_key_prefix and args.key:sub(1, #fail_set_key_prefix) == fail_set_key_prefix then
+          error("injected write interruption for " .. args.key)
+        end
+        local previous = durable_store[args.key]
+        if conflict_set_key_prefix
+          and args.key:sub(1, #conflict_set_key_prefix) == conflict_set_key_prefix
+          and previous
+        then
+          previous.revision = previous.revision + 1
+          conflict_set_key_prefix = nil
+        end
+        local expected_revision = args.expected_revision
+        local actual_revision = previous and previous.revision or 0
+        if expected_revision ~= nil and expected_revision ~= actual_revision then
+          error("revision conflict for " .. args.key)
+        end
         durable_store[args.key] = {
+          key = args.key,
           schema_version = args.schema_version,
+          revision = previous and (previous.revision + 1) or 1,
           payload = deep_copy(args.payload),
         }
+        return { ok = true, record = deep_copy(durable_store[args.key]) }
+      end,
+      list = function(args)
+        local entries = {}
+        for key, record in pairs(durable_store) do
+          if args.prefix == nil or key:sub(1, #args.prefix) == args.prefix then
+            table.insert(entries, {
+              key = key,
+              schema_version = record.schema_version,
+              revision = record.revision,
+            })
+          end
+        end
+        table.sort(entries, function(left, right) return left.key < right.key end)
+        return { entries = entries }
+      end,
+      delete = function(args)
+        durable_store[args.key] = nil
         return { ok = true }
       end,
     },
@@ -424,8 +472,8 @@ botster = {
         session_template_resolution_calls = session_template_resolution_calls + 1
         return { templates = deep_copy(session_template_registry) }
       end,
-      spawn = function(args)
-        assert(type(args) == "table", "session_templates.spawn must receive one request table")
+      test_managed_spawn = function(args)
+        assert(type(args) == "table", "managed session template fixture must receive one request table")
         assert(
           args.template_id == "template_codex_runtime"
             or args.template_id == "template_workspace_runtime"
@@ -469,6 +517,25 @@ botster = {
   end,
 }
 
+botster.capabilities.session_templates.ensure_worktree_and_spawn = function(args)
+  assert(type(args.branch) == "string" and args.branch ~= "", "managed spawn must carry branch")
+  assert(args.context.branch_name == nil, "managed spawn must not smuggle trusted branch_name")
+  assert(args.context.worktree_path == nil, "managed spawn must not smuggle trusted worktree_path")
+  local result = botster.capabilities.session_templates.test_managed_spawn(args)
+  return {
+    ok = true,
+    result = {
+      session_id = result.session_id,
+      lifecycle = result.lifecycle,
+      template_id = result.template_id,
+      context_id = result.context_id,
+      target_id = args.target_id,
+      branch = args.branch,
+      worktree_path = "worktree://managed/" .. args.branch,
+    },
+  }
+end
+
 local plugin = dofile("plugin.lua")
 assert(type(plugin) == "table", "plugin.lua must return a registration table")
 assert(type(plugin.tools) == "table" and #plugin.tools >= 14, "plugin must register CRUD/context/entity/activation tools")
@@ -493,6 +560,61 @@ assert(handlers["project_pipelines.record_run"] ~= nil, "record run ui_action mu
 assert(handlers["project_pipelines.activate_step"] ~= nil, "activate step ui_action must be wired")
 assert(handlers["project_pipelines.filter"] ~= nil, "filter ui_action must be wired")
 assert(handlers["project_pipelines.select_row"] ~= nil, "select row ui_action must be wired")
+
+local initialized_context = tools["project_pipelines.current_context"]({})
+local sourced_pipelines = 0
+local stack_delivery = nil
+for _, definition in ipairs(initialized_context.pipeline_definitions) do
+  if definition.source_id == "botster_stack_delivery" then
+    sourced_pipelines = sourced_pipelines + 1
+    stack_delivery = definition
+  end
+end
+assert(sourced_pipelines == 1, "empty store must initialize exactly one sourced Stack Delivery pipeline")
+assert(stack_delivery.source_authority == "trybotster/botster-project-pipelines:plugin.lua", "standalone plugin source must be authoritative")
+assert(#stack_delivery.steps == 6, "Stack Delivery must initialize each sourced step exactly once")
+local finding_policy_gate_prompts = {
+  botster_stack_plan_review = "Submit an approved plan review with no open blocker/high findings.",
+  botster_stack_review = "Submit an approved review with no open blocker/high findings.",
+}
+local checked_finding_policy_gates = 0
+for _, step in ipairs(stack_delivery.steps) do
+  assert(step.prompt:find("[[botster-tui-kit-playbook]]", 1, true), "every delivery role must carry the TUI-kit route")
+  local expected_prompt = finding_policy_gate_prompts[step.id]
+  if expected_prompt then
+    assert(
+      step.gates[1] and step.gates[1].prompt == expected_prompt,
+      "sourced " .. step.name .. " gate prompt must match the blocker/high transition policy"
+    )
+    checked_finding_policy_gates = checked_finding_policy_gates + 1
+  end
+end
+assert(
+  checked_finding_policy_gates == 2,
+  "every sourced gate that states finding policy must be checked"
+)
+assert(
+  not string.find("[[botster-core-playbook]]", "[[botster-tui-kit-playbook]]", 1, true),
+  "routing assertion positive control must reject a prompt without the TUI-kit route"
+)
+local expected_routes = {
+  ["botster-core"] = "[[botster-core-playbook]]",
+  ["botster-hub"] = "[[botster-hub-playbook]]",
+  ["botster-hub-client"] = "[[botster-hub-client-playbook]]",
+  ["botster-web"] = "[[botster-web-playbook]]",
+  ["botster-tui"] = "[[botster-tui-playbook]]",
+  ["botster-tui-kit"] = "[[botster-tui-kit-playbook]]",
+  ["botster-terminal-ghostty"] = "[[botster-terminal-ghostty-playbook]]",
+  ["trybotster/botster-project-pipelines"] = "[[project-pipelines-playbook]]",
+}
+for repository, playbook in pairs(expected_routes) do
+  local route = tools["project_pipelines.resolve_repository_playbook"]({ repository = repository })
+  assert(route.ok and route.playbook == playbook, repository .. " must resolve exactly one charter")
+end
+for _, excluded in ipairs({ "botster-workspaces", "trybotster/restty", "Ghostty" }) do
+  assert(tools["project_pipelines.resolve_repository_playbook"]({ repository = excluded }).ok == false, excluded .. " must remain outside the explicit routing allowlist")
+end
+assert(tools["project_pipelines.resolve_repository_playbook"]({ repository = "botster-core", path = "plugin.lua" }).ok == false, "multiple routing matches must require a question")
 
 local empty_home = handlers["project-pipelines.home"]({})
 local empty_home_sections = {}
@@ -532,6 +654,7 @@ local ticket = tools["project_pipelines.create_ticket"]({
   title = "Runtime ticket",
 })
 assert(ticket.ok and ticket.ticket.project_id == "proj_runtime_standalone", "ticket create failed")
+assert(durable_store["v2/projects/proj_runtime_standalone"].revision == 1, "ticket mutation must not rewrite unchanged project records")
 
 local pipeline = tools["project_pipelines.define_pipeline"]({
   id = "pipeline_runtime",
@@ -572,13 +695,12 @@ local pty_activation = tools["project_pipelines.activate_step"]({
   run_id = "run_runtime_one",
   step_id = "step_implement",
   request_id = "session_request_runtime_one",
-  session_id = "session_runtime_one",
   prompt = "Runtime prompt body",
   environment = { STRING_VALUE = "kept", NUMBER_VALUE = 1 },
   metadata = { role = "implement", ignored = { "not scalar" }, numeric = 1, boolean = true },
 })
 assert(pty_activation.ok and pty_activation.activation.status == "spawn_requested", "PTY activation should request a hub session template spawn")
-assert(pty_activation.activation.session_id == "session_runtime_one", "PTY activation should preserve caller session id")
+assert(pty_activation.activation.session_id == "session_from_hub_1", "managed PTY activation should persist the Hub-owned session id")
 assert(pty_activation.activation.context_id == "context_from_hub_1", "PTY activation should store returned context id")
 
 local named_activation = tools["project_pipelines.activate_step"]({
@@ -840,29 +962,37 @@ assert(linked_activation.activation.session_id == "session_from_hub_4", "workspa
 assert(#spawned_session_templates == 4, "only PTY-backed steps should spawn session templates")
 local first_spawn = spawned_session_templates[1]
 assert(first_spawn.template_id == "template_codex_runtime", "first spawn should use implement template")
-assert(first_spawn.session_id == "session_runtime_one", "first spawn should pass correlation session_id")
+assert(first_spawn.session_id == nil, "managed spawn must not supply a trusted session_id")
 assert(first_spawn.target_id == "spawn_target_runtime_override", "first spawn should pass target_id")
 assert(first_spawn.context.ticket_id == "ticket_runtime_one", "first spawn should pass ticket_id")
 assert(spawned_session_templates[2].template_id == "template_named_runtime", "second spawn should use resolved name template")
 assert(spawned_session_templates[3].template_id == "template_capability_runtime", "third spawn should use resolved capability template")
 local spawned_context = tools["project_pipelines.current_context"]({})
 assert(spawned_context.ok and #spawned_context.session_requests == 4, "spawned session requests must be persisted")
-local standalone_request = spawned_context.session_requests[1]
-local named_request = spawned_context.session_requests[2]
-local capability_request = spawned_context.session_requests[3]
-local workspace_request = spawned_context.session_requests[4]
+local standalone_request = nil
+local named_request = nil
+local capability_request = nil
+local workspace_request = nil
+for _, request in ipairs(spawned_context.session_requests) do
+  if request.id == "session_request_runtime_one" then standalone_request = request end
+  if request.id == "session_request_runtime_named" then named_request = request end
+  if request.id == "session_request_runtime_capability" then capability_request = request end
+  if request.id == "session_request_runtime_workspace" then workspace_request = request end
+end
+assert(standalone_request and named_request and capability_request and workspace_request, "persisted request ids must remain addressable")
 assert(standalone_request.status == "spawn_requested", "standalone request should record spawn-requested status")
 assert(standalone_request.result.lifecycle == "spawned", "standalone request should record real hub spawn lifecycle")
 assert(standalone_request.result.template_id == "template_codex_runtime", "standalone request should record returned template_id")
 assert(standalone_request.template_id == "template_codex_runtime", "first request should use implement template")
-assert(standalone_request.session_id == "session_runtime_one", "session id should be preserved for correlation")
+assert(standalone_request.session_id == "session_from_hub_1", "Hub-owned session id should be preserved for correlation")
 assert(standalone_request.request.template_id == "template_codex_runtime", "persisted request should carry template_id")
-assert(standalone_request.request.session_id == "session_runtime_one", "persisted request should carry session_id")
+assert(standalone_request.request.session_id == nil, "managed request must not carry caller-owned session_id")
 assert(standalone_request.request.target_id == "spawn_target_runtime_override", "request must use DaemonSessionTemplateRequest target_id")
 assert(standalone_request.request.environment.STRING_VALUE == "kept", "environment string values should be kept")
 assert(standalone_request.request.environment.NUMBER_VALUE == nil, "environment non-string values should be dropped")
 assert(standalone_request.request.context.ticket_id == "ticket_runtime_one", "request context must use ticket_id")
-assert(standalone_request.request.context.branch_name == "project-pipelines/runtime-test", "request context must use branch_name")
+assert(standalone_request.request.branch == "project-pipelines/runtime-test", "managed request must carry semantic branch")
+assert(standalone_request.request.context.branch_name == nil, "managed request must not carry trusted branch_name")
 assert(standalone_request.request.context.prompt == "Runtime prompt body", "request context must use prompt")
 assert(standalone_request.request.context.metadata.owner_plugin == "project-pipelines", "request context metadata must include owner_plugin")
 assert(standalone_request.request.context.metadata.role == "implement", "request context metadata must keep string caller metadata")
@@ -995,9 +1125,14 @@ botster.capabilities.session_templates.list = original_list
 
 local blocked_context = tools["project_pipelines.current_context"]({})
 assert(blocked_context.ok and #blocked_context.session_requests == 7, "blocked session requests must be persisted")
-local provider_available_request = blocked_context.session_requests[5]
-local provider_blocked_request = blocked_context.session_requests[6]
-local unsupported_selector_request = blocked_context.session_requests[7]
+local provider_available_request = nil
+local provider_blocked_request = nil
+local unsupported_selector_request = nil
+for _, request in ipairs(blocked_context.session_requests) do
+  if request.id == "session_request_runtime_provider_available" then provider_available_request = request end
+  if request.id == "session_request_runtime_provider_blocked" then provider_blocked_request = request end
+  if request.id == "session_request_runtime_unsupported_selector" then unsupported_selector_request = request end
+end
 assert(provider_available_request.status == "spawn_requested", "available provider dependency request should persist spawn-requested status")
 assert(provider_available_request.template_selector.template_id == "template_codex_runtime", "available provider dependency request should persist id selector")
 assert(provider_blocked_request.status == "blocked", "provider dependency request should persist blocked status")
@@ -1040,7 +1175,10 @@ assert(failed_activation.error.code == "session_template_spawn_failed", "thrown 
 
 local failed_context = tools["project_pipelines.current_context"]({})
 assert(failed_context.ok and #failed_context.session_requests == 8, "failed session request must still be persisted")
-local failed_request = failed_context.session_requests[8]
+local failed_request = nil
+for _, request in ipairs(failed_context.session_requests) do
+  if request.id == "session_request_runtime_failure" then failed_request = request end
+end
 assert(failed_request.status == "failed", "failed request should record failed status")
 assert(failed_request.result.error.code == "session_template_spawn_failed", "failed request should store structured error")
 assert(failed_request.result.error.message:find("hub rejected spawn target", 1, true), "failed request should store hub error message")
@@ -1530,9 +1668,346 @@ for _, persisted_run in ipairs(reloaded_context.runs) do
   if persisted_run.id == "run_runtime_missing_dependency" then reloaded_missing_run = persisted_run end
 end
 assert(reloaded_missing_run.blocked_transition.code == "ticket_dependencies_unmet", "blocked transition must survive plugin reload")
+
+local sourced_run = reloaded_tools["project_pipelines.record_run"]({
+  id = "run_runtime_sourced",
+  ticket_id = "ticket_runtime_one",
+  pipeline_definition_id = "botster_stack_delivery",
+})
+assert(sourced_run.ok and sourced_run.run.current_step_id == "botster_stack_plan", "sourced workflow must be executable")
+assert(reloaded_tools["project_pipelines.request_step_advance"]({
+  run_id = sourced_run.run.id,
+  request_id = "advance_without_plan_gate",
+}).ok == false, "missing required gate must block transition")
+assert(reloaded_tools["project_pipelines.submit_gate"]({
+  run_id = sourced_run.run.id,
+  step_id = "botster_stack_plan",
+  gate_id = "plan_artifact",
+  status = "passed",
+  evidence = { artifact_id = "artifact_runtime_one" },
+}).ok, "plan gate submission failed")
+local plan_advance = reloaded_tools["project_pipelines.request_step_advance"]({
+  run_id = sourced_run.run.id,
+  request_id = "advance_plan_once",
+})
+assert(plan_advance.ok and plan_advance.step_id == "botster_stack_plan_review", "valid plan gate must advance")
+local duplicate_plan_advance = reloaded_tools["project_pipelines.request_step_advance"]({
+  run_id = sourced_run.run.id,
+  request_id = "advance_plan_once",
+})
+assert(duplicate_plan_advance.ok and duplicate_plan_advance.step_id == "botster_stack_plan_review", "duplicate request_id must reuse durable result")
+assert(reloaded_tools["project_pipelines.submit_gate"]({
+  run_id = sourced_run.run.id,
+  step_id = "botster_stack_plan_review",
+  gate_id = "plan_review",
+  status = "passed",
+}).ok, "plan review gate submission failed")
+local changes_required = reloaded_tools["project_pipelines.submit_review"]({
+  run_id = sourced_run.run.id,
+  step_id = "botster_stack_plan_review",
+  verdict = "changes_required",
+  findings = {
+    { id = "finding_runtime_plan", severity = "high", title = "Plan correction" },
+  },
+})
+assert(changes_required.ok, "changes-required review must persist")
+assert(reloaded_tools["project_pipelines.request_step_advance"]({
+  run_id = sourced_run.run.id,
+  request_id = "advance_blocked_review",
+}).ok == false, "changes-required review and open finding must block")
+assert(reloaded_tools["project_pipelines.resolve_finding"]({
+  finding_id = "finding_runtime_plan",
+  resolution = "corrected",
+}).ok, "finding resolution failed")
+assert(reloaded_tools["project_pipelines.submit_review"]({
+  run_id = sourced_run.run.id,
+  step_id = "botster_stack_plan_review",
+  verdict = "approved",
+}).ok, "approved review must persist")
+assert(reloaded_tools["project_pipelines.request_step_advance"]({
+  run_id = sourced_run.run.id,
+  request_id = "advance_approved_review",
+}).ok, "approved review with resolved findings must advance")
+assert(reloaded_tools["project_pipelines.submit_gate"]({
+  run_id = sourced_run.run.id,
+  step_id = "botster_stack_implement",
+  gate_id = "implementation",
+  status = "passed",
+  evidence = { commit_sha = "abc123", diff_against_base = "1 file changed" },
+}).ok, "implementation gate submission failed")
+assert(reloaded_tools["project_pipelines.request_step_advance"]({
+  run_id = sourced_run.run.id,
+  request_id = "advance_without_pr",
+}).ok == false, "PR-backed implementation must not advance without a link")
+assert(reloaded_tools["project_pipelines.link_pr"]({
+  run_id = sourced_run.run.id,
+  url = "https://example.invalid/pull/1",
+}).ok, "PR link failed")
+assert(reloaded_tools["project_pipelines.request_step_advance"]({
+  run_id = sourced_run.run.id,
+  request_id = "advance_with_pr",
+}).ok, "committed implementation with PR link must advance")
+
+local interruption_pipeline = reloaded_tools["project_pipelines.define_pipeline"]({
+  id = "pipeline_runtime_interruptions",
+  project_id = "proj_runtime_standalone",
+  name = "Runtime interruption recovery",
+  steps = {
+    {
+      id = "step_interrupt_spawn",
+      name = "Spawn",
+      position = 1,
+      kind = "pty",
+      session_template_id = "template_codex_runtime",
+      prompt = "Exercise durable spawn correlation.",
+      next_step_id = "step_interrupt_middle",
+      gates = {},
+    },
+    {
+      id = "step_interrupt_middle",
+      name = "Middle",
+      position = 2,
+      kind = "manual",
+      next_step_id = "step_interrupt_final",
+      gates = {},
+    },
+    {
+      id = "step_interrupt_final",
+      name = "Final",
+      position = 3,
+      kind = "manual",
+      gates = {},
+    },
+  },
+})
+assert(interruption_pipeline.ok, "interruption recovery pipeline create failed")
+
+local interrupted_spawn_run = reloaded_tools["project_pipelines.record_run"]({
+  id = "run_runtime_interrupted_spawn",
+  ticket_id = "ticket_runtime_one",
+  pipeline_definition_id = "pipeline_runtime_interruptions",
+  spawn_target_id = "spawn_target_runtime",
+  branch = "project-pipelines/interrupted-spawn",
+})
+assert(interrupted_spawn_run.ok, "interrupted spawn run create failed")
+local spawns_before_interruption = #spawned_session_templates
+fail_set_key_prefix = "v2/runs/"
+local interrupted_spawn = reloaded_tools["project_pipelines.activate_step"]({
+  run_id = interrupted_spawn_run.run.id,
+  request_id = "session_request_interrupted_once",
+})
+assert(interrupted_spawn.ok == false and interrupted_spawn.error.code == "persist_failed", "post-spawn write interruption must be structured")
+assert(
+  #spawned_session_templates == spawns_before_interruption + 1,
+  "interrupted activation must dispatch only once: before="
+    .. tostring(spawns_before_interruption)
+    .. " after="
+    .. tostring(#spawned_session_templates)
+    .. " reason="
+    .. tostring(interrupted_spawn.error and interrupted_spawn.error.reason)
+)
+fail_set_key_prefix = nil
+local recovered_spawn = reloaded_tools["project_pipelines.activate_step"]({
+  run_id = interrupted_spawn_run.run.id,
+  request_id = "session_request_interrupted_once",
+})
+assert(recovered_spawn.ok and recovered_spawn.activation.status == "spawn_requested", "retry must reuse the durable spawn result")
+assert(#spawned_session_templates == spawns_before_interruption + 1, "retry must not dispatch another managed spawn")
+
+local ticket_before_conflict = deep_copy(durable_store["v2/tickets/ticket_runtime_one"].payload)
+conflict_set_key_prefix = "v2/tickets/"
+local revision_conflict = reloaded_tools["project_pipelines.update_ticket_status"]({
+  ticket_id = "ticket_runtime_one",
+  status = "closed",
+})
+assert(revision_conflict.ok == false and revision_conflict.error.code == "persist_failed", "CAS conflict must return a structured persistence failure")
+assert(
+  durable_store["v2/tickets/ticket_runtime_one"].payload.status == ticket_before_conflict.status,
+  "CAS conflict must preserve the concurrently revised record"
+)
+
+local interrupted_advance_run = reloaded_tools["project_pipelines.record_run"]({
+  id = "run_runtime_interrupted_advance",
+  ticket_id = "ticket_runtime_one",
+  pipeline_definition_id = "pipeline_runtime_interruptions",
+  current_step_id = "step_interrupt_middle",
+})
+assert(interrupted_advance_run.ok, "interrupted advance run create failed")
+fail_set_key_prefix = "v2/advance_requests/"
+local interrupted_before_correlation = reloaded_tools["project_pipelines.request_step_advance"]({
+  run_id = interrupted_advance_run.run.id,
+  request_id = "advance_interrupted_before_correlation",
+})
+assert(interrupted_before_correlation.ok == false and interrupted_before_correlation.error.code == "persist_failed", "correlation write interruption must be structured")
+fail_set_key_prefix = nil
+local recovered_before_correlation = reloaded_tools["project_pipelines.request_step_advance"]({
+  run_id = interrupted_advance_run.run.id,
+  request_id = "advance_interrupted_before_correlation",
+})
+assert(recovered_before_correlation.ok and recovered_before_correlation.step_id == "step_interrupt_final", "retry must advance once after correlation write interruption")
+
+local interrupted_run_write = reloaded_tools["project_pipelines.record_run"]({
+  id = "run_runtime_interrupted_run_write",
+  ticket_id = "ticket_runtime_one",
+  pipeline_definition_id = "pipeline_runtime_interruptions",
+  current_step_id = "step_interrupt_middle",
+})
+assert(interrupted_run_write.ok, "interrupted run-write scenario create failed")
+fail_set_key_prefix = "v2/runs/"
+local interrupted_after_correlation = reloaded_tools["project_pipelines.request_step_advance"]({
+  run_id = interrupted_run_write.run.id,
+  request_id = "advance_interrupted_after_correlation",
+})
+assert(interrupted_after_correlation.ok == false and interrupted_after_correlation.error.code == "persist_failed", "run write interruption must be structured")
+fail_set_key_prefix = nil
+local recovered_after_correlation = reloaded_tools["project_pipelines.request_step_advance"]({
+  run_id = interrupted_run_write.run.id,
+  request_id = "advance_interrupted_after_correlation",
+})
+assert(recovered_after_correlation.ok and recovered_after_correlation.step_id == "step_interrupt_final", "retry must reconcile the durable advance")
+local recovered_advance_context = reloaded_tools["project_pipelines.current_context"]({})
+local recovered_durable_run = nil
+for _, candidate in ipairs(recovered_advance_context.runs) do
+  if candidate.id == interrupted_run_write.run.id then recovered_durable_run = candidate end
+end
+assert(recovered_durable_run.current_step_id == "step_interrupt_final", "recovered advance must move the durable run exactly one step")
+
+for _, severity_case in ipairs({
+  { severity = "info", blocks = false },
+  { severity = "low", blocks = false },
+  { severity = "medium", blocks = false },
+  { severity = "high", blocks = true },
+  { severity = "blocker", blocks = true },
+}) do
+  local severity_run_id = "run_runtime_finding_" .. severity_case.severity
+  assert(reloaded_tools["project_pipelines.record_run"]({
+    id = severity_run_id,
+    ticket_id = "ticket_runtime_one",
+    pipeline_definition_id = "botster_stack_delivery",
+    current_step_id = "botster_stack_plan_review",
+  }).ok, "severity run create failed")
+  assert(reloaded_tools["project_pipelines.submit_gate"]({
+    run_id = severity_run_id,
+    step_id = "botster_stack_plan_review",
+    gate_id = "plan_review",
+    status = "passed",
+  }).ok, "severity gate submit failed")
+  assert(reloaded_tools["project_pipelines.submit_review"]({
+    run_id = severity_run_id,
+    step_id = "botster_stack_plan_review",
+    verdict = "approved",
+    findings = {
+      { id = "finding_runtime_" .. severity_case.severity, severity = severity_case.severity, title = "Severity policy probe" },
+    },
+  }).ok, "severity review submit failed")
+  local severity_advance = reloaded_tools["project_pipelines.request_step_advance"]({
+    run_id = severity_run_id,
+    request_id = "advance_finding_" .. severity_case.severity,
+  })
+  assert(
+    (severity_case.blocks and severity_advance.ok == false)
+      or (not severity_case.blocks and severity_advance.ok == true),
+    severity_case.severity .. " finding blocker policy mismatch"
+  )
+end
+
+local question_answer = reloaded_tools["project_pipelines.answer_question"]({
+  question_id = "question_runtime_one",
+  answer = "No.",
+})
+assert(question_answer.ok and question_answer.question.status == "answered", "question answer must persist")
+local checklist = reloaded_tools["project_pipelines.create_checklist"]({
+  run_id = sourced_run.run.id,
+  step_id = "botster_stack_review",
+  source = "vault",
+  name = "Runtime vault evidence",
+})
+assert(checklist.ok, "checklist create failed")
+assert(reloaded_tools["project_pipelines.add_checklist_item"]({
+  checklist_id = checklist.checklist.id,
+  text = "Loaded the Project Pipelines ownership charter",
+  status = "completed",
+}).ok, "checklist item failed")
+
+for index = 1, 280 do
+  assert(reloaded_tools["project_pipelines.submit_gate"]({
+    run_id = "run_runtime_finding_info",
+    step_id = "botster_stack_plan_review",
+    gate_id = "plan_review",
+    status = "passed",
+    summary = "Event retention probe " .. tostring(index),
+  }).ok, "event retention probe failed")
+end
+local bounded_context = reloaded_tools["project_pipelines.current_context"]({})
+assert(#bounded_context.events == 256, "diagnostic event retention must stay bounded")
+assert(durable_store["v2/events/event_1"] == nil, "event retention must delete the oldest durable event keys")
+
+local key_count = 0
+for _ in pairs(durable_store) do key_count = key_count + 1 end
+local quota_probe_keys = {}
+for index = key_count + 1, 960 do
+  local key = "v2/quota_probe/" .. tostring(index)
+  durable_store[key] = {
+    key = key,
+    schema_version = 2,
+    revision = 1,
+    payload = { id = "quota_probe_" .. tostring(index) },
+  }
+  table.insert(quota_probe_keys, key)
+end
+local counters_revision_before_quota = durable_store["v2/meta/counters"].revision
+local quota_failure = reloaded_tools["project_pipelines.create_ticket"]({
+  id = "ticket_runtime_over_quota",
+  project_id = "proj_runtime_standalone",
+  title = "Must not partially persist",
+})
+assert(quota_failure.ok == false and quota_failure.error.code == "store_capacity_exhausted", "store ceiling must fail diagnostically")
+assert(durable_store["v2/tickets/ticket_runtime_over_quota"] == nil, "capacity failure must not partially persist the domain record")
+assert(durable_store["v2/meta/counters"].revision == counters_revision_before_quota, "capacity failure must not partially reserve counters")
+for _, key in ipairs(quota_probe_keys) do durable_store[key] = nil end
+
+for key in pairs(durable_store) do
+  assert(key ~= "state", "retired all-domain state key must not be read or written")
+  assert(key:sub(1, 3) == "v2/", "all runtime records must use versioned prefix-addressable keys")
+end
+
+local source_record = durable_store["v2/pipeline_definitions/botster_stack_delivery"]
+source_record.payload.source_revision = "stale-source"
+source_record.payload.steps[1].agent_name = "operator-selected-agent"
+local initialized_events_before_reconcile = 0
+for key, record in pairs(durable_store) do
+  if key:sub(1, #"v2/events/") == "v2/events/" and record.payload.kind == "pipeline_source_initialized" then
+    initialized_events_before_reconcile = initialized_events_before_reconcile + 1
+  end
+end
+local reconciled_plugin = dofile("plugin.lua")
+local reconciled_tools = {}
+for _, tool in ipairs(reconciled_plugin.tools) do reconciled_tools[tool.name] = tool.call end
+local reconciled_context = reconciled_tools["project_pipelines.current_context"]({})
+local reconciled_stack = nil
+local initialized_events = 0
+for _, definition in ipairs(reconciled_context.pipeline_definitions) do
+  if definition.id == "botster_stack_delivery" then reconciled_stack = definition end
+end
+for _, event in ipairs(reconciled_context.events) do
+  if event.kind == "pipeline_source_initialized" then initialized_events = initialized_events + 1 end
+end
+assert(reconciled_stack.steps[1].agent_name == "operator-selected-agent", "source reconciliation must preserve device-selected agent_name")
+assert(reconciled_stack.steps[1].prompt:find("repository charter"), "source reconciliation must refresh package-owned prompt fields")
+assert(initialized_events == initialized_events_before_reconcile, "reload and reconciliation must not duplicate initialization events")
+
+durable_store["v2/questions/corrupt_payload"] = {
+  key = "v2/questions/corrupt_payload",
+  schema_version = 2,
+  revision = 1,
+  payload = { id = "corrupt_payload", run_id = "run_runtime_sourced", status = "open" },
+}
+local corrupt_load_ok, corrupt_load_error = pcall(dofile, "plugin.lua")
+assert(not corrupt_load_ok and tostring(corrupt_load_error):find("missing required field question", 1, true), "payload validator must reject malformed durable records")
+durable_store["v2/questions/corrupt_payload"] = nil
 LUA
 lua "$lua_test"
 rm -f "$lua_test"
 trap - EXIT HUP INT TERM
 
-echo "package scaffold checks passed"
+echo "standalone package authority checks passed"

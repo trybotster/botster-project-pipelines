@@ -7,7 +7,8 @@
   "capabilities": [
     { "surface": "surfaces" },
     { "surface": "mcp" },
-    { "surface": "plugin_db", "scope": "project-pipelines" }
+    { "surface": "plugin_db", "scope": "project-pipelines" },
+    { "surface": "session_actions", "scope": "session_template_managed_git_spawn" }
   ],
   "entrypoints": [
     { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
@@ -92,12 +93,16 @@
   ],
   "features": [
     {
-      "id": "minimal_crud",
-      "label": "Minimal Project Pipelines CRUD"
+      "id": "standalone_authority",
+      "label": "Standalone Project Pipelines authority"
     },
     {
-      "id": "surface_proof",
-      "label": "App and settings surface proof"
+      "id": "botster_stack_delivery",
+      "label": "Sourced Botster Stack Delivery workflow"
+    },
+    {
+      "id": "durable_workflow_engine",
+      "label": "Durable workflow gates, reviews, findings, questions, and artifacts"
     }
   ]
 }
