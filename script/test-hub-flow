@@ -1,0 +1,124 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "timeout"
+require "tmpdir"
+
+ROOT = File.expand_path("..", __dir__)
+EXPECTED_HUB_COMMIT = "d79403c74520fa054fb8b5996958dcf739d2fee3"
+
+def required_executable(name)
+  path = File.expand_path(ENV.fetch(name) { raise "#{name} must point at an executable" }, ROOT)
+  raise "#{name} is not executable: #{path}" unless File.executable?(path)
+
+  path
+end
+
+def run!(*command)
+  raise "command failed: #{command.join(" ")}" unless system(*command)
+end
+
+hub = required_executable("BOTSTER_HUB_BIN")
+session_worker = required_executable("BOTSTER_SESSION_WORKER_BIN")
+hub_source = File.realpath(ENV.fetch("BOTSTER_HUB_SOURCE") { raise "BOTSTER_HUB_SOURCE is required" })
+hub_commit = IO.popen(["git", "-C", hub_source, "rev-parse", "HEAD"], &:read).strip
+raise "unexpected Hub provenance #{hub_commit}" unless hub_commit == EXPECTED_HUB_COMMIT
+lock = File.read(File.join(hub_source, "Cargo.lock"))
+core_commit = lock.match(%r{source = "git\+https://github\.com/trybotster/botster-core\?branch=main#([0-9a-f]{40})"})&.captures&.first
+raise "botster-core git provenance is missing from Cargo.lock" unless core_commit
+target_prefix = File.join(hub_source, "target") + File::SEPARATOR
+raise "BOTSTER_HUB_BIN was not built from BOTSTER_HUB_SOURCE" unless File.realpath(hub).start_with?(target_prefix)
+raise "BOTSTER_SESSION_WORKER_BIN was not built from BOTSTER_HUB_SOURCE" unless File.realpath(session_worker).start_with?(target_prefix)
+
+temporary_root = Dir.exist?("/private/tmp") ? "/private/tmp" : Dir.tmpdir
+Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
+  socket_path = File.join(data_dir, "botster-hub.sock")
+  log_path = File.join(data_dir, "botster-hub.log")
+  log = File.open(log_path, "w")
+  hub_pid = Process.spawn(
+    hub,
+    "start",
+    "--data-dir",
+    data_dir,
+    "--session-worker-bin",
+    session_worker,
+    out: log,
+    err: log
+  )
+  hub_status = nil
+  failure = nil
+
+  begin
+    Timeout.timeout(20) do
+      until File.socket?(socket_path)
+        if Process.waitpid(hub_pid, Process::WNOHANG)
+          hub_status = $?
+          log.flush
+          raise "isolated hub exited before creating its socket:\n#{File.read(log_path)}"
+        end
+        sleep 0.05
+      end
+    end
+
+    run!(hub, "packages", "install", "--data-dir", data_dir, "--path", ROOT)
+    run!(hub, "packages", "enable", "--data-dir", data_dir, "project-pipelines")
+    run!(File.join(ROOT, "script", "hub_acceptance_smoke"), socket_path)
+  rescue StandardError => error
+    failure = error
+  ensure
+    shutdown_ok = hub_status ? true : system(hub, "shutdown", "--data-dir", data_dir, out: File::NULL, err: File::NULL)
+    unless hub_status
+      begin
+        Timeout.timeout(10) do
+          Process.waitpid(hub_pid)
+          hub_status = $?
+        end
+      rescue Timeout::Error
+        failure ||= RuntimeError.new("isolated hub did not stop within 10 seconds")
+        begin
+          Process.kill("TERM", hub_pid)
+        rescue Errno::ESRCH
+          nil
+        end
+        begin
+          Timeout.timeout(5) do
+            Process.waitpid(hub_pid)
+            hub_status = $?
+          end
+        rescue Timeout::Error
+          begin
+            Process.kill("KILL", hub_pid)
+          rescue Errno::ESRCH
+            nil
+          end
+          begin
+            Timeout.timeout(5) do
+              Process.waitpid(hub_pid)
+              hub_status = $?
+            end
+          rescue Timeout::Error
+            failure ||= RuntimeError.new("isolated hub could not be reaped after KILL")
+          rescue Errno::ECHILD
+            nil
+          end
+        rescue Errno::ECHILD
+          nil
+        end
+      rescue Errno::ECHILD, Errno::ESRCH
+        nil
+      end
+    end
+
+    failure ||= RuntimeError.new("isolated hub cleanup failed") unless shutdown_ok && hub_status&.success?
+    if failure
+      log.flush
+      warn "isolated hub log tail:"
+      warn File.readlines(log_path).last(80).join
+    end
+    log.close unless log.closed?
+  end
+
+  raise failure if failure
+end
+
+puts "script/test-hub-flow: ok hub=#{hub_commit} core=#{core_commit}"

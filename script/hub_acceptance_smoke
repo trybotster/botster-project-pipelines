@@ -1,0 +1,198 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "socket"
+
+socket_path = ARGV.fetch(0) do
+  warn "usage: script/hub_acceptance_smoke <botster-hub.sock>"
+  exit 1
+end
+
+def assert(condition, message)
+  raise message unless condition
+end
+
+socket = UNIXSocket.new(socket_path)
+socket.puts(JSON.generate({
+  protocol: "botster-hub-daemon-v1",
+  compatibility: {
+    protocol: "botster-hub-daemon-v1",
+    minimum_protocol_version: 1,
+    required_features: %w[plugin_surface_render plugin_surface_action],
+    minimum_conformance_fixture_revision: 1,
+    client_name: "botster-project-pipelines-acceptance-smoke"
+  }
+}))
+hello = JSON.parse(socket.gets || raise("daemon closed before hello"))
+assert(hello["protocol"] == "botster-hub-daemon-v1", "daemon hello failed")
+
+def request(socket, payload)
+  socket.puts(JSON.generate(payload))
+  response = JSON.parse(socket.gets || raise("daemon closed during #{payload.fetch(:type)}"))
+  raise "daemon #{payload.fetch(:type)} failed: #{response["error"]}" if response["error"]
+
+  response
+end
+
+def call_tool(socket, name, arguments)
+  response = request(socket, {
+    type: "plugin_mcp_call_tool",
+    name: name,
+    arguments: arguments
+  })
+  assert(response["kind"] == "plugin_mcp_tool_result", "#{name} returned #{response["kind"]}")
+  response.fetch("plugin_tool_result")
+end
+
+def render_surface(socket)
+  response = request(socket, {
+    type: "plugin_surface_render",
+    package_name: "project-pipelines",
+    surface_id: "project-pipelines.home",
+    payload: {}
+  })
+  assert(response["kind"] == "plugin_surface", "render did not return plugin_surface")
+  surface = response.fetch("plugin_surface")
+  assert(surface.fetch("package_name") == "project-pipelines", "render package identity mismatch")
+  assert(surface.fetch("surface_id") == "project-pipelines.home", "render surface identity mismatch")
+  surface.fetch("body")
+end
+
+def each_node(node, &block)
+  yield node
+  each_node(node["node"], &block) if node["node"].is_a?(Hash)
+  each_node(node["item_template"], &block) if node["item_template"].is_a?(Hash)
+  each_node(node["empty_template"], &block) if node["empty_template"].is_a?(Hash)
+  Array(node["children"]).each { |child| each_node(child, &block) }
+  (node["slots"] || {}).each_value do |children|
+    Array(children).each { |child| each_node(child, &block) }
+  end
+end
+
+def find_node(root, id)
+  found = nil
+  each_node(root) { |node| found ||= node if node["id"] == id }
+  found
+end
+
+def dispatch_action(socket, action_id:, request_id:, node_id:, values: nil, payload: nil)
+  action_request = {
+    request_id: request_id,
+    surface_id: "project-pipelines.home",
+    action_id: action_id,
+    node_id: node_id,
+    kind: "submit"
+  }
+  action_request[:values] = values if values
+  action_request[:payload] = payload if payload
+  response = request(socket, {
+    type: "plugin_surface_action",
+    package_name: "project-pipelines",
+    request: action_request
+  })
+  assert(response["kind"] == "plugin_action_result", "#{action_id} did not return plugin_action_result")
+  result = response.fetch("plugin_action_result")
+  assert(result["request_id"] == request_id, "#{action_id} request identity mismatch")
+  assert(result["surface_id"] == "project-pipelines.home", "#{action_id} surface identity mismatch")
+  assert(result["action_id"] == action_id, "#{action_id} action identity mismatch")
+  assert(result["node_id"] == node_id, "#{action_id} node identity mismatch")
+  result
+end
+
+project_id = "project_live_#{Process.pid}"
+created_project = call_tool(socket, "project_pipelines.create_project", {
+  id: project_id,
+  name: "Live contract project",
+  repository: {
+    id: "repo_live_contract",
+    name: "example/live-contract",
+    remote: "https://example.invalid/live-contract.git"
+  },
+  spawn_target_id: "spawn_target_live_contract"
+})
+assert(created_project["ok"] == true, "live project setup failed")
+
+surface = render_surface(socket)
+create_form = find_node(surface, "project-pipelines-create-ticket-form")
+filter_button = find_node(surface, "project-pipelines-toolbar-filter-running")
+run_table = find_node(surface, "project-pipelines-run-table")
+assert(create_form, "rendered surface missing create ticket form")
+assert(filter_button, "rendered surface missing filter button")
+assert(run_table, "rendered surface missing selectable run table")
+
+create_action_id = create_form.dig("props", "action", "id")
+filter_action_id = filter_button.dig("props", "action", "id")
+select_action_id = run_table.dig("props", "row_action", "id")
+assert(create_action_id == "project_pipelines.create_ticket", "rendered create action mismatch")
+assert(filter_action_id == "project_pipelines.filter", "rendered filter action mismatch")
+assert(select_action_id == "project_pipelines.select_row", "rendered select action mismatch")
+
+filter = dispatch_action(
+  socket,
+  action_id: filter_action_id,
+  request_id: "live-filter",
+  node_id: filter_button.fetch("id"),
+  payload: { status: "active" }
+)
+assert(filter["state"] == "accepted", "filter action was not accepted")
+assert(filter.dig("payload", "filter") == "active", "filter payload did not arrive")
+assert(filter.dig("presentation", 0, "kind") == "set", "filter did not set presentation")
+assert(filter.dig("presentation", 0, "key") == "project-pipelines.filter", "filter presentation key mismatch")
+
+select = dispatch_action(
+  socket,
+  action_id: select_action_id,
+  request_id: "live-select",
+  node_id: run_table.fetch("id"),
+  payload: { row_id: "workspace_runtime_alpha" }
+)
+assert(select["state"] == "accepted", "select action was not accepted")
+assert(select.dig("payload", "row_id") == "workspace_runtime_alpha", "select payload did not arrive")
+assert(select.dig("presentation", 0, "key") == "selected-workspace", "select presentation key mismatch")
+
+ticket_id = "ticket_live_#{Process.pid}"
+submitted_values = {
+  id: ticket_id,
+  project_id: project_id,
+  title: "Live contract ticket"
+}
+created = dispatch_action(
+  socket,
+  action_id: create_action_id,
+  request_id: "live-create",
+  node_id: create_form.fetch("id"),
+  values: submitted_values
+)
+assert(created["state"] == "accepted", "create action was not accepted")
+assert(created.dig("payload", "ticket", "id") == ticket_id, "create values did not reach the domain mutation")
+assert(created.dig("presentation", 0, "kind") == "clear", "create did not close its dialog")
+assert(created.dig("presentation", 0, "key") == "project-pipelines.create-ticket-dialog", "create dialog key mismatch")
+assert(created.dig("replacement", "id") == "project-pipelines-created-ticket", "create replacement mismatch")
+
+rejected_values = {
+  id: "ticket_live_rejected_#{Process.pid}",
+  project_id: project_id,
+  title: "   "
+}
+rejected = dispatch_action(
+  socket,
+  action_id: create_action_id,
+  request_id: "live-create-rejected",
+  node_id: create_form.fetch("id"),
+  values: rejected_values
+)
+assert(rejected["state"] == "rejected", "invalid create was not rejected")
+assert(rejected["normalized_values"] == rejected_values.transform_keys(&:to_s), "rejected create did not retain submitted values")
+assert(rejected.dig("field_errors", "project-pipelines-create-ticket-title", 0) == "title is required", "rejected create field error mismatch")
+assert(!rejected.key?("presentation"), "rejected create must preserve presentation")
+assert(!rejected.key?("replacement"), "rejected create must not replace the tree")
+
+predicates = []
+each_node(surface) do |node|
+  predicates << node["predicate"] if node["$kind"] == "presentation_if"
+end
+selected = predicates.find { |predicate| predicate["kind"] == "equals" && predicate["key"] == "selected-workspace" }
+assert(selected && selected["value"] == "workspace_runtime_alpha", "selected-workspace equality predicate missing")
+
+puts "script/hub_acceptance_smoke: ok project_id=#{project_id} ticket_id=#{ticket_id} kind=submit"

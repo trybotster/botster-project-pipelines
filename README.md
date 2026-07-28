@@ -79,7 +79,9 @@ Project Pipelines surfaces are Botster shared `ui_contract` trees consumed by
 browser and TUI renderers. Web rendering should stay React/Catalyst-side; this
 plugin emits structured nodes, stable node IDs, and plugin-owned entity families
 such as `project-pipelines.project`, `project-pipelines.ticket`, and
-`project-pipelines.run`.
+`project-pipelines.run`. The package test contract is pinned to the published
+`@trybotster/ui-contract@0.1.0` registry artifact; sibling checkout, `file:`,
+`link:`, path, git, and environment dependency overrides are not supported.
 
 Stable package surface IDs are:
 
@@ -119,6 +121,30 @@ and iframes are intentionally out of scope for CRUD/workbench controls. Future
 graph or report surfaces may use an iframe only when they need a custom
 full-screen visual app with an explicit plugin asset bridge.
 
+Every plugin action consumes the complete worker-visible `UiActionRequest`
+envelope: `request_id`, `surface_id`, `action_id`, optional `node_id`, `kind`,
+optional form `values`, and optional non-form `payload`. The five current
+operations require `kind="submit"`. Reset, validate, and cancel requests are
+rejected without workflow mutation or presentation/replacement effects. Form
+handlers read domain input only from `values`; filter and row selection read
+metadata only from `payload`. Flat legacy arguments are not accepted.
+
+Every Form declares an explicit `submit_label`. Create-ticket, record-run, and
+activate-step dialogs use `presentation="auto"` and are wrapped in scoped
+`presentation_if` presence predicates; selected workspace content uses an
+equality predicate. Dialogs never use `props.open`. Modal visibility remains
+client-local presentation state, while tickets and runs remain plugin-owned
+entity state.
+
+Action results echo request, surface, action, and optional node identity exactly.
+Accepted filter/select results set scoped presentation values. Accepted
+mutations clear their dialog key and return the smallest direct replacement that
+exposes the mutation. Rejected form results have stable input-node
+`field_errors`, `form_errors`, and `normalized_values` equal to the submitted
+values, with no presentation or replacement effects, so the active dialog and
+operator input are retained. `tree_update` and compatibility result aliases are
+not part of this contract.
+
 The settings surface reports provider/dependency status without importing a
 provider client. After a missing provider dependency blocks activation, the
 real settings handler returns `project-pipelines-provider-dependency-status`
@@ -130,8 +156,14 @@ diagnostic, such as `github:github_auth`.
 Run the package checks:
 
 ```sh
+npm ci
 script/test
 ```
+
+`script/test` runs the registry contract assertions and the repository Lua
+harness. It covers all five canonical action envelopes, submit-kind handling,
+form-values/non-form-payload separation, exact optional node identity, dialog
+predicates, accepted effects, rejected retention, and negative legacy calls.
 
 Smoke the package against a real Botster Hub data directory:
 
@@ -174,3 +206,29 @@ Ticket dependency acceptance should separately add an open prerequisite through
 and observe `ticket_dependencies_unmet` with unchanged current-step and session
 state. After closing or removing the prerequisite, a later explicit activation
 should spawn once and a repeat activation should reuse that request.
+
+For the Hub-owned UI contract flow, build the exact merged Hub and its locked
+Core session worker from a fresh checkout. The second binary is a
+`botster-core` target pinned by that Hub commit's `Cargo.lock`; it does not carry
+the Hub SHA.
+
+```sh
+git clone https://github.com/trybotster/botster-hub.git /private/tmp/botster-hub-ui-contract
+git -C /private/tmp/botster-hub-ui-contract checkout d79403c74520fa054fb8b5996958dcf739d2fee3
+cargo build --locked --manifest-path /private/tmp/botster-hub-ui-contract/Cargo.toml
+cargo build --locked --manifest-path /private/tmp/botster-hub-ui-contract/Cargo.toml -p botster-core --bin botster-session-worker
+BOTSTER_HUB_SOURCE=/private/tmp/botster-hub-ui-contract \
+BOTSTER_HUB_BIN=/private/tmp/botster-hub-ui-contract/target/debug/botster-hub \
+BOTSTER_SESSION_WORKER_BIN=/private/tmp/botster-hub-ui-contract/target/debug/botster-session-worker \
+script/test-hub-flow
+```
+
+The harness verifies the Hub checkout SHA, reads the distinct Core SHA from its
+lockfile, confirms both executables came from that checkout's target directory,
+installs/enables this packaged plugin in an isolated data directory, renders the
+real `project-pipelines.home` entry point, reads action IDs from returned nodes,
+and dispatches canonical filter, select, accepted create, and rejected create
+requests through the real worker. It asserts structured
+`plugin_action_result` frames, exact identity, submit kind, values/payload
+separation, close/replacement behavior, retained normalized values/errors, and
+the selected-workspace equality binding.
