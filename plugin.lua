@@ -1,8 +1,15 @@
 local STORE_SCHEMA_VERSION = 2
 local STORE_ROOT = "v2/"
-local SOURCE_REVISION = "botster-stack-delivery/2026-07-28.1"
+local SOURCE_REVISION = "botster-stack-delivery/2026-07-28.2"
+local MAX_STORE_KEYS = 1024
+local STORE_KEY_HEADROOM = 64
+local MAX_EVENTS = 256
 
 local RECORD_FAMILIES = {
+  -- Correlation records must become durable before the run records whose
+  -- effects they describe. save_state preserves this order.
+  "session_requests",
+  "advance_requests",
   "projects",
   "tickets",
   "pipeline_definitions",
@@ -16,9 +23,8 @@ local RECORD_FAMILIES = {
   "questions",
   "answers",
   "pr_links",
+  -- Events are diagnostic consequences and are always written last.
   "events",
-  "session_requests",
-  "advance_requests",
 }
 
 local function empty_schema()
@@ -220,6 +226,9 @@ local function default_state()
     _original_counters = {},
     _originals = {},
     _positions = {},
+    _revisions = {},
+    _counter_revision = 0,
+    _store_key_count = 0,
   }
 end
 
@@ -236,6 +245,45 @@ local function record_payload(response)
   return type(response.record.payload) == "table" and response.record.payload or nil
 end
 
+local RECORD_REQUIRED_FIELDS = {
+  projects = { "id", "name", "repository", "spawn_target_id" },
+  tickets = { "id", "project_id", "title", "status" },
+  pipeline_definitions = { "id", "name", "steps" },
+  runs = { "id", "ticket_id", "pipeline_definition_id", "current_step_id", "status" },
+  gate_results = { "id", "run_id", "step_id", "gate_id", "status" },
+  reviews = { "id", "run_id", "step_id", "verdict" },
+  findings = { "id", "run_id", "review_id", "severity", "status" },
+  artifacts = { "id", "run_id", "kind" },
+  checklists = { "id", "run_id", "name" },
+  checklist_items = { "id", "checklist_id", "text", "status" },
+  questions = { "id", "run_id", "question", "status" },
+  answers = { "id", "question_id", "answer" },
+  pr_links = { "id", "run_id", "url" },
+  events = { "id", "kind" },
+  session_requests = { "id", "run_id", "step_id", "status" },
+  advance_requests = { "id", "request_id", "run_id", "previous_step_id", "step_id", "status", "result" },
+}
+
+local function validate_record(family, payload)
+  if type(payload) ~= "table" then return false, "payload must be an object" end
+  for _, field in ipairs(RECORD_REQUIRED_FIELDS[family] or { "id" }) do
+    local value = payload[field]
+    if value == nil or (type(value) == "string" and value == "") then
+      return false, "missing required field " .. field
+    end
+  end
+  if type(payload.id) ~= "string" then return false, "id must be a string" end
+  return true
+end
+
+local function validate_counters(counters)
+  if type(counters) ~= "table" then return false end
+  for key, value in pairs(counters) do
+    if type(key) ~= "string" or type(value) ~= "number" or value < 0 then return false end
+  end
+  return true
+end
+
 local function list_entries(response)
   if type(response) ~= "table" then return {} end
   return type(response.entries) == "table" and response.entries or {}
@@ -248,18 +296,29 @@ local function load_state()
     return state
   end
 
-  local counters = record_payload(plugin_db.get({ key = STORE_ROOT .. "meta/counters" }))
-  if counters then state.counters = counters end
+  state._store_key_count = #list_entries(plugin_db.list({ prefix = STORE_ROOT }))
+  local counter_response = plugin_db.get({ key = STORE_ROOT .. "meta/counters" })
+  local counters = record_payload(counter_response)
+  if counters then
+    if not validate_counters(counters) then error("invalid project-pipelines counters payload") end
+    state.counters = counters
+    state._counter_revision = counter_response.record.revision or 0
+  end
   state._original_counters = copy(state.counters)
   for _, family in ipairs(RECORD_FAMILIES) do
     state._originals[family] = {}
     state._positions[family] = {}
+    state._revisions[family] = {}
     local listed = plugin_db.list({ prefix = STORE_ROOT .. family .. "/" })
     for _, entry in ipairs(list_entries(listed)) do
       if type(entry.key) == "string" then
-        local payload = record_payload(plugin_db.get({ key = entry.key }))
+        local response = plugin_db.get({ key = entry.key })
+        local payload = record_payload(response)
         if payload then
+          local valid, reason = validate_record(family, payload)
+          if not valid then error("invalid " .. family .. " record " .. entry.key .. ": " .. reason) end
           state._positions[family][payload.id] = payload._store_position
+          state._revisions[family][payload.id] = response.record.revision or entry.revision or 0
           table.insert(state[family], payload)
         end
       end
@@ -286,18 +345,68 @@ local function save_state(state)
     return failure("persist_failed", "plugin_db capability is unavailable")
   end
 
-  -- Records are independently addressable. Counters are reserved first so an
-  -- interrupted multi-key mutation may leave an observable id gap, but a retry
-  -- cannot reuse an id or overwrite a partially written record.
+  local deleted_keys = {}
+  local new_key_count = 0
+  for _, family in ipairs(RECORD_FAMILIES) do
+    local current = {}
+    for _, record in ipairs(state[family] or {}) do current[record.id] = true end
+    for id in pairs(state._originals and state._originals[family] or {}) do
+      if not current[id] then table.insert(deleted_keys, record_key(family, id)) end
+    end
+    for _, record in ipairs(state[family] or {}) do
+      if not (state._originals and state._originals[family] and state._originals[family][record.id]) then
+        new_key_count = new_key_count + 1
+      end
+    end
+  end
+  if state._counter_revision == 0 and not deep_equal(state.counters, state._original_counters or {}) then
+    new_key_count = new_key_count + 1
+  end
+  local projected_keys = (state._store_key_count or 0) - #deleted_keys + new_key_count
+  if projected_keys > MAX_STORE_KEYS - STORE_KEY_HEADROOM then
+    return failure("store_capacity_exhausted", "project-pipelines store has reached its reserved key ceiling", {
+      projected_keys = projected_keys,
+      maximum_keys = MAX_STORE_KEYS,
+      reserved_headroom = STORE_KEY_HEADROOM,
+    })
+  end
+
+  for _, key in ipairs(deleted_keys) do
+    local deleted, delete_error = pcall(plugin_db.delete, { key = key })
+    if not deleted then
+      return failure("persist_failed", "plugin_db delete failed", { key = key, reason = tostring(delete_error) })
+    end
+    state._store_key_count = state._store_key_count - 1
+  end
+
+  local function persist(args)
+    local written, response = pcall(plugin_db.set, args)
+    if not written then
+      return nil, failure("persist_failed", "plugin_db write failed", { key = args.key, reason = tostring(response) })
+    end
+    return response, nil
+  end
+
+  -- Counters are reserved first so retries cannot reuse identifiers.
   if not deep_equal(state.counters, state._original_counters or {}) then
-    plugin_db.set({
+    local response, err = persist({
       key = STORE_ROOT .. "meta/counters",
       schema_version = STORE_SCHEMA_VERSION,
       payload = state.counters,
+      expected_revision = state._counter_revision or 0,
     })
+    if err then return err end
+    state._counter_revision = response and response.record and response.record.revision
+      or (state._counter_revision or 0) + 1
+    state._original_counters = copy(state.counters)
+    if state._counter_revision == 1 then state._store_key_count = state._store_key_count + 1 end
   end
   for _, family in ipairs(RECORD_FAMILIES) do
     for position, record in ipairs(state[family] or {}) do
+      local valid, reason = validate_record(family, record)
+      if not valid then
+        return failure("invalid_record", "invalid " .. family .. " record: " .. reason, { family = family, id = record.id })
+      end
       local original = state._originals and state._originals[family] and state._originals[family][record.id]
       if not original or not deep_equal(record, original) then
         local payload = copy(record)
@@ -305,11 +414,18 @@ local function save_state(state)
           and state._positions[family]
           and state._positions[family][record.id]
           or position
-        plugin_db.set({
+        local revision = state._revisions and state._revisions[family] and state._revisions[family][record.id] or 0
+        local response, err = persist({
           key = record_key(family, record.id),
           schema_version = STORE_SCHEMA_VERSION,
           payload = payload,
+          expected_revision = revision,
         })
+        if err then return err end
+        state._revisions[family][record.id] = response and response.record and response.record.revision or revision + 1
+        state._originals[family][record.id] = copy(record)
+        state._positions[family][record.id] = payload._store_position
+        if revision == 0 then state._store_key_count = state._store_key_count + 1 end
       end
     end
   end
@@ -336,6 +452,7 @@ local function push_event(state, kind, run_id, subject_id, payload)
     subject_id = subject_id,
     payload = payload,
   })
+  while #state.events > MAX_EVENTS do table.remove(state.events, 1) end
 end
 
 local function find_project_for_ticket(state, ticket)
@@ -351,14 +468,14 @@ local function find_pipeline_step(pipeline, step_id)
   return nil
 end
 
-local REPOSITORY_PLAYBOOKS = {
-  ["botster-core"] = "[[botster-core-playbook]]",
-  ["botster-hub"] = "[[botster-hub-playbook]]",
-  ["botster-hub-client"] = "[[botster-hub-client-playbook]]",
-  ["botster-web"] = "[[botster-web-playbook]]",
-  ["botster-tui"] = "[[botster-tui-playbook]]",
-  ["botster-tui-kit"] = "[[botster-tui-kit-playbook]]",
-  ["botster-terminal-ghostty"] = "[[botster-terminal-ghostty-playbook]]",
+local REPOSITORY_ROUTING = {
+  { slug = "botster-core", playbook = "[[botster-core-playbook]]" },
+  { slug = "botster-hub", playbook = "[[botster-hub-playbook]]" },
+  { slug = "botster-hub-client", playbook = "[[botster-hub-client-playbook]]" },
+  { slug = "botster-web", playbook = "[[botster-web-playbook]]" },
+  { slug = "botster-tui", playbook = "[[botster-tui-playbook]]" },
+  { slug = "botster-tui-kit", playbook = "[[botster-tui-kit-playbook]]" },
+  { slug = "botster-terminal-ghostty", playbook = "[[botster-terminal-ghostty-playbook]]" },
 }
 
 local function project_pipelines_path(path)
@@ -378,8 +495,8 @@ local function resolve_repository_playbook(arguments)
   local matches = {}
   if repository then
     local slug = repository:match("([^/]+)$") or repository
-    if REPOSITORY_PLAYBOOKS[slug] then
-      table.insert(matches, REPOSITORY_PLAYBOOKS[slug])
+    for _, route in ipairs(REPOSITORY_ROUTING) do
+      if route.slug == slug then table.insert(matches, route.playbook) end
     end
     if slug == "botster-project-pipelines" then
       table.insert(matches, "[[project-pipelines-playbook]]")
@@ -405,17 +522,16 @@ local function resolve_repository_playbook(arguments)
   return ok({ repository = repository, path = path, playbook = charters[1] })
 end
 
-local ROUTING_PROMPT = [=[
-Resolve target_id to the authoritative repository before acting. Load exactly
-one repository charter: botster-core -> [[botster-core-playbook]];
-botster-hub -> [[botster-hub-playbook]]; botster-hub-client ->
-[[botster-hub-client-playbook]]; botster-web -> [[botster-web-playbook]];
-botster-tui -> [[botster-tui-playbook]]; botster-tui-kit ->
-[[botster-tui-kit-playbook]]; botster-terminal-ghostty ->
-[[botster-terminal-ghostty-playbook]]. Project Pipelines package/plugin paths
-load [[project-pipelines-playbook]]. Zero or multiple matches require a routing
-question; never substitute a generic charter or load every charter.
-]=]
+local function routing_prompt()
+  local routes = {}
+  for _, route in ipairs(REPOSITORY_ROUTING) do
+    table.insert(routes, route.slug .. " -> " .. route.playbook)
+  end
+  table.insert(routes, "Project Pipelines package/plugin paths -> [[project-pipelines-playbook]]")
+  return "Resolve target_id to the authoritative repository before acting. Load exactly one repository charter: "
+    .. table.concat(routes, "; ")
+    .. ". Zero or multiple matches require a routing question; never substitute a generic charter or load every charter."
+end
 
 local function sourced_step(id, name, position, agent_name, role_prompt, options)
   options = options or {}
@@ -426,7 +542,7 @@ local function sourced_step(id, name, position, agent_name, role_prompt, options
     kind = options.kind or "pty",
     session_template_capability = options.session_template_capability or "botster.pipeline.agent",
     agent_name = agent_name,
-    prompt = role_prompt .. "\n\n" .. ROUTING_PROMPT,
+    prompt = role_prompt .. "\n\n" .. routing_prompt(),
     allows_open_ticket_dependencies = options.allows_open_ticket_dependencies == true,
     gates = options.gates or {},
     next_step_id = options.next_step_id,
@@ -701,8 +817,6 @@ local function context_value(arguments, run, ticket, project, step, key)
 end
 
 local function build_session_template_request(arguments, run, ticket, project, step)
-  local repository = context_value(arguments, run, ticket, project, step, "repository")
-  local worktree = context_value(arguments, run, ticket, project, step, "worktree")
   local prompt = bounded_prompt(context_value(arguments, run, ticket, project, step, "prompt"))
   local metadata = clean_string_map(context_value(arguments, run, ticket, project, step, "metadata"))
   metadata.owner_plugin = metadata.owner_plugin or "project-pipelines"
@@ -712,8 +826,6 @@ local function build_session_template_request(arguments, run, ticket, project, s
   metadata.ticket_id = ticket.id
 
   local context = {
-    worktree_path = type(worktree) == "table" and worktree.path or nil,
-    repo_path = type(repository) == "table" and repository.path or nil,
     branch_name = context_value(arguments, run, ticket, project, step, "branch") or run.branch,
     prompt = prompt,
     ticket_id = ticket.id,
@@ -724,7 +836,6 @@ local function build_session_template_request(arguments, run, ticket, project, s
 
   return {
     target_id = context_value(arguments, run, ticket, project, step, "spawn_target_id") or project.spawn_target_id,
-    cwd = context_value(arguments, run, ticket, project, step, "cwd"),
     environment = clean_string_map(context_value(arguments, run, ticket, project, step, "environment")),
     context = context,
   }
@@ -953,6 +1064,13 @@ local function existing_spawn_activation(state, run, step)
   return nil
 end
 
+local function session_request_for(state, request_id, run, step)
+  if not request_id then return nil end
+  local request = find_by_id(state.session_requests, request_id)
+  if request and request.run_id == run.id and request.step_id == step.id then return request end
+  return nil
+end
+
 local function define_pipeline(arguments)
   arguments = arguments or {}
   local project_id = trim(arguments.project_id)
@@ -1062,19 +1180,27 @@ local function activate_step(arguments)
   local blocked_transition_cleared = run.blocked_transition ~= nil
   run.blocked_transition = nil
 
-  local existing_activation = existing_spawn_activation(state, run, step)
+  local request_id = string_arg(arguments, "request_id")
+  local existing_activation = session_request_for(state, request_id, run, step)
+    or existing_spawn_activation(state, run, step)
   if existing_activation then
     if blocked_transition_cleared then
       local err = save_state(state)
       if err then return err end
     end
+    if existing_activation.status == "spawning" then
+      return diagnostic_failure(
+        "activation_outcome_unknown",
+        "managed spawn was dispatched but its final result was not durably recorded; refusing to spawn again",
+        { request_id = existing_activation.id, run_id = run.id, step_id = step.id }
+      )
+    end
     return ok({ activation = existing_activation, run = run })
   end
 
-  run.current_step_id = step.id
-  push_event(state, "step_started", run.id, step.id)
-
   if not step_uses_session_template(step) then
+    run.current_step_id = step.id
+    push_event(state, "step_started", run.id, step.id)
     local activation = {
       run_id = run.id,
       step_id = step.id,
@@ -1088,7 +1214,7 @@ local function activate_step(arguments)
     return ok({ activation = activation, run = run })
   end
 
-  local request_id = string_arg(arguments, "request_id") or next_id(state, "session_request")
+  request_id = request_id or next_id(state, "session_request")
   local request = build_session_template_request(arguments, run, ticket, project, step)
   if not request.target_id or request.target_id == "" then
     return failure("validation_failed", "spawn target is required for session-template activation", { "target_id" })
@@ -1131,9 +1257,6 @@ local function activate_step(arguments)
     return resolved
   end
 
-  local response, dispatched_request = spawn_session_template(resolved, request)
-  request = dispatched_request or request
-  local status = response and response.ok == false and "failed" or "spawn_requested"
   local session_request = {
     id = request_id,
     run_id = run.id,
@@ -1141,16 +1264,33 @@ local function activate_step(arguments)
     ticket_id = ticket.id,
     template_id = resolved.template_id,
     template_selector = selector,
-    session_id = response and (response.session_id or response.session_uuid),
-    status = status,
+    status = "spawning",
     request = request,
-    result = response,
     prompt_summary = bounded_prompt(request.context and request.context.prompt),
-    context_id = response and response.context_id,
   }
   table.insert(state.session_requests, session_request)
+  local pending_error = save_state(state)
+  if pending_error then return pending_error end
+
+  local response, dispatched_request = spawn_session_template(resolved, request)
+  state = load_state()
+  run = find_by_id(state.runs, run_id)
+  session_request = find_by_id(state.session_requests, request_id)
+  if not run or not session_request then
+    return failure("persist_failed", "durable spawn correlation record disappeared")
+  end
+  request = dispatched_request or request
+  local status = response and response.ok == false and "failed" or "spawn_requested"
+  session_request.session_id = response and (response.session_id or response.session_uuid)
+  session_request.status = status
+  session_request.request = request
+  session_request.result = response
+  session_request.prompt_summary = bounded_prompt(request.context and request.context.prompt)
+  session_request.context_id = response and response.context_id
+  run.current_step_id = step.id
   run.session_request_id = session_request.id
   run.session_id = session_request.session_id
+  push_event(state, "step_started", run.id, step.id)
   local event_kind = status == "failed" and "session_template_spawn_failed" or "session_template_spawn_requested"
   push_event(state, event_kind, run.id, session_request.id, {
     template_id = resolved.template_id,
@@ -1446,7 +1586,11 @@ local function transition_blockers(state, run, pipeline, step)
     table.insert(blockers, { kind = "review", review_id = latest_review.id, verdict = latest_review.verdict })
   end
   for _, finding in ipairs(state.findings) do
-    if finding.run_id == run.id and finding.status ~= "resolved" and finding.status ~= "waived" then
+    if finding.run_id == run.id
+      and finding.status ~= "resolved"
+      and finding.status ~= "waived"
+      and (finding.severity == "blocker" or finding.severity == "high")
+    then
       table.insert(blockers, { kind = "finding", finding_id = finding.id, severity = finding.severity })
     end
   end
@@ -1493,7 +1637,30 @@ local function request_step_advance(arguments)
   local request_id = string_arg(arguments, "request_id")
   if request_id then
     for _, request in ipairs(state.advance_requests) do
-      if request.request_id == request_id then return copy(request.result) end
+      if request.request_id == request_id then
+        if request.run_id ~= run.id then
+          return failure("request_id_conflict", "advance request_id belongs to another run")
+        end
+        if run.current_step_id == request.previous_step_id then
+          run.current_step_id = request.step_id
+          run.status = "active"
+          push_event(state, "step_advanced", run.id, request.step_id, {
+            from_step_id = request.previous_step_id,
+            request_id = request.request_id,
+            recovered = true,
+          })
+          request.status = "applied"
+          local recovered_error = save_state(state)
+          if recovered_error then return recovered_error end
+        elseif run.current_step_id ~= request.step_id then
+          return failure("advance_recovery_conflict", "run no longer matches the durable advance request")
+        elseif request.status ~= "applied" then
+          request.status = "applied"
+          local recovered_error = save_state(state)
+          if recovered_error then return recovered_error end
+        end
+        return copy(request.result)
+      end
     end
   end
   local pipeline = find_by_id(state.pipeline_definitions, run.pipeline_definition_id)
@@ -1520,18 +1687,35 @@ local function request_step_advance(arguments)
       blockers = blockers,
     })
   end
-  run.current_step_id = next_step_id
-  run.status = "active"
-  push_event(state, "step_advanced", run.id, next_step_id, { from_step_id = current_step.id })
-  local response = ok({ run = copy(run), previous_step_id = current_step.id, step_id = next_step_id })
+  local response_run = copy(run)
+  response_run.current_step_id = next_step_id
+  response_run.status = "active"
+  local response = ok({ run = response_run, previous_step_id = current_step.id, step_id = next_step_id })
+  local advance_request
   if request_id then
-    table.insert(state.advance_requests, {
+    advance_request = {
       id = next_id(state, "advance_request"),
       request_id = request_id,
       run_id = run.id,
+      previous_step_id = current_step.id,
+      step_id = next_step_id,
+      status = "pending",
       result = copy(response),
-    })
+    }
+    table.insert(state.advance_requests, advance_request)
+    local correlation_error = save_state(state)
+    if correlation_error then return correlation_error end
+    state = load_state()
+    run = find_by_id(state.runs, run_id)
+    advance_request = find_by_id(state.advance_requests, advance_request.id)
   end
+  run.current_step_id = next_step_id
+  run.status = "active"
+  push_event(state, "step_advanced", run.id, next_step_id, {
+    from_step_id = current_step.id,
+    request_id = request_id,
+  })
+  if advance_request then advance_request.status = "applied" end
   local err = save_state(state)
   if err then return err end
   return response
@@ -1541,7 +1725,7 @@ local function records_for_run(records, run_id)
   if not run_id then return records end
   local selected = {}
   for _, record in ipairs(records) do
-    if record.run_id == run_id then table.insert(selected, record) end
+    if record.run_id == run_id or record.id == run_id then table.insert(selected, record) end
   end
   return selected
 end

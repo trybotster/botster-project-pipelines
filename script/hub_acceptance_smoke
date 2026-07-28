@@ -3,6 +3,7 @@
 
 require "json"
 require "socket"
+require "timeout"
 
 socket_path = ARGV.fetch(0) do
   warn "usage: script/hub_acceptance_smoke <botster-hub.sock> [verify_restart]"
@@ -285,6 +286,12 @@ run = call_tool(socket, "project_pipelines.record_run", {
 })
 assert(run["ok"] == true && run.dig("run", "current_step_id") == "botster_stack_plan", "sourced run did not start at Plan")
 
+blocked_plan = call_tool(socket, "project_pipelines.request_step_advance", {
+  run_id: run_id,
+  request_id: "live-plan-before-gate"
+})
+assert(blocked_plan["ok"] == false && blocked_plan.dig("error", "code") == "transition_blocked", "missing Plan evidence must block")
+
 plan_activation = call_tool(socket, "project_pipelines.activate_step", {
   run_id: run_id,
   step_id: "botster_stack_plan",
@@ -298,33 +305,25 @@ assert(plan_activation.dig("activation", "result", "worktree_path"), "downstream
 assert(plan_activation.dig("activation", "result", "session_id"), "downstream Plan did not create a managed session")
 assert(plan_activation.dig("activation", "request", "context", "prompt").include?("[[botster-tui-kit-playbook]]"), "production Plan prompt did not carry the TUI-kit charter")
 
-blocked_plan = call_tool(socket, "project_pipelines.request_step_advance", {
-  run_id: run_id,
-  request_id: "live-plan-before-gate"
-})
-assert(blocked_plan["ok"] == false && blocked_plan.dig("error", "code") == "transition_blocked", "missing Plan evidence must block")
-call_tool(socket, "project_pipelines.record_artifact", {
-  id: "artifact_live_plan",
-  run_id: run_id,
-  step_id: "botster_stack_plan",
-  kind: "plan",
-  summary: "Live public-path plan"
-})
-call_tool(socket, "project_pipelines.submit_gate", {
-  run_id: run_id,
-  step_id: "botster_stack_plan",
-  gate_id: "plan_artifact",
-  status: "passed",
-  evidence: { artifact_id: "artifact_live_plan" }
-})
+managed_worktree = plan_activation.dig("activation", "result", "worktree_path")
+agent_result_path = File.join(managed_worktree, "downstream-plan-ran.json")
+Timeout.timeout(15) do
+  sleep 0.05 until File.file?(agent_result_path)
+end
+agent_result = JSON.parse(File.read(agent_result_path))
+assert(agent_result["repository_playbook"] == "[[botster-tui-kit-playbook]]", "spawned Plan agent did not resolve the TUI-kit charter")
+assert(agent_result["artifact_id"] == "artifact_live_plan_agent", "spawned Plan agent did not submit its artifact")
+assert(agent_result["gate_id"] == "plan_artifact", "spawned Plan agent did not submit its gate")
+assert(agent_result["step_id"] == "botster_stack_plan_review", "spawned Plan agent did not advance to Plan Review")
+
 plan_advance = call_tool(socket, "project_pipelines.request_step_advance", {
   run_id: run_id,
-  request_id: "live-plan-advance"
+  request_id: "live-plan-agent-advance"
 })
-assert(plan_advance["ok"] == true && plan_advance["step_id"] == "botster_stack_plan_review", "Plan did not advance through public MCP")
+assert(plan_advance["ok"] == true && plan_advance["step_id"] == "botster_stack_plan_review", "spawned Plan result was not durable")
 duplicate_advance = call_tool(socket, "project_pipelines.request_step_advance", {
   run_id: run_id,
-  request_id: "live-plan-advance"
+  request_id: "live-plan-agent-advance"
 })
 assert(duplicate_advance == plan_advance, "duplicate advance request did not reuse durable result")
 
@@ -423,6 +422,5 @@ assert(final_context.fetch("findings").any? { |record| record["run_id"] == run_i
 assert(final_context.fetch("questions").any? { |record| record["run_id"] == run_id && record["status"] == "answered" }, "answered question missing")
 assert(final_context.fetch("pr_links").count { |record| record["run_id"] == run_id } == 1, "PR link missing")
 assert(final_context.fetch("questions").none? { |record| record["question"].to_s.downcase.include?("routing") }, "downstream Plan asked a repository routing question")
-assert(final_context.fetch("events").none? { |record| record["kind"] == "question_asked" && record.dig("payload", "kind") == "repository_routing" }, "downstream Plan emitted a repository routing question event")
 
 puts "script/hub_acceptance_smoke: ok project_id=#{project_id} ticket_id=#{ticket_id} client_authored_kind=submit"

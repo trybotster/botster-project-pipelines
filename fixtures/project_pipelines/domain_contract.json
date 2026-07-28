@@ -3,7 +3,7 @@
   "fixture_role": {
     "authority": "schema_example_only",
     "production_source": "plugin.lua",
-    "source_revision": "botster-stack-delivery/2026-07-28.1"
+    "source_revision": "botster-stack-delivery/2026-07-28.2"
   },
   "manifest_anchors": {
     "package_name": "project-pipelines",
@@ -86,7 +86,15 @@
       "workspace_repository_grouping",
       "workspace_session_grouping"
     ],
-    "runtime_storage_namespace": "v2/<family>/<id>"
+    "runtime_storage_namespace": "v2/<family>/<id>",
+    "write_contract": {
+      "payload_validation": "family_required_fields",
+      "optimistic_concurrency": "expected_revision",
+      "correlation_before_effect": ["session_requests", "advance_requests"],
+      "event_retention": 256,
+      "namespace_key_limit": 1024,
+      "reserved_key_headroom": 64
+    }
   },
   "provider_capabilities": [
     {

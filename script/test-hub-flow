@@ -56,8 +56,77 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
   template_root = File.join(data_dir, "downstream-plan-template")
   FileUtils.mkdir_p(File.join(template_root, "bin"))
   File.write(File.join(template_root, "plugin.lua"), "return botster.register({})\n")
-  plan_script = File.join(template_root, "bin", "plan.sh")
-  File.write(plan_script, "#!/bin/sh\nprintf 'downstream-plan\\n' > downstream-plan-ran.txt\n")
+  plan_script = File.join(template_root, "bin", "plan.rb")
+  File.write(plan_script, <<~'RUBY')
+    #!/usr/bin/env ruby
+    # frozen_string_literal: true
+
+    require "json"
+    require "socket"
+
+    context_json = IO.popen([
+      ENV.fetch("BOTSTER_HUB_BIN"),
+      "context",
+      "--data-dir", ENV.fetch("BOTSTER_HUB_DATA_DIR"),
+      "--session-id", ENV.fetch("BOTSTER_SESSION_ID"),
+      "--context-id", ENV.fetch("BOTSTER_CONTEXT_ID")
+    ], &:read)
+    raise "could not read managed session context" unless $?.success?
+
+    context = JSON.parse(context_json)
+    prompt = context.fetch("prompt")
+    run_id = context.fetch("metadata.run_id")
+    raise "TUI-kit charter was not resolved" unless prompt.include?("[[botster-tui-kit-playbook]]")
+
+    socket = UNIXSocket.new(ENV.fetch("BOTSTER_HUB_SOCKET"))
+    socket.puts(JSON.generate({
+      protocol: "botster-hub-daemon-v1",
+      compatibility: {
+        protocol: "botster-hub-daemon-v1",
+        minimum_protocol_version: 1,
+        required_features: [],
+        minimum_conformance_fixture_revision: 1,
+        client_name: "downstream-tui-kit-plan-agent"
+      }
+    }))
+    JSON.parse(socket.gets || raise("daemon closed before hello"))
+
+    call_tool = lambda do |name, arguments|
+      socket.puts(JSON.generate({ type: "plugin_mcp_call_tool", name: name, arguments: arguments }))
+      response = JSON.parse(socket.gets || raise("daemon closed during #{name}"))
+      raise "#{name} daemon error: #{response["error"]}" if response["error"]
+      response.fetch("plugin_tool_result")
+    end
+
+    artifact = call_tool.call("project_pipelines.record_artifact", {
+      id: "artifact_live_plan_agent",
+      run_id: run_id,
+      step_id: "botster_stack_plan",
+      kind: "plan",
+      summary: "Downstream TUI-kit agent resolved the repository charter",
+      payload: { repository_playbook: "[[botster-tui-kit-playbook]]" }
+    })
+    gate = call_tool.call("project_pipelines.submit_gate", {
+      run_id: run_id,
+      step_id: "botster_stack_plan",
+      gate_id: "plan_artifact",
+      status: "passed",
+      evidence: { artifact_id: "artifact_live_plan_agent", producer: "spawned_downstream_agent" }
+    })
+    advance = call_tool.call("project_pipelines.request_step_advance", {
+      run_id: run_id,
+      request_id: "live-plan-agent-advance"
+    })
+    raise "downstream agent failed to advance Plan" unless advance["ok"] && advance["step_id"] == "botster_stack_plan_review"
+
+    File.write("downstream-plan-ran.json", JSON.pretty_generate({
+      run_id: run_id,
+      repository_playbook: "[[botster-tui-kit-playbook]]",
+      artifact_id: artifact.dig("artifact", "id"),
+      gate_id: gate.dig("gate_result", "gate_id"),
+      step_id: advance["step_id"]
+    }))
+  RUBY
   File.chmod(0o755, plan_script)
   File.write(
     File.join(template_root, "botster-package.json"),
@@ -71,9 +140,9 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
       entrypoints: [{ runtime: "lua", path: "plugin.lua", bootstrap: false }],
       session_templates: [{
         id: "plan",
-        command: "bin/plan.sh",
+        command: "bin/plan.rb",
         target_id: "tgt_3dfae49c02454037bf13554f552baf7f",
-        context: %w[prompt ticket_id]
+        context: ["prompt", "ticket_id", "metadata.run_id"]
       }]
     })
   )

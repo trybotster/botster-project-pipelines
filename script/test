@@ -74,7 +74,7 @@ assert contract["contract_version"] == 2
 assert contract["fixture_role"] == {
     "authority": "schema_example_only",
     "production_source": "plugin.lua",
-    "source_revision": "botster-stack-delivery/2026-07-28.1",
+    "source_revision": "botster-stack-delivery/2026-07-28.2",
 }
 anchors = contract["manifest_anchors"]
 assert anchors["package_name"] == manifest["name"]
@@ -371,6 +371,8 @@ cat > "$lua_test" <<'LUA'
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
 local durable_store = {}
+local fail_set_key_prefix = nil
+local conflict_set_key_prefix = nil
 
 local function deep_copy(value)
   if type(value) ~= "table" then return value end
@@ -402,14 +404,29 @@ botster = {
         return { record = deep_copy(record) }
       end,
       set = function(args)
+        if fail_set_key_prefix and args.key:sub(1, #fail_set_key_prefix) == fail_set_key_prefix then
+          error("injected write interruption for " .. args.key)
+        end
         local previous = durable_store[args.key]
+        if conflict_set_key_prefix
+          and args.key:sub(1, #conflict_set_key_prefix) == conflict_set_key_prefix
+          and previous
+        then
+          previous.revision = previous.revision + 1
+          conflict_set_key_prefix = nil
+        end
+        local expected_revision = args.expected_revision
+        local actual_revision = previous and previous.revision or 0
+        if expected_revision ~= nil and expected_revision ~= actual_revision then
+          error("revision conflict for " .. args.key)
+        end
         durable_store[args.key] = {
           key = args.key,
           schema_version = args.schema_version,
           revision = previous and (previous.revision + 1) or 1,
           payload = deep_copy(args.payload),
         }
-        return { ok = true }
+        return { ok = true, record = deep_copy(durable_store[args.key]) }
       end,
       list = function(args)
         local entries = {}
@@ -557,8 +574,12 @@ assert(sourced_pipelines == 1, "empty store must initialize exactly one sourced 
 assert(stack_delivery.source_authority == "trybotster/botster-project-pipelines:plugin.lua", "standalone plugin source must be authoritative")
 assert(#stack_delivery.steps == 6, "Stack Delivery must initialize each sourced step exactly once")
 for _, step in ipairs(stack_delivery.steps) do
-  assert(step.prompt:find("[[botster%-tui%-kit%-playbook]]"), "every delivery role must carry the TUI-kit route")
+  assert(step.prompt:find("[[botster-tui-kit-playbook]]", 1, true), "every delivery role must carry the TUI-kit route")
 end
+assert(
+  not string.find("[[botster-core-playbook]]", "[[botster-tui-kit-playbook]]", 1, true),
+  "routing assertion positive control must reject a prompt without the TUI-kit route"
+)
 local expected_routes = {
   ["botster-core"] = "[[botster-core-playbook]]",
   ["botster-hub"] = "[[botster-hub-playbook]]",
@@ -1710,6 +1731,169 @@ assert(reloaded_tools["project_pipelines.request_step_advance"]({
   request_id = "advance_with_pr",
 }).ok, "committed implementation with PR link must advance")
 
+local interruption_pipeline = reloaded_tools["project_pipelines.define_pipeline"]({
+  id = "pipeline_runtime_interruptions",
+  project_id = "proj_runtime_standalone",
+  name = "Runtime interruption recovery",
+  steps = {
+    {
+      id = "step_interrupt_spawn",
+      name = "Spawn",
+      position = 1,
+      kind = "pty",
+      session_template_id = "template_codex_runtime",
+      prompt = "Exercise durable spawn correlation.",
+      next_step_id = "step_interrupt_middle",
+      gates = {},
+    },
+    {
+      id = "step_interrupt_middle",
+      name = "Middle",
+      position = 2,
+      kind = "manual",
+      next_step_id = "step_interrupt_final",
+      gates = {},
+    },
+    {
+      id = "step_interrupt_final",
+      name = "Final",
+      position = 3,
+      kind = "manual",
+      gates = {},
+    },
+  },
+})
+assert(interruption_pipeline.ok, "interruption recovery pipeline create failed")
+
+local interrupted_spawn_run = reloaded_tools["project_pipelines.record_run"]({
+  id = "run_runtime_interrupted_spawn",
+  ticket_id = "ticket_runtime_one",
+  pipeline_definition_id = "pipeline_runtime_interruptions",
+  spawn_target_id = "spawn_target_runtime",
+  branch = "project-pipelines/interrupted-spawn",
+})
+assert(interrupted_spawn_run.ok, "interrupted spawn run create failed")
+local spawns_before_interruption = #spawned_session_templates
+fail_set_key_prefix = "v2/runs/"
+local interrupted_spawn = reloaded_tools["project_pipelines.activate_step"]({
+  run_id = interrupted_spawn_run.run.id,
+  request_id = "session_request_interrupted_once",
+})
+assert(interrupted_spawn.ok == false and interrupted_spawn.error.code == "persist_failed", "post-spawn write interruption must be structured")
+assert(
+  #spawned_session_templates == spawns_before_interruption + 1,
+  "interrupted activation must dispatch only once: before="
+    .. tostring(spawns_before_interruption)
+    .. " after="
+    .. tostring(#spawned_session_templates)
+    .. " reason="
+    .. tostring(interrupted_spawn.error and interrupted_spawn.error.reason)
+)
+fail_set_key_prefix = nil
+local recovered_spawn = reloaded_tools["project_pipelines.activate_step"]({
+  run_id = interrupted_spawn_run.run.id,
+  request_id = "session_request_interrupted_once",
+})
+assert(recovered_spawn.ok and recovered_spawn.activation.status == "spawn_requested", "retry must reuse the durable spawn result")
+assert(#spawned_session_templates == spawns_before_interruption + 1, "retry must not dispatch another managed spawn")
+
+local ticket_before_conflict = deep_copy(durable_store["v2/tickets/ticket_runtime_one"].payload)
+conflict_set_key_prefix = "v2/tickets/"
+local revision_conflict = reloaded_tools["project_pipelines.update_ticket_status"]({
+  ticket_id = "ticket_runtime_one",
+  status = "closed",
+})
+assert(revision_conflict.ok == false and revision_conflict.error.code == "persist_failed", "CAS conflict must return a structured persistence failure")
+assert(
+  durable_store["v2/tickets/ticket_runtime_one"].payload.status == ticket_before_conflict.status,
+  "CAS conflict must preserve the concurrently revised record"
+)
+
+local interrupted_advance_run = reloaded_tools["project_pipelines.record_run"]({
+  id = "run_runtime_interrupted_advance",
+  ticket_id = "ticket_runtime_one",
+  pipeline_definition_id = "pipeline_runtime_interruptions",
+  current_step_id = "step_interrupt_middle",
+})
+assert(interrupted_advance_run.ok, "interrupted advance run create failed")
+fail_set_key_prefix = "v2/advance_requests/"
+local interrupted_before_correlation = reloaded_tools["project_pipelines.request_step_advance"]({
+  run_id = interrupted_advance_run.run.id,
+  request_id = "advance_interrupted_before_correlation",
+})
+assert(interrupted_before_correlation.ok == false and interrupted_before_correlation.error.code == "persist_failed", "correlation write interruption must be structured")
+fail_set_key_prefix = nil
+local recovered_before_correlation = reloaded_tools["project_pipelines.request_step_advance"]({
+  run_id = interrupted_advance_run.run.id,
+  request_id = "advance_interrupted_before_correlation",
+})
+assert(recovered_before_correlation.ok and recovered_before_correlation.step_id == "step_interrupt_final", "retry must advance once after correlation write interruption")
+
+local interrupted_run_write = reloaded_tools["project_pipelines.record_run"]({
+  id = "run_runtime_interrupted_run_write",
+  ticket_id = "ticket_runtime_one",
+  pipeline_definition_id = "pipeline_runtime_interruptions",
+  current_step_id = "step_interrupt_middle",
+})
+assert(interrupted_run_write.ok, "interrupted run-write scenario create failed")
+fail_set_key_prefix = "v2/runs/"
+local interrupted_after_correlation = reloaded_tools["project_pipelines.request_step_advance"]({
+  run_id = interrupted_run_write.run.id,
+  request_id = "advance_interrupted_after_correlation",
+})
+assert(interrupted_after_correlation.ok == false and interrupted_after_correlation.error.code == "persist_failed", "run write interruption must be structured")
+fail_set_key_prefix = nil
+local recovered_after_correlation = reloaded_tools["project_pipelines.request_step_advance"]({
+  run_id = interrupted_run_write.run.id,
+  request_id = "advance_interrupted_after_correlation",
+})
+assert(recovered_after_correlation.ok and recovered_after_correlation.step_id == "step_interrupt_final", "retry must reconcile the durable advance")
+local recovered_advance_context = reloaded_tools["project_pipelines.current_context"]({})
+local recovered_durable_run = nil
+for _, candidate in ipairs(recovered_advance_context.runs) do
+  if candidate.id == interrupted_run_write.run.id then recovered_durable_run = candidate end
+end
+assert(recovered_durable_run.current_step_id == "step_interrupt_final", "recovered advance must move the durable run exactly one step")
+
+for _, severity_case in ipairs({
+  { severity = "info", blocks = false },
+  { severity = "low", blocks = false },
+  { severity = "medium", blocks = false },
+  { severity = "high", blocks = true },
+  { severity = "blocker", blocks = true },
+}) do
+  local severity_run_id = "run_runtime_finding_" .. severity_case.severity
+  assert(reloaded_tools["project_pipelines.record_run"]({
+    id = severity_run_id,
+    ticket_id = "ticket_runtime_one",
+    pipeline_definition_id = "botster_stack_delivery",
+    current_step_id = "botster_stack_plan_review",
+  }).ok, "severity run create failed")
+  assert(reloaded_tools["project_pipelines.submit_gate"]({
+    run_id = severity_run_id,
+    step_id = "botster_stack_plan_review",
+    gate_id = "plan_review",
+    status = "passed",
+  }).ok, "severity gate submit failed")
+  assert(reloaded_tools["project_pipelines.submit_review"]({
+    run_id = severity_run_id,
+    step_id = "botster_stack_plan_review",
+    verdict = "approved",
+    findings = {
+      { id = "finding_runtime_" .. severity_case.severity, severity = severity_case.severity, title = "Severity policy probe" },
+    },
+  }).ok, "severity review submit failed")
+  local severity_advance = reloaded_tools["project_pipelines.request_step_advance"]({
+    run_id = severity_run_id,
+    request_id = "advance_finding_" .. severity_case.severity,
+  })
+  assert(
+    (severity_case.blocks and severity_advance.ok == false)
+      or (not severity_case.blocks and severity_advance.ok == true),
+    severity_case.severity .. " finding blocker policy mismatch"
+  )
+end
+
 local question_answer = reloaded_tools["project_pipelines.answer_question"]({
   question_id = "question_runtime_one",
   answer = "No.",
@@ -1728,6 +1912,43 @@ assert(reloaded_tools["project_pipelines.add_checklist_item"]({
   status = "completed",
 }).ok, "checklist item failed")
 
+for index = 1, 280 do
+  assert(reloaded_tools["project_pipelines.submit_gate"]({
+    run_id = "run_runtime_finding_info",
+    step_id = "botster_stack_plan_review",
+    gate_id = "plan_review",
+    status = "passed",
+    summary = "Event retention probe " .. tostring(index),
+  }).ok, "event retention probe failed")
+end
+local bounded_context = reloaded_tools["project_pipelines.current_context"]({})
+assert(#bounded_context.events == 256, "diagnostic event retention must stay bounded")
+assert(durable_store["v2/events/event_1"] == nil, "event retention must delete the oldest durable event keys")
+
+local key_count = 0
+for _ in pairs(durable_store) do key_count = key_count + 1 end
+local quota_probe_keys = {}
+for index = key_count + 1, 960 do
+  local key = "v2/quota_probe/" .. tostring(index)
+  durable_store[key] = {
+    key = key,
+    schema_version = 2,
+    revision = 1,
+    payload = { id = "quota_probe_" .. tostring(index) },
+  }
+  table.insert(quota_probe_keys, key)
+end
+local counters_revision_before_quota = durable_store["v2/meta/counters"].revision
+local quota_failure = reloaded_tools["project_pipelines.create_ticket"]({
+  id = "ticket_runtime_over_quota",
+  project_id = "proj_runtime_standalone",
+  title = "Must not partially persist",
+})
+assert(quota_failure.ok == false and quota_failure.error.code == "store_capacity_exhausted", "store ceiling must fail diagnostically")
+assert(durable_store["v2/tickets/ticket_runtime_over_quota"] == nil, "capacity failure must not partially persist the domain record")
+assert(durable_store["v2/meta/counters"].revision == counters_revision_before_quota, "capacity failure must not partially reserve counters")
+for _, key in ipairs(quota_probe_keys) do durable_store[key] = nil end
+
 for key in pairs(durable_store) do
   assert(key ~= "state", "retired all-domain state key must not be read or written")
   assert(key:sub(1, 3) == "v2/", "all runtime records must use versioned prefix-addressable keys")
@@ -1736,6 +1957,12 @@ end
 local source_record = durable_store["v2/pipeline_definitions/botster_stack_delivery"]
 source_record.payload.source_revision = "stale-source"
 source_record.payload.steps[1].agent_name = "operator-selected-agent"
+local initialized_events_before_reconcile = 0
+for key, record in pairs(durable_store) do
+  if key:sub(1, #"v2/events/") == "v2/events/" and record.payload.kind == "pipeline_source_initialized" then
+    initialized_events_before_reconcile = initialized_events_before_reconcile + 1
+  end
+end
 local reconciled_plugin = dofile("plugin.lua")
 local reconciled_tools = {}
 for _, tool in ipairs(reconciled_plugin.tools) do reconciled_tools[tool.name] = tool.call end
@@ -1750,7 +1977,17 @@ for _, event in ipairs(reconciled_context.events) do
 end
 assert(reconciled_stack.steps[1].agent_name == "operator-selected-agent", "source reconciliation must preserve device-selected agent_name")
 assert(reconciled_stack.steps[1].prompt:find("repository charter"), "source reconciliation must refresh package-owned prompt fields")
-assert(initialized_events == 1, "reload and reconciliation must not duplicate initialization events")
+assert(initialized_events == initialized_events_before_reconcile, "reload and reconciliation must not duplicate initialization events")
+
+durable_store["v2/questions/corrupt_payload"] = {
+  key = "v2/questions/corrupt_payload",
+  schema_version = 2,
+  revision = 1,
+  payload = { id = "corrupt_payload", run_id = "run_runtime_sourced", status = "open" },
+}
+local corrupt_load_ok, corrupt_load_error = pcall(dofile, "plugin.lua")
+assert(not corrupt_load_ok and tostring(corrupt_load_error):find("missing required field question", 1, true), "payload validator must reject malformed durable records")
+durable_store["v2/questions/corrupt_payload"] = nil
 LUA
 lua "$lua_test"
 rm -f "$lua_test"

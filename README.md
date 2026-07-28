@@ -75,7 +75,14 @@ disable/enable, and Hub restart reuse those stable IDs. Checked-in source owns
 metadata, prompts, transitions, gates, routing text, and `source_revision`; an
 existing step's operator-selected `agent_name` remains device policy. Runtime
 records live under `v2/<family>/<id>` plugin-db keys; the retired all-domain
-state blob is neither read nor written.
+state blob is neither read nor written. Record payloads are validated on load
+and before writes, and each write uses the revision observed during load as its
+optimistic-concurrency precondition. Correlation records become durable before
+managed spawn or step-advance effects. A retry either reuses the spawn result or
+reconciles the recorded advance; it never dispatches the same logical request
+twice. Diagnostic events retain the newest 256 records, deleting older event
+keys, and mutations fail with `store_capacity_exhausted` before any write when
+the Hub's 1,024-key namespace reaches the package's 64-key safety reserve.
 
 Every delivery role uses the same exact routing source:
 
@@ -104,6 +111,11 @@ ticket IDs in `run.blocked_transition`, and performs no step transition,
 session-request creation, provider/template resolution, or spawn. Closing or
 removing the blocker permits a later explicit retry, and repeated activation of
 an already spawned run/step reuses the existing request.
+
+Transition findings are run-scoped: unresolved `blocker` and `high` findings
+stop advancement until resolved or waived. `medium`, `low`, and `info` findings
+remain visible carry-forward work and do not contradict an approved review or
+deadlock later steps.
 
 ## UI Contract
 
@@ -273,9 +285,11 @@ submit envelope, values/payload separation, close/replacement behavior, retained
 normalized values/errors, and the selected-workspace equality binding. It also
 admits a deterministic Git target using the real TUI-kit target id, installs a
 test Plan template, activates the production sourced Plan through
-`ensure_worktree_and_spawn`, proves its prompt resolves
-`[[botster-tui-kit-playbook]]` without a routing question, exercises the public
-workflow tools, restarts Hub, and rechecks the same durable workflow identity.
+`ensure_worktree_and_spawn`, and waits for that spawned Plan process to inspect
+its managed prompt, resolve `[[botster-tui-kit-playbook]]`, and submit the Plan
+artifact, gate, and step advance through the public plugin MCP socket without a
+routing question. The harness then restarts Hub and rechecks the same durable
+workflow identity.
 
 `EXPECTED_HUB_COMMIT` in `script/test-hub-flow` records the Hub revision against
 which this plugin contract was proven. Advance that pin deliberately only when

@@ -83,6 +83,10 @@ must explicitly retry activation. The successful retry clears
 `blocked_transition`; repeating activation for the same already
 `spawn_requested` run/step returns the existing request without another spawn.
 
+Unresolved findings are run-scoped transition inputs. `blocker` and `high`
+findings block advancement; `medium`, `low`, and `info` findings are durable
+carry-forward review context and do not block an otherwise approved transition.
+
 Declared provider prerequisites are pre-spawn blockers. A step may declare
 `required_provider_dependencies`, `provider_dependencies`, or
 `required_provider_capabilities`. If a declared dependency such as
@@ -174,7 +178,14 @@ never live under the plugin source tree. The package does not read the retired
 all-domain blob or any catalog/runtime compatibility source. Records are
 independently retryable; counters are reserved before domain writes so an
 interrupted multi-key operation can leave an observable ID gap but cannot reuse
-an ID or overwrite a partially written record.
+an ID or overwrite a partially written record. Payload validators reject
+malformed family records, and writes use per-key expected revisions from the
+load snapshot. Session and advance correlation records are written before their
+effects. A retry refuses to redispatch a spawn whose final outcome is unknown
+and reconciles a durable pending advance against the run before returning its
+stored result. The package preflights new keys against the Hub's 1,024-key
+namespace with 64 keys of reserved headroom, returning a structured
+`store_capacity_exhausted` failure before any write.
 
 Provider-owned facts remain external facts. Project Pipelines may cache stable
 references and lifecycle observations, but provider APIs, OAuth, webhooks, and
@@ -226,8 +237,10 @@ must not make standalone project, ticket, run, or provider records invalid.
 
 ## Event Boundaries
 
-Events are append-only workflow audit records. They should record state changes
-and external observations, not raw transcripts or secret-bearing payloads.
+Events are a bounded workflow audit window. The newest 256 records describe
+state changes and external observations; older event keys are deleted to keep
+the plugin namespace viable. Events never contain raw transcripts or
+secret-bearing payloads.
 
 Expected event kinds include:
 
