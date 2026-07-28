@@ -1,6 +1,6 @@
 local STORE_SCHEMA_VERSION = 2
 local STORE_ROOT = "v2/"
-local SOURCE_REVISION = "botster-stack-delivery/2026-07-28.3"
+local SOURCE_REVISION = "botster-stack-delivery/2026-07-28.4"
 local MAX_STORE_KEYS = 1024
 local STORE_KEY_HEADROOM = 64
 local MAX_EVENTS = 256
@@ -572,7 +572,11 @@ local function botster_stack_delivery_source()
         allows_open_ticket_dependencies = true,
         next_step_id = "botster_stack_implement",
         gates = {
-          { id = "plan_review", required = true, prompt = "Submit an approved plan review with no open blocker findings." },
+          {
+            id = "plan_review",
+            required = true,
+            prompt = "Submit an approved plan review with no open " .. BLOCKING_FINDING_POLICY .. " findings.",
+          },
         },
       }),
       sourced_step("botster_stack_implement", "Implement", 3, "codex", "Implement the approved plan in the routed run worktree and prove the production entry point.", {

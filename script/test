@@ -74,7 +74,7 @@ assert contract["contract_version"] == 2
 assert contract["fixture_role"] == {
     "authority": "schema_example_only",
     "production_source": "plugin.lua",
-    "source_revision": "botster-stack-delivery/2026-07-28.3",
+    "source_revision": "botster-stack-delivery/2026-07-28.4",
 }
 anchors = contract["manifest_anchors"]
 assert anchors["package_name"] == manifest["name"]
@@ -573,15 +573,25 @@ end
 assert(sourced_pipelines == 1, "empty store must initialize exactly one sourced Stack Delivery pipeline")
 assert(stack_delivery.source_authority == "trybotster/botster-project-pipelines:plugin.lua", "standalone plugin source must be authoritative")
 assert(#stack_delivery.steps == 6, "Stack Delivery must initialize each sourced step exactly once")
-local sourced_review_gate = nil
+local finding_policy_gate_prompts = {
+  botster_stack_plan_review = "Submit an approved plan review with no open blocker/high findings.",
+  botster_stack_review = "Submit an approved review with no open blocker/high findings.",
+}
+local checked_finding_policy_gates = 0
 for _, step in ipairs(stack_delivery.steps) do
   assert(step.prompt:find("[[botster-tui-kit-playbook]]", 1, true), "every delivery role must carry the TUI-kit route")
-  if step.id == "botster_stack_review" then sourced_review_gate = step.gates[1] end
+  local expected_prompt = finding_policy_gate_prompts[step.id]
+  if expected_prompt then
+    assert(
+      step.gates[1] and step.gates[1].prompt == expected_prompt,
+      "sourced " .. step.name .. " gate prompt must match the blocker/high transition policy"
+    )
+    checked_finding_policy_gates = checked_finding_policy_gates + 1
+  end
 end
 assert(
-  sourced_review_gate
-    and sourced_review_gate.prompt == "Submit an approved review with no open blocker/high findings.",
-  "sourced Review gate prompt must match the blocker/high transition policy"
+  checked_finding_policy_gates == 2,
+  "every sourced gate that states finding policy must be checked"
 )
 assert(
   not string.find("[[botster-core-playbook]]", "[[botster-tui-kit-playbook]]", 1, true),
