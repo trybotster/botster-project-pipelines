@@ -229,16 +229,16 @@ BOTSTER_SESSION_WORKER_BIN=/private/tmp/botster-hub-ui-contract/target/debug/bot
 script/test-hub-flow
 ```
 
-The harness verifies the Hub checkout SHA, reads the distinct Core SHA from its
-lockfile, rebuilds both executables, confirms they came from that checkout's
-target directory, installs/enables this packaged plugin in an isolated data
-directory, renders the real `project-pipelines.home` entry point, reads action
-IDs from returned nodes, reads workspace identity from a rendered row action,
-opens the rendered dialogs, and dispatches canonical filter, select, accepted
-create, and rejected create requests through the real worker. It asserts structured
-`plugin_action_result` frames, exact identity, a client-authored submit envelope,
-values/payload separation, close/replacement behavior, retained normalized
-values/errors, and the selected-workspace equality binding.
+The harness verifies the Hub checkout SHA and clean worktree, reads the distinct
+Core SHA from its lockfile, rebuilds both executables, confirms they came from
+that checkout's target directory, installs/enables this packaged plugin in an
+isolated data directory, renders the real `project-pipelines.home` entry point,
+reads action IDs from returned nodes, reads workspace identity from a rendered
+row action, opens the rendered dialogs, and dispatches canonical filter, select,
+accepted create, and rejected create requests through the real worker. It asserts
+structured `plugin_action_result` frames, exact identity, a client-authored
+submit envelope, values/payload separation, close/replacement behavior, retained
+normalized values/errors, and the selected-workspace equality binding.
 
 `EXPECTED_HUB_COMMIT` in `script/test-hub-flow` records the Hub revision against
 which this plugin contract was proven. Advance that pin deliberately only when
