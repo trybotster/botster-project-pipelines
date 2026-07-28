@@ -57,12 +57,12 @@ local function failure(code, message, fields)
   }
 end
 
-local function action_result(arguments, surface_id, action_id, node_id, state, extra)
+local function action_result(arguments, state, extra)
   local result = {
-    request_id = arguments and arguments.request_id or (action_id .. "-request"),
-    surface_id = surface_id,
-    action_id = action_id,
-    node_id = node_id,
+    request_id = arguments.request_id,
+    surface_id = arguments.surface_id,
+    action_id = arguments.action_id,
+    node_id = arguments.node_id,
     state = state,
   }
   for key, value in pairs(extra or {}) do
@@ -71,31 +71,69 @@ local function action_result(arguments, surface_id, action_id, node_id, state, e
   return result
 end
 
-local function action_from_tool(arguments, surface_id, action_id, node_id, call)
-  local response = call(arguments or {})
+local function require_action_request(arguments)
+  if type(arguments) ~= "table"
+    or type(arguments.request_id) ~= "string"
+    or type(arguments.surface_id) ~= "string"
+    or type(arguments.action_id) ~= "string"
+    or type(arguments.kind) ~= "string"
+  then
+    error("canonical UiActionRequest envelope is required")
+  end
+end
+
+local function rejected_action_kind(arguments)
+  require_action_request(arguments)
+  if arguments.kind == "submit" then return nil end
+  local extra = {
+    error = "unsupported action kind: " .. arguments.kind,
+    form_errors = { "Only submit actions are supported." },
+  }
+  if type(arguments.values) == "table" then
+    extra.normalized_values = copy(arguments.values)
+  end
+  return action_result(arguments, "rejected", extra)
+end
+
+local function action_from_tool(arguments, call, options)
+  require_action_request(arguments)
+  local kind_rejection = rejected_action_kind(arguments)
+  if kind_rejection then return kind_rejection end
+
+  local values = type(arguments.values) == "table" and arguments.values or {}
+  local response = call(values)
   if response and response.ok == false then
     local error = response.error or {}
     local fields = {}
     for _, field in ipairs(error.fields or {}) do
-      fields[field] = { error.message or "Action rejected" }
+      local field_id = options.field_ids and options.field_ids[field] or field
+      fields[field_id] = { error.message or "Action rejected" }
     end
-    return action_result(arguments, surface_id, action_id, node_id, "rejected", {
+    local state = error.code == "validation_failed" and "rejected" or "error"
+    local extra = {
       error = error.message or "Action rejected",
       form_errors = { error.message or "Action rejected" },
-      field_errors = fields,
       payload = response,
-    })
+      normalized_values = copy(values),
+    }
+    if next(fields) ~= nil then extra.field_errors = fields end
+    return action_result(arguments, state, extra)
   end
-  return action_result(arguments, surface_id, action_id, node_id, "accepted", {
-    normalized_values = arguments or {},
+  return action_result(arguments, "accepted", {
+    normalized_values = copy(values),
+    presentation = options.presentation,
+    replacement = options.replacement(response),
     payload = response,
   })
 end
 
-local function action_ack(arguments, surface_id, action_id, node_id, payload)
-  return action_result(arguments, surface_id, action_id, node_id, "accepted", {
-    normalized_values = arguments or {},
-    payload = payload or arguments or {},
+local function action_ack(arguments, payload, presentation)
+  require_action_request(arguments)
+  local kind_rejection = rejected_action_kind(arguments)
+  if kind_rejection then return kind_rejection end
+  return action_result(arguments, "accepted", {
+    payload = payload,
+    presentation = presentation,
   })
 end
 
@@ -876,27 +914,121 @@ local function current_context()
   })
 end
 
+local function open_dialog_action(arguments, key)
+  require_action_request(arguments)
+  local kind_rejection = rejected_action_kind(arguments)
+  if kind_rejection then return kind_rejection end
+  local payload = type(arguments.payload) == "table" and arguments.payload or {}
+  if payload.intent ~= "open_dialog" then return nil end
+  return action_result(arguments, "accepted", {
+    presentation = {
+      { kind = "set", key = key, value = true },
+    },
+  })
+end
+
 local function create_ticket_action(arguments)
-  return action_from_tool(arguments, "project-pipelines.home", "project_pipelines.create_ticket", "project-pipelines-toolbar-create-ticket", create_ticket)
+  local open_result = open_dialog_action(arguments, "project-pipelines.create-ticket-dialog")
+  if open_result then return open_result end
+  return action_from_tool(arguments, create_ticket, {
+    field_ids = {
+      project_id = "project-pipelines-create-ticket-project-id",
+      title = "project-pipelines-create-ticket-title",
+    },
+    presentation = {
+      { kind = "clear", key = "project-pipelines.create-ticket-dialog" },
+    },
+    replacement = function(response)
+      return {
+        type = "text",
+        id = "project-pipelines-created-ticket",
+        props = { text = "Created ticket " .. tostring(response.ticket.title) },
+      }
+    end,
+  })
 end
 
 local function record_run_action(arguments)
-  return action_from_tool(arguments, "project-pipelines.home", "project_pipelines.record_run", "project-pipelines-toolbar-record-run", record_run)
+  local open_result = open_dialog_action(arguments, "project-pipelines.record-run-dialog")
+  if open_result then return open_result end
+  return action_from_tool(arguments, record_run, {
+    field_ids = {
+      ticket_id = "project-pipelines-record-run-ticket-id",
+      pipeline_definition_id = "project-pipelines-record-run-pipeline-id",
+    },
+    presentation = {
+      { kind = "clear", key = "project-pipelines.record-run-dialog" },
+    },
+    replacement = function(response)
+      return {
+        type = "text",
+        id = "project-pipelines-recorded-run",
+        props = { text = "Recorded run " .. tostring(response.run.id) },
+      }
+    end,
+  })
 end
 
 local function activate_step_action(arguments)
-  return action_from_tool(arguments, "project-pipelines.home", "project_pipelines.activate_step", "project-pipelines-action-feedback", activate_step)
+  local open_result = open_dialog_action(arguments, "project-pipelines.activate-step-dialog")
+  if open_result then return open_result end
+  return action_from_tool(arguments, activate_step, {
+    field_ids = {
+      run_id = "project-pipelines-action-run-id",
+      step_id = "project-pipelines-action-step-id",
+    },
+    presentation = {
+      { kind = "clear", key = "project-pipelines.activate-step-dialog" },
+    },
+    replacement = function(response)
+      local activation = response.activation or {}
+      return {
+        type = "status_badge",
+        id = "project-pipelines-activated-step",
+        props = {
+          label = "Step " .. tostring(activation.status or "activated"),
+          status = activation.status or "active",
+          tone = "success",
+        },
+      }
+    end,
+  })
 end
 
 local function filter_action(arguments)
-  return action_ack(arguments, "project-pipelines.home", "project_pipelines.filter", "project-pipelines-workbench-toolbar", {
-    filter = arguments and arguments.status,
+  require_action_request(arguments)
+  local kind_rejection = rejected_action_kind(arguments)
+  if kind_rejection then return kind_rejection end
+  local payload = type(arguments.payload) == "table" and arguments.payload or {}
+  if type(payload.status) ~= "string" or payload.status == "" then
+    return action_result(arguments, "rejected", {
+      error = "filter status is required",
+      form_errors = { "Filter status is required." },
+    })
+  end
+  return action_ack(arguments, {
+    filter = payload.status,
+  }, {
+    { kind = "set", key = "project-pipelines.filter", value = payload.status },
   })
 end
 
 local function select_row_action(arguments)
-  return action_ack(arguments, "project-pipelines.home", "project_pipelines.select_row", "project-pipelines-workbench", {
-    row_id = arguments and (arguments.row_id or arguments.id or arguments.value),
+  require_action_request(arguments)
+  local kind_rejection = rejected_action_kind(arguments)
+  if kind_rejection then return kind_rejection end
+  local payload = type(arguments.payload) == "table" and arguments.payload or {}
+  local row_id = payload.row_id or payload.id or payload.value
+  if type(row_id) ~= "string" or row_id == "" then
+    return action_result(arguments, "rejected", {
+      error = "selected row id is required",
+      form_errors = { "Selected row id is required." },
+    })
+  end
+  return action_ack(arguments, {
+    row_id = row_id,
+  }, {
+    { kind = "set", key = "selected-workspace", value = row_id },
   })
 end
 
@@ -1075,8 +1207,8 @@ local function toolbar_node(id)
     props = { label = "Workbench actions", density = "compact", variant = "plain" },
     slots = {
       commands = {
-        button_node("project-pipelines-toolbar-create-ticket", "Create ticket", "project_pipelines.create_ticket", {}),
-        button_node("project-pipelines-toolbar-record-run", "Record run", "project_pipelines.record_run", {}),
+        button_node("project-pipelines-toolbar-create-ticket", "Create ticket", "project_pipelines.create_ticket", { intent = "open_dialog" }),
+        button_node("project-pipelines-toolbar-record-run", "Record run", "project_pipelines.record_run", { intent = "open_dialog" }),
       },
       filters = {
         button_node("project-pipelines-toolbar-filter-attention", "Needs attention", "project_pipelines.filter", { status = "attention" }, "warning"),
@@ -1084,7 +1216,7 @@ local function toolbar_node(id)
         button_node("project-pipelines-toolbar-filter-review", "Review", "project_pipelines.filter", { status = "review" }, "success"),
       },
       actions = {
-        button_node("project-pipelines-toolbar-activate-step", "Activate step", "project_pipelines.activate_step", {}),
+        button_node("project-pipelines-toolbar-activate-step", "Activate step", "project_pipelines.activate_step", { intent = "open_dialog" }),
       },
     },
   }
@@ -1207,14 +1339,21 @@ end
 local function project_rows(context)
   local rows = {}
   for _, project in ipairs(context.projects) do
-    table.insert(rows, {
+    local row = {
       id = project.id,
       cells = {
         name = project.name,
         mode = project.mode or "standalone",
         spawn_target = project.spawn_target_id or "",
       },
-    })
+    }
+    if type(project.workspace_id) == "string" and project.workspace_id ~= "" then
+      row.action = {
+        id = "project_pipelines.select_row",
+        payload = { row_id = project.workspace_id },
+      }
+    end
+    table.insert(rows, row)
   end
   return rows
 end
@@ -1280,7 +1419,6 @@ local function table_node(id, columns, rows, empty_title)
   local props = {
     columns = columns,
     selection = { mode = "single" },
-    row_action = { id = "project_pipelines.select_row" },
     empty_state = {
       type = "empty_state",
       id = id .. "-empty",
@@ -1301,6 +1439,7 @@ local function action_feedback_form()
     id = "project-pipelines-action-feedback",
     props = {
       action = { id = "project_pipelines.activate_step" },
+      submit_label = "Activate step",
     },
     children = {
       {
@@ -1340,6 +1479,102 @@ local function action_feedback_form()
       },
     },
   }
+end
+
+local function text_input_node(id, name, label, required)
+  return {
+    type = "text_input",
+    id = id,
+    props = {
+      name = name,
+      label = label,
+      required = required == true,
+    },
+  }
+end
+
+local function dialog_form(id, action_id, submit_label, children)
+  return {
+    type = "form",
+    id = id,
+    props = {
+      action = { id = action_id },
+      submit_label = submit_label,
+    },
+    children = children,
+  }
+end
+
+local function presentation_dialog(key, id, title, form)
+  return {
+    ["$kind"] = "presentation_if",
+    predicate = { kind = "present", key = key },
+    node = {
+      type = "dialog",
+      id = id,
+      props = {
+        title = title,
+        presentation = "auto",
+      },
+      slots = { body = { form } },
+    },
+  }
+end
+
+local function workbench_dialogs(context)
+  local children = {
+    presentation_dialog(
+      "project-pipelines.create-ticket-dialog",
+      "project-pipelines-create-ticket-dialog",
+      "Create ticket",
+      dialog_form(
+        "project-pipelines-create-ticket-form",
+        "project_pipelines.create_ticket",
+        "Create ticket",
+        {
+          text_input_node("project-pipelines-create-ticket-project-id", "project_id", "Project id", true),
+          text_input_node("project-pipelines-create-ticket-title", "title", "Title", true),
+        }
+      )
+    ),
+    presentation_dialog(
+      "project-pipelines.record-run-dialog",
+      "project-pipelines-record-run-dialog",
+      "Record run",
+      dialog_form(
+        "project-pipelines-record-run-form",
+        "project_pipelines.record_run",
+        "Record run",
+        {
+          text_input_node("project-pipelines-record-run-ticket-id", "ticket_id", "Ticket id", true),
+          text_input_node("project-pipelines-record-run-pipeline-id", "pipeline_definition_id", "Pipeline definition id", true),
+        }
+      )
+    ),
+    presentation_dialog(
+      "project-pipelines.activate-step-dialog",
+      "project-pipelines-activate-step-dialog",
+      "Activate step",
+      action_feedback_form()
+    ),
+  }
+  for _, project in ipairs(context.projects) do
+    if type(project.workspace_id) == "string" and project.workspace_id ~= "" then
+      table.insert(children, {
+        ["$kind"] = "presentation_if",
+        predicate = {
+          kind = "equals",
+          key = "selected-workspace",
+          value = project.workspace_id,
+        },
+        node = text_node(
+          "project-pipelines-selected-workspace-" .. project.id,
+          "Workspace " .. project.name .. " selected"
+        ),
+      })
+    end
+  end
+  return children
 end
 
 local function drilldown_tables(context)
@@ -1478,7 +1713,7 @@ end
 local function render_home()
   local context = current_context()
   local summary = status_summary(context)
-  return panel_node("project-pipelines-home", "Project Pipelines", {
+  local children = {
       panel_node("project-pipelines-command-center", "Command Center", {
         toolbar_node("project-pipelines-workbench-toolbar"),
         metric_grid_node("project-pipelines-command-center-metrics", {
@@ -1517,9 +1752,12 @@ local function render_home()
           list_item("project-pipelines-record-run-action", "Record run", "project_pipelines.record_run", "tool"),
           list_item("project-pipelines-activate-step-action", "Activate step", "project_pipelines.activate_step", "tool"),
         }),
-        action_feedback_form(),
       }),
-    })
+    }
+  for _, dialog in ipairs(workbench_dialogs(context)) do
+    table.insert(children, dialog)
+  end
+  return panel_node("project-pipelines-home", "Project Pipelines", children)
 end
 
 local function render_settings()

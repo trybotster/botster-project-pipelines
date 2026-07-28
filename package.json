@@ -1,0 +1,11 @@
+{
+  "name": "botster-project-pipelines-contract-check",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node script/test-ui-contract.mjs"
+  },
+  "dependencies": {
+    "@trybotster/ui-contract": "0.1.0"
+  }
+}

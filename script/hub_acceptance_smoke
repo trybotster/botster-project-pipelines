@@ -1,0 +1,235 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "socket"
+
+socket_path = ARGV.fetch(0) do
+  warn "usage: script/hub_acceptance_smoke <botster-hub.sock>"
+  exit 1
+end
+
+def assert(condition, message)
+  raise message unless condition
+end
+
+socket = UNIXSocket.new(socket_path)
+socket.puts(JSON.generate({
+  protocol: "botster-hub-daemon-v1",
+  compatibility: {
+    protocol: "botster-hub-daemon-v1",
+    minimum_protocol_version: 1,
+    required_features: %w[plugin_surface_render plugin_surface_action],
+    minimum_conformance_fixture_revision: 1,
+    client_name: "botster-project-pipelines-acceptance-smoke"
+  }
+}))
+hello = JSON.parse(socket.gets || raise("daemon closed before hello"))
+assert(hello["protocol"] == "botster-hub-daemon-v1", "daemon hello failed")
+
+def request(socket, payload)
+  socket.puts(JSON.generate(payload))
+  response = JSON.parse(socket.gets || raise("daemon closed during #{payload.fetch(:type)}"))
+  raise "daemon #{payload.fetch(:type)} failed: #{response["error"]}" if response["error"]
+
+  response
+end
+
+def call_tool(socket, name, arguments)
+  response = request(socket, {
+    type: "plugin_mcp_call_tool",
+    name: name,
+    arguments: arguments
+  })
+  assert(response["kind"] == "plugin_mcp_tool_result", "#{name} returned #{response["kind"]}")
+  response.fetch("plugin_tool_result")
+end
+
+def render_surface(socket)
+  response = request(socket, {
+    type: "plugin_surface_render",
+    package_name: "project-pipelines",
+    surface_id: "project-pipelines.home",
+    payload: {}
+  })
+  assert(response["kind"] == "plugin_surface", "render did not return plugin_surface")
+  surface = response.fetch("plugin_surface")
+  assert(surface.fetch("package_name") == "project-pipelines", "render package identity mismatch")
+  assert(surface.fetch("surface_id") == "project-pipelines.home", "render surface identity mismatch")
+  surface.fetch("body")
+end
+
+def each_node(node, &block)
+  yield node
+  each_node(node["node"], &block) if node["node"].is_a?(Hash)
+  each_node(node["item_template"], &block) if node["item_template"].is_a?(Hash)
+  each_node(node["empty_template"], &block) if node["empty_template"].is_a?(Hash)
+  Array(node["children"]).each { |child| each_node(child, &block) }
+  (node["slots"] || {}).each_value do |children|
+    Array(children).each { |child| each_node(child, &block) }
+  end
+end
+
+def find_node(root, id)
+  found = nil
+  each_node(root) { |node| found ||= node if node["id"] == id }
+  found
+end
+
+def dispatch_action(socket, action_id:, request_id:, node_id: nil, kind: "submit", values: nil, payload: nil)
+  # This harness is the client, so kind is authored here rather than observed
+  # from a Hub-generated or renderer-generated dispatch.
+  action_request = {
+    request_id: request_id,
+    surface_id: "project-pipelines.home",
+    action_id: action_id,
+    kind: kind
+  }
+  action_request[:node_id] = node_id if node_id
+  action_request[:values] = values if values
+  action_request[:payload] = payload if payload
+  response = request(socket, {
+    type: "plugin_surface_action",
+    package_name: "project-pipelines",
+    request: action_request
+  })
+  assert(response["kind"] == "plugin_action_result", "#{action_id} did not return plugin_action_result")
+  result = response.fetch("plugin_action_result")
+  assert(result["request_id"] == request_id, "#{action_id} request identity mismatch")
+  assert(result["surface_id"] == "project-pipelines.home", "#{action_id} surface identity mismatch")
+  assert(result["action_id"] == action_id, "#{action_id} action identity mismatch")
+  if node_id
+    assert(result["node_id"] == node_id, "#{action_id} node identity mismatch")
+  else
+    assert(!result.key?("node_id"), "#{action_id} must preserve absent node identity")
+  end
+  result
+end
+
+project_id = "project_live_#{Process.pid}"
+workspace_id = "workspace_live_#{Process.pid}"
+created_project = call_tool(socket, "project_pipelines.create_project", {
+  id: project_id,
+  name: "Live contract project",
+  repository: {
+    id: "repo_live_contract",
+    name: "example/live-contract",
+    remote: "https://example.invalid/live-contract.git"
+  },
+  spawn_target_id: "spawn_target_live_contract",
+  workspace_id: workspace_id
+})
+assert(created_project["ok"] == true, "live project setup failed")
+
+surface = render_surface(socket)
+create_form = find_node(surface, "project-pipelines-create-ticket-form")
+create_button = find_node(surface, "project-pipelines-toolbar-create-ticket")
+record_button = find_node(surface, "project-pipelines-toolbar-record-run")
+activate_button = find_node(surface, "project-pipelines-toolbar-activate-step")
+filter_button = find_node(surface, "project-pipelines-toolbar-filter-running")
+project_table = find_node(surface, "project-pipelines-project-table")
+assert(create_form, "rendered surface missing create ticket form")
+assert(create_button && record_button && activate_button, "rendered surface missing dialog toolbar buttons")
+assert(filter_button, "rendered surface missing filter button")
+assert(project_table, "rendered surface missing project table")
+
+create_action_id = create_form.dig("props", "action", "id")
+filter_action_id = filter_button.dig("props", "action", "id")
+assert(create_action_id == "project_pipelines.create_ticket", "rendered create action mismatch")
+assert(filter_action_id == "project_pipelines.filter", "rendered filter action mismatch")
+
+{
+  create_button => "project-pipelines.create-ticket-dialog",
+  record_button => "project-pipelines.record-run-dialog",
+  activate_button => "project-pipelines.activate-step-dialog"
+}.each_with_index do |(button, presentation_key), index|
+  action = button.dig("props", "action")
+  opened = dispatch_action(
+    socket,
+    action_id: action.fetch("id"),
+    request_id: "live-open-dialog-#{index}",
+    node_id: button.fetch("id"),
+    payload: action.fetch("payload")
+  )
+  assert(opened["state"] == "accepted", "#{presentation_key} open action was not accepted")
+  assert(opened.dig("presentation", 0, "kind") == "set", "#{presentation_key} was not opened")
+  assert(opened.dig("presentation", 0, "key") == presentation_key, "#{presentation_key} open key mismatch")
+end
+
+filter = dispatch_action(
+  socket,
+  action_id: filter_action_id,
+  request_id: "live-filter",
+  node_id: filter_button.fetch("id"),
+  payload: { status: "active" }
+)
+assert(filter["state"] == "accepted", "filter action was not accepted")
+assert(filter.dig("payload", "filter") == "active", "filter payload did not arrive")
+assert(filter.dig("presentation", 0, "kind") == "set", "filter did not set presentation")
+assert(filter.dig("presentation", 0, "key") == "project-pipelines.filter", "filter presentation key mismatch")
+
+workspace_row = project_table.fetch("props").fetch("rows").find { |row| row["id"] == project_id }
+assert(workspace_row, "rendered project table missing live workspace row")
+row_action = workspace_row.fetch("action")
+assert(row_action.fetch("id") == "project_pipelines.select_row", "workspace row select action mismatch")
+assert(row_action.dig("payload", "row_id") == workspace_id, "workspace row did not author its identity payload")
+select = dispatch_action(
+  socket,
+  action_id: row_action.fetch("id"),
+  request_id: "live-select",
+  payload: row_action.fetch("payload")
+)
+assert(select["state"] == "accepted", "select action was not accepted")
+assert(select.dig("payload", "row_id") == workspace_id, "select payload did not arrive")
+assert(select.dig("presentation", 0, "key") == "selected-workspace", "select presentation key mismatch")
+assert(select.dig("presentation", 0, "value") == workspace_id, "select presentation value mismatch")
+
+ticket_id = "ticket_live_#{Process.pid}"
+submitted_values = {
+  id: ticket_id,
+  project_id: project_id,
+  title: "Live contract ticket"
+}
+created = dispatch_action(
+  socket,
+  action_id: create_action_id,
+  request_id: "live-create",
+  node_id: create_form.fetch("id"),
+  values: submitted_values
+)
+assert(created["state"] == "accepted", "create action was not accepted")
+assert(created.dig("payload", "ticket", "id") == ticket_id, "create values did not reach the domain mutation")
+assert(created.dig("presentation", 0, "kind") == "clear", "create did not close its dialog")
+assert(created.dig("presentation", 0, "key") == "project-pipelines.create-ticket-dialog", "create dialog key mismatch")
+assert(created.dig("replacement", "id") == "project-pipelines-created-ticket", "create replacement mismatch")
+
+rejected_values = {
+  id: "ticket_live_rejected_#{Process.pid}",
+  project_id: project_id,
+  title: "   "
+}
+rejected = dispatch_action(
+  socket,
+  action_id: create_action_id,
+  request_id: "live-create-rejected",
+  node_id: create_form.fetch("id"),
+  values: rejected_values
+)
+assert(rejected["state"] == "rejected", "invalid create was not rejected")
+assert(rejected["normalized_values"] == rejected_values.transform_keys(&:to_s), "rejected create did not retain submitted values")
+assert(rejected.dig("field_errors", "project-pipelines-create-ticket-title", 0) == "title is required", "rejected create field error mismatch")
+assert(!rejected.key?("presentation"), "rejected create must preserve presentation")
+assert(!rejected.key?("replacement"), "rejected create must not replace the tree")
+
+presentation_bindings = []
+each_node(surface) do |node|
+  presentation_bindings << node if node["$kind"] == "presentation_if"
+end
+selected = presentation_bindings.find do |binding|
+  binding.dig("predicate", "kind") == "equals" &&
+    binding.dig("predicate", "key") == "selected-workspace"
+end
+assert(selected && selected.dig("predicate", "value") == workspace_id, "selected-workspace equality predicate missing")
+assert(selected.dig("node", "props", "text") == "Workspace Live contract project selected", "selected workspace copy must derive from product data")
+
+puts "script/hub_acceptance_smoke: ok project_id=#{project_id} ticket_id=#{ticket_id} client_authored_kind=submit"

@@ -1,6 +1,8 @@
 #!/usr/bin/env sh
 set -eu
 
+npm test
+
 python3 - <<'PY'
 import json
 from pathlib import Path
@@ -18,6 +20,11 @@ assert manifest["entrypoints"] == [
 plugin_source = Path("plugin.lua").read_text()
 assert "require(" not in plugin_source
 assert "botster.register" in plugin_source
+assert "tree_update" not in plugin_source
+assert "props.open" not in plugin_source
+assert "arguments and arguments.status" not in plugin_source
+assert "arguments and (arguments.row_id" not in plugin_source
+assert 'or (action_id .. "-request")' not in plugin_source
 assert [group["id"] for group in manifest["configuration"]["groups"]] == ["defaults", "integrations"]
 assert [field["key"] for field in manifest["configuration"]["fields"]] == [
     "default_spawn_target_id",
@@ -490,7 +497,7 @@ assert(handlers["project_pipelines.select_row"] ~= nil, "select row ui_action mu
 local empty_home = handlers["project-pipelines.home"]({})
 local empty_home_sections = {}
 for _, child in ipairs(empty_home.children) do
-  empty_home_sections[child.id] = child
+  if child.id then empty_home_sections[child.id] = child end
 end
 assert(empty_home_sections["project-pipelines-workbench"].children[1].type == "table", "empty workbench must still render project table")
 assert(empty_home_sections["project-pipelines-workbench"].children[1].props.rows == nil, "empty table rows must be omitted so Lua does not serialize an empty map")
@@ -600,38 +607,207 @@ local linked_ticket = tools["project_pipelines.create_ticket"]({
 })
 assert(linked_ticket.ok, "workspace ticket create failed")
 
-local invalid_ticket_action = handlers["project_pipelines.create_ticket"]({
-  request_id = "invalid-ticket-action",
+local function action_request(request_id, action_id, node_id, kind, values, payload)
+  return {
+    request_id = request_id,
+    surface_id = "project-pipelines.home",
+    action_id = action_id,
+    node_id = node_id,
+    kind = kind or "submit",
+    values = values,
+    payload = payload,
+  }
+end
+
+local before_dialog_open = tools["project_pipelines.current_context"]({})
+for _, dialog in ipairs({
+  {
+    action_id = "project_pipelines.create_ticket",
+    node_id = "project-pipelines-toolbar-create-ticket",
+    key = "project-pipelines.create-ticket-dialog",
+  },
+  {
+    action_id = "project_pipelines.record_run",
+    node_id = "project-pipelines-toolbar-record-run",
+    key = "project-pipelines.record-run-dialog",
+  },
+  {
+    action_id = "project_pipelines.activate_step",
+    node_id = "project-pipelines-toolbar-activate-step",
+    key = "project-pipelines.activate-step-dialog",
+  },
+}) do
+  local opened = handlers[dialog.action_id](action_request(
+    dialog.action_id .. "-open",
+    dialog.action_id,
+    dialog.node_id,
+    "submit",
+    nil,
+    { intent = "open_dialog" }
+  ))
+  assert(opened.state == "accepted", dialog.action_id .. " toolbar action must open its dialog")
+  assert(opened.presentation[1].kind == "set", dialog.action_id .. " toolbar action must set presentation")
+  assert(opened.presentation[1].key == dialog.key, dialog.action_id .. " toolbar action must set its scoped dialog key")
+  assert(opened.presentation[1].value == true, dialog.action_id .. " toolbar action must make its dialog key present")
+  assert(opened.replacement == nil, dialog.action_id .. " toolbar open must not emit a replacement")
+end
+local after_dialog_open = tools["project_pipelines.current_context"]({})
+assert(#after_dialog_open.tickets == #before_dialog_open.tickets, "opening dialogs must not mutate tickets")
+assert(#after_dialog_open.runs == #before_dialog_open.runs, "opening dialogs must not mutate runs")
+assert(#after_dialog_open.events == #before_dialog_open.events, "opening dialogs must not create workflow events")
+
+local invalid_values = {
   project_id = "proj_runtime_standalone",
   title = "   ",
-})
+}
+local invalid_ticket_action = handlers["project_pipelines.create_ticket"](action_request(
+  "invalid-ticket-action",
+  "project_pipelines.create_ticket",
+  "project-pipelines-create-ticket-form",
+  "submit",
+  invalid_values
+))
 assert(invalid_ticket_action.state == "rejected", "invalid create_ticket ui_action must reject")
+assert(invalid_ticket_action.request_id == "invalid-ticket-action", "invalid create_ticket request id must be preserved")
+assert(invalid_ticket_action.surface_id == "project-pipelines.home", "invalid create_ticket surface id must be preserved")
 assert(invalid_ticket_action.action_id == "project_pipelines.create_ticket", "invalid create_ticket action id must be preserved")
-assert(invalid_ticket_action.field_errors.title[1] == "title is required", "invalid create_ticket ui_action must expose field error")
+assert(invalid_ticket_action.node_id == "project-pipelines-create-ticket-form", "invalid create_ticket node id must be preserved")
+assert(invalid_ticket_action.field_errors["project-pipelines-create-ticket-title"][1] == "title is required", "invalid create_ticket ui_action must expose stable field error")
+assert(invalid_ticket_action.normalized_values.title == "   ", "invalid create_ticket ui_action must retain submitted title")
+assert(invalid_ticket_action.normalized_values.project_id == "proj_runtime_standalone", "invalid create_ticket ui_action must retain submitted project")
+assert(invalid_ticket_action.presentation == nil, "rejected create_ticket must not emit presentation effects")
+assert(invalid_ticket_action.replacement == nil, "rejected create_ticket must not emit replacement effects")
 
-local valid_ticket_action = handlers["project_pipelines.create_ticket"]({
-  request_id = "valid-ticket-action",
-  id = "ticket_runtime_action",
-  project_id = "proj_runtime_standalone",
-  title = "Runtime action ticket",
-})
+local valid_ticket_action = handlers["project_pipelines.create_ticket"](action_request(
+  "valid-ticket-action",
+  "project_pipelines.create_ticket",
+  "project-pipelines-create-ticket-form",
+  "submit",
+  {
+    id = "ticket_runtime_action",
+    project_id = "proj_runtime_standalone",
+    title = "Runtime action ticket",
+  },
+  { title = "payload title must not be used" }
+))
 assert(valid_ticket_action.state == "accepted", "valid create_ticket ui_action must accept")
 assert(valid_ticket_action.payload.ok == true, "valid create_ticket ui_action must include tool payload")
 assert(valid_ticket_action.payload.ticket.id == "ticket_runtime_action", "valid create_ticket ui_action must persist ticket")
+assert(valid_ticket_action.payload.ticket.title == "Runtime action ticket", "create_ticket ui_action must read form values")
+assert(valid_ticket_action.presentation[1].kind == "clear", "create_ticket ui_action must close its dialog")
+assert(valid_ticket_action.presentation[1].key == "project-pipelines.create-ticket-dialog", "create_ticket ui_action must clear the scoped dialog key")
+assert(valid_ticket_action.replacement.id == "project-pipelines-created-ticket", "create_ticket ui_action must return the smallest ticket replacement")
 
-local filter_action = handlers["project_pipelines.filter"]({
-  request_id = "filter-action",
-  status = "active",
-})
+local record_run_action = handlers["project_pipelines.record_run"](action_request(
+  "record-run-action",
+  "project_pipelines.record_run",
+  "project-pipelines-record-run-form",
+  "submit",
+  {
+    id = "run_runtime_action",
+    ticket_id = "ticket_runtime_one",
+    pipeline_definition_id = "pipeline_runtime",
+  }
+))
+assert(record_run_action.state == "accepted", "record_run ui_action must accept canonical values")
+assert(record_run_action.payload.run.id == "run_runtime_action", "record_run ui_action must persist the requested run")
+assert(record_run_action.presentation[1].key == "project-pipelines.record-run-dialog", "record_run ui_action must close its dialog")
+assert(record_run_action.replacement.id == "project-pipelines-recorded-run", "record_run ui_action must return a direct replacement")
+
+local activate_step_action = handlers["project_pipelines.activate_step"](action_request(
+  "activate-step-action",
+  "project_pipelines.activate_step",
+  "project-pipelines-action-feedback",
+  "submit",
+  {
+    run_id = "run_runtime_action",
+    step_id = "step_manual",
+  }
+))
+assert(activate_step_action.state == "accepted", "activate_step ui_action must accept canonical values")
+assert(activate_step_action.payload.activation.status == "preserved_non_pty", "activate_step ui_action must pass form values to the tool")
+assert(activate_step_action.presentation[1].key == "project-pipelines.activate-step-dialog", "activate_step ui_action must close its dialog")
+assert(activate_step_action.replacement.id == "project-pipelines-activated-step", "activate_step ui_action must return a direct replacement")
+
+local before_non_submit = tools["project_pipelines.current_context"]({})
+for _, kind in ipairs({ "reset", "validate", "cancel" }) do
+  local mutation_requests = {
+    {
+      handler = "project_pipelines.create_ticket",
+      node_id = "project-pipelines-create-ticket-form",
+      values = { id = "ticket_must_not_exist_" .. kind, project_id = "proj_runtime_standalone", title = "Must not exist" },
+    },
+    {
+      handler = "project_pipelines.record_run",
+      node_id = "project-pipelines-record-run-form",
+      values = { id = "run_must_not_exist_" .. kind, ticket_id = "ticket_runtime_one", pipeline_definition_id = "pipeline_runtime" },
+    },
+    {
+      handler = "project_pipelines.activate_step",
+      node_id = "project-pipelines-action-feedback",
+      values = { run_id = "run_runtime_action", step_id = "step_implement" },
+    },
+  }
+  for _, mutation in ipairs(mutation_requests) do
+    local result = handlers[mutation.handler](action_request(
+      mutation.handler .. "-" .. kind,
+      mutation.handler,
+      mutation.node_id,
+      kind,
+      mutation.values
+    ))
+    assert(result.state == "rejected", mutation.handler .. " must reject " .. kind)
+    assert(result.presentation == nil and result.replacement == nil, mutation.handler .. " non-submit rejection must not emit effects")
+    assert(type(result.normalized_values) == "table", mutation.handler .. " must retain non-submit form values")
+    for key, value in pairs(mutation.values) do
+      assert(result.normalized_values[key] == value, mutation.handler .. " must retain submitted " .. key)
+    end
+    for key, value in pairs(result.normalized_values) do
+      assert(mutation.values[key] == value, mutation.handler .. " must not invent normalized " .. key)
+    end
+  end
+end
+local after_non_submit = tools["project_pipelines.current_context"]({})
+assert(#after_non_submit.tickets == #before_non_submit.tickets, "non-submit create requests must not mutate tickets")
+assert(#after_non_submit.runs == #before_non_submit.runs, "non-submit record/activate requests must not mutate runs")
+assert(#after_non_submit.session_requests == #before_non_submit.session_requests, "non-submit activate requests must not create session requests")
+assert(#after_non_submit.events == #before_non_submit.events, "non-submit mutation requests must not create events")
+
+local filter_action = handlers["project_pipelines.filter"](action_request(
+  "filter-action",
+  "project_pipelines.filter",
+  "project-pipelines-toolbar-filter-running",
+  "submit",
+  { status = "values must not be used" },
+  { status = "active" }
+))
 assert(filter_action.state == "accepted", "filter ui_action must accept")
 assert(filter_action.payload.filter == "active", "filter ui_action must echo filter payload")
+assert(filter_action.presentation[1].kind == "set", "filter ui_action must set scoped presentation state")
+assert(filter_action.presentation[1].key == "project-pipelines.filter", "filter ui_action must use the scoped filter key")
+assert(filter_action.presentation[1].value == "active", "filter ui_action must use non-form payload")
+assert(filter_action.normalized_values == nil, "filter ui_action must not treat payload as form values")
 
-local select_row_action = handlers["project_pipelines.select_row"]({
-  request_id = "select-row-action",
-  row_id = "run_runtime_one",
-})
+local select_row_action = handlers["project_pipelines.select_row"](action_request(
+  "select-row-action",
+  "project_pipelines.select_row",
+  nil,
+  "submit",
+  { row_id = "values must not be used" },
+  { row_id = "workspace_runtime_alpha" }
+))
 assert(select_row_action.state == "accepted", "select row ui_action must accept")
-assert(select_row_action.payload.row_id == "run_runtime_one", "select row ui_action must echo selected row")
+assert(select_row_action.payload.row_id == "workspace_runtime_alpha", "select row ui_action must echo selected row payload")
+assert(select_row_action.node_id == nil, "select row ui_action must preserve absent node identity")
+assert(select_row_action.presentation[1].key == "selected-workspace", "select row ui_action must set selected-workspace presentation")
+assert(select_row_action.presentation[1].value == "workspace_runtime_alpha", "select row ui_action must set selected workspace from payload")
+
+local legacy_ok = pcall(handlers["project_pipelines.create_ticket"], {
+  request_id = "legacy-flat-action",
+  project_id = "proj_runtime_standalone",
+  title = "Legacy flat action",
+})
+assert(legacy_ok == false, "legacy flat-only ui_action calls must be rejected")
 
 local linked_pipeline = tools["project_pipelines.define_pipeline"]({
   id = "pipeline_runtime_workspace",
@@ -1134,7 +1310,7 @@ local allowed_ui_node_types = {
 local function validate_ui_child_contract(child, path)
   assert(type(child) == "table", path .. " must be a table")
   if child["$kind"] ~= nil then
-    assert(child["$kind"] == "bind_list" or child["$kind"] == "bind_if" or child["$kind"] == "when" or child["$kind"] == "hidden", path .. " has unsupported $kind")
+    assert(child["$kind"] == "bind_list" or child["$kind"] == "bind_if" or child["$kind"] == "presentation_if" or child["$kind"] == "when" or child["$kind"] == "hidden", path .. " has unsupported $kind")
     if child["$kind"] == "bind_list" then
       assert(type(child.source) == "string" and child.source:sub(1, 1) == "/", path .. " bind_list source must be absolute")
       validate_ui_child_contract(child.item_template, path .. ".item_template")
@@ -1164,14 +1340,83 @@ local function validate_ui_child_contract(child, path)
   end
 end
 
+local function collect_contract_nodes(child, forms, dialogs, predicates)
+  if child["$kind"] ~= nil then
+    if child["$kind"] == "presentation_if" then
+      table.insert(predicates, child.predicate)
+    end
+    if child.node then collect_contract_nodes(child.node, forms, dialogs, predicates) end
+    if child.item_template then collect_contract_nodes(child.item_template, forms, dialogs, predicates) end
+    if child.empty_template then collect_contract_nodes(child.empty_template, forms, dialogs, predicates) end
+    return
+  end
+  if child.type == "form" then table.insert(forms, child) end
+  if child.type == "dialog" then table.insert(dialogs, child) end
+  for _, nested in ipairs(child.children or {}) do
+    collect_contract_nodes(nested, forms, dialogs, predicates)
+  end
+  for _, slot_children in pairs(child.slots or {}) do
+    for _, nested in ipairs(slot_children) do
+      collect_contract_nodes(nested, forms, dialogs, predicates)
+    end
+  end
+end
+
+local function assert_unique_node_ids(child, seen)
+  if child["$kind"] ~= nil then
+    if child.node then assert_unique_node_ids(child.node, seen) end
+    if child.item_template then assert_unique_node_ids(child.item_template, seen) end
+    if child.empty_template then assert_unique_node_ids(child.empty_template, seen) end
+    return
+  end
+  if child.id then
+    assert(seen[child.id] == nil, "rendered node id must be unique: " .. child.id)
+    seen[child.id] = true
+  end
+  for _, nested in ipairs(child.children or {}) do
+    assert_unique_node_ids(nested, seen)
+  end
+  for _, slot_children in pairs(child.slots or {}) do
+    for _, nested in ipairs(slot_children) do
+      assert_unique_node_ids(nested, seen)
+    end
+  end
+end
+
 local home = handlers["project-pipelines.home"]({})
 validate_ui_child_contract(home, "home")
+assert_unique_node_ids(home, {})
+local contract_forms = {}
+local contract_dialogs = {}
+local presentation_predicates = {}
+collect_contract_nodes(home, contract_forms, contract_dialogs, presentation_predicates)
+assert(#contract_forms == 3, "home must render each dialog form exactly once")
+for _, form in ipairs(contract_forms) do
+  assert(type(form.props.submit_label) == "string" and form.props.submit_label:match("%S"), "every Form must declare a nonblank submit_label")
+end
+assert(#contract_dialogs == 3, "home must render create, record, and activate dialogs")
+for _, dialog in ipairs(contract_dialogs) do
+  assert(dialog.props.presentation == "auto", "every Dialog must use presentation=auto")
+  assert(dialog.props.open == nil, "Dialog props.open is forbidden")
+end
+local presence_keys = {}
+local selected_workspace_equality = nil
+for _, predicate in ipairs(presentation_predicates) do
+  if predicate.kind == "present" then presence_keys[predicate.key] = true end
+  if predicate.kind == "equals" and predicate.key == "selected-workspace" then
+    selected_workspace_equality = predicate
+  end
+end
+assert(presence_keys["project-pipelines.create-ticket-dialog"], "create dialog must use a presence predicate")
+assert(presence_keys["project-pipelines.record-run-dialog"], "record dialog must use a presence predicate")
+assert(presence_keys["project-pipelines.activate-step-dialog"], "activate dialog must use a presence predicate")
+assert(selected_workspace_equality and selected_workspace_equality.value == "workspace_runtime_alpha", "selected workspace must use an equality predicate")
 assert(home.type == "panel", "home surface must use hub UiNode panel primitive")
 assert(home.id == "project-pipelines-home", "home surface id missing")
 assert(home.props.title == "Project Pipelines", "home surface title missing")
 local home_sections = {}
 for _, child in ipairs(home.children) do
-  home_sections[child.id] = child
+  if child.id then home_sections[child.id] = child end
 end
 assert(home_sections["project-pipelines-command-center"] ~= nil, "home surface must render command center")
 assert(home_sections["project-pipelines-command-center"].type == "panel", "command center must use panel primitive")
@@ -1181,6 +1426,9 @@ assert(home.children[3].id == "project-pipelines-running", "home first viewport 
 assert(home.children[4].id == "project-pipelines-ready-for-review", "home first viewport must put review before drilldown")
 assert(home_sections["project-pipelines-command-center"].children[1].type == "toolbar", "command center must use toolbar primitive")
 assert(home_sections["project-pipelines-command-center"].children[1].slots.commands[1].props.action.id == "project_pipelines.create_ticket", "toolbar must expose command actions")
+assert(home_sections["project-pipelines-command-center"].children[1].slots.commands[1].props.action.payload.intent == "open_dialog", "create toolbar action must author dialog-open intent")
+assert(home_sections["project-pipelines-command-center"].children[1].slots.commands[2].props.action.payload.intent == "open_dialog", "record toolbar action must author dialog-open intent")
+assert(home_sections["project-pipelines-command-center"].children[1].slots.actions[1].props.action.payload.intent == "open_dialog", "activate toolbar action must author dialog-open intent")
 assert(home_sections["project-pipelines-command-center"].children[2].type == "metric_grid", "command center metrics must use metric_grid primitive")
 assert(home_sections["project-pipelines-command-center"].children[2].children[1].type == "metric", "command center metrics must use metric primitive")
 assert(home_sections["project-pipelines-command-center"].children[2].children[1].props.label == "Needs attention", "attention metric must be first")
@@ -1192,7 +1440,7 @@ assert(home_sections["project-pipelines-needs-attention"].children[1].children[1
 assert(home_sections["project-pipelines-needs-attention"].children[1].children[1].slots.subtitle[1].children[2].type == "status_badge", "attention rows must use status_badge state")
 assert(home_sections["project-pipelines-running"] ~= nil, "home surface must render running section")
 assert(home_sections["project-pipelines-running"].type == "section", "running section must use section primitive")
-assert(#home_sections["project-pipelines-running"].children[1].children == 9, "running section must count active runs")
+assert(#home_sections["project-pipelines-running"].children[1].children == 10, "running section must count active runs")
 assert(home_sections["project-pipelines-ready-for-review"] ~= nil, "home surface must render review section")
 assert(home_sections["project-pipelines-ready-for-review"].type == "section", "review section must use section primitive")
 assert(home_sections["project-pipelines-workbench"] ~= nil, "home surface must render workbench section")
@@ -1202,7 +1450,13 @@ assert(home_sections["project-pipelines-workbench"].children[1].props.columns[1]
 assert(home_sections["project-pipelines-workbench"].children[1].props.rows[1].cells.name == "Runtime Standalone", "project table must expose current records")
 assert(home_sections["project-pipelines-workbench"].children[3].id == "project-pipelines-run-table", "workbench must include run table")
 assert(home_sections["project-pipelines-workbench"].children[3].props.selection.mode == "single", "run table must declare selection semantics")
-assert(home_sections["project-pipelines-workbench"].children[3].props.row_action.id == "project_pipelines.select_row", "run table must declare row action semantics")
+assert(home_sections["project-pipelines-workbench"].children[3].props.row_action == nil, "table-level row_action must not claim implicit row identity")
+local workspace_project_row = nil
+for _, row in ipairs(home_sections["project-pipelines-workbench"].children[1].props.rows) do
+  if row.id == "proj_runtime_workspace" then workspace_project_row = row end
+end
+assert(workspace_project_row.action.id == "project_pipelines.select_row", "workspace project row must author its select action")
+assert(workspace_project_row.action.payload.row_id == "workspace_runtime_alpha", "workspace project row must carry its workspace identity")
 local missing_dependency_row = nil
 for _, row in ipairs(home_sections["project-pipelines-workbench"].children[3].props.rows) do
   if row.id == "run_runtime_missing_dependency" then missing_dependency_row = row end
@@ -1220,10 +1474,7 @@ assert(workbench_list.children[1].item_template.type == "list_item", "bound rows
 assert(workbench_list.children[1].item_template.slots.title[1].props.text["$bind"] == "@/title", "bound row title must use hub $bind shape")
 assert(home_sections["project-pipelines-create-guidance"].type == "section", "create guidance must use section primitive")
 assert(home_sections["project-pipelines-create-guidance"].children[2].children[2].slots.subtitle[1].children[1].props.text == "project_pipelines.create_ticket", "home surface must expose create ticket action hint")
-assert(home_sections["project-pipelines-create-guidance"].children[3].type == "form", "create guidance must expose form/action feedback")
-assert(home_sections["project-pipelines-create-guidance"].children[3].children[1].type == "form_section", "action feedback must use form_section primitive")
-assert(home_sections["project-pipelines-create-guidance"].children[3].children[1].children[1].type == "form_field", "action feedback must use form_field primitive")
-assert(home_sections["project-pipelines-create-guidance"].children[3].children[1].children[3].props.action.id == "project_pipelines.activate_step", "action feedback form must route to activate_step")
+assert(#home_sections["project-pipelines-create-guidance"].children == 2, "create guidance must not duplicate the activate-step dialog form")
 
 local settings = handlers["project-pipelines.settings"]({})
 validate_ui_child_contract(settings, "settings")
@@ -1272,7 +1523,7 @@ local reloaded_context = reloaded_tools["project_pipelines.current_context"]({})
 assert(reloaded_context.ok, "reloaded context failed")
 assert(#reloaded_context.projects == 2, "projects must survive plugin reload")
 assert(#reloaded_context.tickets == 5, "tickets must survive plugin reload")
-assert(#reloaded_context.runs == 9, "runs must survive plugin reload")
+assert(#reloaded_context.runs == 10, "runs must survive plugin reload")
 assert(#reloaded_context.session_requests == 10, "session requests must survive plugin reload")
 local reloaded_missing_run = nil
 for _, persisted_run in ipairs(reloaded_context.runs) do
