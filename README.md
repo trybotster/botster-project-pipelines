@@ -92,6 +92,7 @@ Every delivery role uses the same exact routing source:
 - `botster-web` → `[[botster-web-playbook]]`
 - `botster-tui` → `[[botster-tui-playbook]]`
 - `botster-tui-kit` → `[[botster-tui-kit-playbook]]`
+- `botster-workspaces` → `[[botster-workspaces-playbook]]`
 - `botster-terminal-ghostty` → `[[botster-terminal-ghostty-playbook]]`
 - Project Pipelines package/plugin paths → `[[project-pipelines-playbook]]`
 
@@ -283,10 +284,10 @@ accepted create, and rejected create requests through the real worker. It assert
 structured `plugin_action_result` frames, exact identity, a client-authored
 submit envelope, values/payload separation, close/replacement behavior, retained
 normalized values/errors, and the selected-workspace equality binding. It also
-admits a deterministic Git target using the real TUI-kit target id, installs a
+admits a deterministic Git target using the real Workspaces target id, installs a
 test Plan template, activates the production sourced Plan through
 `ensure_worktree_and_spawn`, and waits for that spawned Plan process to inspect
-its managed prompt, resolve `[[botster-tui-kit-playbook]]`, and submit the Plan
+its managed prompt, resolve `[[botster-workspaces-playbook]]`, and submit the Plan
 artifact, gate, and step advance through the public plugin MCP socket without a
 routing question. The harness then restarts Hub and rechecks the same durable
 workflow identity.
