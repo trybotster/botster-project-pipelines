@@ -1,6 +1,6 @@
 local STORE_SCHEMA_VERSION = 2
 local STORE_ROOT = "v2/"
-local SOURCE_REVISION = "botster-stack-delivery/2026-07-28.5"
+local SOURCE_REVISION = "botster-stack-delivery/2026-07-28.6"
 local MAX_STORE_KEYS = 1024
 local STORE_KEY_HEADROOM = 64
 local MAX_EVENTS = 256
@@ -472,12 +472,12 @@ end
 
 local REPOSITORY_ROUTING = {
   { slug = "botster-core", playbook = "[[botster-core-playbook]]" },
-  { slug = "botster-tui-kit", playbook = "[[botster-tui-kit-playbook]]" },
-  { slug = "botster-workspaces", playbook = "[[botster-workspaces-playbook]]" },
   { slug = "botster-hub", playbook = "[[botster-hub-playbook]]" },
   { slug = "botster-hub-client", playbook = "[[botster-hub-client-playbook]]" },
   { slug = "botster-web", playbook = "[[botster-web-playbook]]" },
   { slug = "botster-tui", playbook = "[[botster-tui-playbook]]" },
+  { slug = "botster-tui-kit", playbook = "[[botster-tui-kit-playbook]]" },
+  { slug = "botster-workspaces", playbook = "[[botster-workspaces-playbook]]" },
   { slug = "botster-terminal-ghostty", playbook = "[[botster-terminal-ghostty-playbook]]" },
 }
 
@@ -828,7 +828,7 @@ local function context_value(arguments, run, ticket, project, step, key)
 end
 
 local function build_session_template_request(arguments, run, ticket, project, step)
-  local prompt = bounded_prompt(context_value(arguments, run, ticket, project, step, "prompt"))
+  local prompt = context_value(arguments, run, ticket, project, step, "prompt")
   local metadata = clean_string_map(context_value(arguments, run, ticket, project, step, "metadata"))
   metadata.owner_plugin = metadata.owner_plugin or "project-pipelines"
   metadata.surface = metadata.surface or "project-pipelines"

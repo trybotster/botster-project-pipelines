@@ -76,7 +76,20 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
     context = JSON.parse(context_json)
     prompt = context.fetch("prompt")
     run_id = context.fetch("metadata.run_id")
-    raise "Workspaces charter was not resolved" unless prompt.include?("[[botster-workspaces-playbook]]")
+    expected_repository_playbooks = [
+      "[[botster-core-playbook]]",
+      "[[botster-hub-playbook]]",
+      "[[botster-hub-client-playbook]]",
+      "[[botster-web-playbook]]",
+      "[[botster-tui-playbook]]",
+      "[[botster-tui-kit-playbook]]",
+      "[[botster-workspaces-playbook]]",
+      "[[botster-terminal-ghostty-playbook]]",
+      "[[project-pipelines-playbook]]"
+    ]
+    missing_playbooks = expected_repository_playbooks.reject { |playbook| prompt.include?(playbook) }
+    raise "repository charters were not resolved: #{missing_playbooks.join(", ")}" unless missing_playbooks.empty?
+    raise "routing failure guard was not delivered" unless prompt.include?("Zero or multiple matches require a routing question; never substitute a generic charter or load every charter.")
 
     socket = UNIXSocket.new(ENV.fetch("BOTSTER_HUB_SOCKET"))
     socket.puts(JSON.generate({

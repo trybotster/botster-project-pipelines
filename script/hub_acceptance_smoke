@@ -12,6 +12,17 @@ end
 
 restart_verification = ARGV[1] == "verify_restart"
 downstream_root = ARGV[2]
+expected_repository_playbooks = [
+  "[[botster-core-playbook]]",
+  "[[botster-hub-playbook]]",
+  "[[botster-hub-client-playbook]]",
+  "[[botster-web-playbook]]",
+  "[[botster-tui-playbook]]",
+  "[[botster-tui-kit-playbook]]",
+  "[[botster-workspaces-playbook]]",
+  "[[botster-terminal-ghostty-playbook]]",
+  "[[project-pipelines-playbook]]"
+].freeze
 
 def assert(condition, message)
   raise message unless condition
@@ -130,8 +141,9 @@ stack_definitions = initial_context.fetch("pipeline_definitions").select { |defi
 assert(stack_definitions.length == 1, "clean package must reconcile exactly one Stack Delivery definition")
 assert(stack_definitions.first["source_authority"] == "trybotster/botster-project-pipelines:plugin.lua", "standalone source authority mismatch")
 assert(stack_definitions.first.fetch("steps").length == 6, "sourced Stack Delivery step count mismatch")
-assert(stack_definitions.first.fetch("steps").all? { |step| step.fetch("prompt").include?("[[botster-tui-kit-playbook]]") }, "every sourced role must carry TUI-kit routing")
-assert(stack_definitions.first.fetch("steps").all? { |step| step.fetch("prompt").include?("[[botster-workspaces-playbook]]") }, "every sourced role must carry Workspaces routing")
+expected_repository_playbooks.each do |playbook|
+  assert(stack_definitions.first.fetch("steps").all? { |step| step.fetch("prompt").include?(playbook) }, "every sourced role must carry #{playbook}")
+end
 
 if restart_verification
   persisted_run = initial_context.fetch("runs").find { |run| run["id"] == "run_live_authority" }
@@ -304,7 +316,11 @@ assert(plan_activation.dig("activation", "status") == "spawn_requested", "downst
 assert(plan_activation.dig("activation", "request", "target_id") == "tgt_71266a8d976d4535902ffed09c18a7ba", "downstream Plan used the wrong target")
 assert(plan_activation.dig("activation", "result", "worktree_path"), "downstream Plan did not create a managed worktree")
 assert(plan_activation.dig("activation", "result", "session_id"), "downstream Plan did not create a managed session")
-assert(plan_activation.dig("activation", "request", "context", "prompt").include?("[[botster-workspaces-playbook]]"), "production Plan prompt did not carry the Workspaces charter")
+managed_prompt = plan_activation.dig("activation", "request", "context", "prompt")
+expected_repository_playbooks.each do |playbook|
+  assert(managed_prompt.include?(playbook), "production Plan prompt did not carry #{playbook}")
+end
+assert(managed_prompt.include?("Zero or multiple matches require a routing question; never substitute a generic charter or load every charter."), "production Plan prompt did not carry the routing failure guard")
 
 managed_worktree = plan_activation.dig("activation", "result", "worktree_path")
 agent_result_path = File.join(managed_worktree, "downstream-plan-ran.json")
