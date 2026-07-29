@@ -12,6 +12,17 @@ end
 
 restart_verification = ARGV[1] == "verify_restart"
 downstream_root = ARGV[2]
+expected_repository_playbooks = [
+  "[[botster-core-playbook]]",
+  "[[botster-hub-playbook]]",
+  "[[botster-hub-client-playbook]]",
+  "[[botster-web-playbook]]",
+  "[[botster-tui-playbook]]",
+  "[[botster-tui-kit-playbook]]",
+  "[[botster-workspaces-playbook]]",
+  "[[botster-terminal-ghostty-playbook]]",
+  "[[project-pipelines-playbook]]"
+].freeze
 
 def assert(condition, message)
   raise message unless condition
@@ -114,15 +125,15 @@ unless restart_verification
   raise "downstream target root is required" unless downstream_root
   target = request(socket, {
     type: "create_spawn_target",
-    target_id: "tgt_3dfae49c02454037bf13554f552baf7f",
-    label: "Downstream TUI-kit acceptance",
+    target_id: "tgt_71266a8d976d4535902ffed09c18a7ba",
+    label: "Downstream Workspaces acceptance",
     root: downstream_root,
     enabled: true,
     kind: "git",
     base_ref: "main",
-    metadata: { repository: "trybotster/botster-tui-kit" }
+    metadata: { repository: "trybotster/botster-workspaces" }
   })
-  assert(target["kind"] == "spawn_targets", "downstream TUI-kit target admission failed")
+  assert(target["kind"] == "spawn_targets", "downstream Workspaces target admission failed")
 end
 
 initial_context = call_tool(socket, "project_pipelines.current_context", {})
@@ -130,7 +141,9 @@ stack_definitions = initial_context.fetch("pipeline_definitions").select { |defi
 assert(stack_definitions.length == 1, "clean package must reconcile exactly one Stack Delivery definition")
 assert(stack_definitions.first["source_authority"] == "trybotster/botster-project-pipelines:plugin.lua", "standalone source authority mismatch")
 assert(stack_definitions.first.fetch("steps").length == 6, "sourced Stack Delivery step count mismatch")
-assert(stack_definitions.first.fetch("steps").all? { |step| step.fetch("prompt").include?("[[botster-tui-kit-playbook]]") }, "every sourced role must carry TUI-kit routing")
+expected_repository_playbooks.each do |playbook|
+  assert(stack_definitions.first.fetch("steps").all? { |step| step.fetch("prompt").include?(playbook) }, "every sourced role must carry #{playbook}")
+end
 
 if restart_verification
   persisted_run = initial_context.fetch("runs").find { |run| run["id"] == "run_live_authority" }
@@ -279,7 +292,7 @@ run = call_tool(socket, "project_pipelines.record_run", {
   id: run_id,
   ticket_id: ticket_id,
   pipeline_definition_id: "botster_stack_delivery",
-  spawn_target_id: "tgt_3dfae49c02454037bf13554f552baf7f",
+  spawn_target_id: "tgt_71266a8d976d4535902ffed09c18a7ba",
   branch: "project-pipelines/live-authority",
   base_ref: "main",
   worktree: { kind: "provider_owned_reference", id: "worktree_live_authority" }
@@ -298,12 +311,16 @@ plan_activation = call_tool(socket, "project_pipelines.activate_step", {
   request_id: "session_request_live_downstream_plan",
   session_template_id: "downstream-plan.fixture/plan"
 })
-assert(plan_activation["ok"] == true, "downstream TUI-kit Plan managed spawn failed: #{plan_activation.inspect}")
+assert(plan_activation["ok"] == true, "downstream Workspaces Plan managed spawn failed: #{plan_activation.inspect}")
 assert(plan_activation.dig("activation", "status") == "spawn_requested", "downstream Plan did not persist a spawn request")
-assert(plan_activation.dig("activation", "request", "target_id") == "tgt_3dfae49c02454037bf13554f552baf7f", "downstream Plan used the wrong target")
+assert(plan_activation.dig("activation", "request", "target_id") == "tgt_71266a8d976d4535902ffed09c18a7ba", "downstream Plan used the wrong target")
 assert(plan_activation.dig("activation", "result", "worktree_path"), "downstream Plan did not create a managed worktree")
 assert(plan_activation.dig("activation", "result", "session_id"), "downstream Plan did not create a managed session")
-assert(plan_activation.dig("activation", "request", "context", "prompt").include?("[[botster-tui-kit-playbook]]"), "production Plan prompt did not carry the TUI-kit charter")
+managed_prompt = plan_activation.dig("activation", "request", "context", "prompt")
+expected_repository_playbooks.each do |playbook|
+  assert(managed_prompt.include?(playbook), "production Plan prompt did not carry #{playbook}")
+end
+assert(managed_prompt.include?("Zero or multiple matches require a routing question; never substitute a generic charter or load every charter."), "production Plan prompt did not carry the routing failure guard")
 
 managed_worktree = plan_activation.dig("activation", "result", "worktree_path")
 agent_result_path = File.join(managed_worktree, "downstream-plan-ran.json")
@@ -311,7 +328,7 @@ Timeout.timeout(15) do
   sleep 0.05 until File.file?(agent_result_path)
 end
 agent_result = JSON.parse(File.read(agent_result_path))
-assert(agent_result["repository_playbook"] == "[[botster-tui-kit-playbook]]", "spawned Plan agent did not resolve the TUI-kit charter")
+assert(agent_result["repository_playbook"] == "[[botster-workspaces-playbook]]", "spawned Plan agent did not resolve the Workspaces charter")
 assert(agent_result["artifact_id"] == "artifact_live_plan_agent", "spawned Plan agent did not submit its artifact")
 assert(agent_result["gate_id"] == "plan_artifact", "spawned Plan agent did not submit its gate")
 assert(agent_result["step_id"] == "botster_stack_plan_review", "spawned Plan agent did not advance to Plan Review")

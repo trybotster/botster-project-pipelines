@@ -74,7 +74,7 @@ assert contract["contract_version"] == 2
 assert contract["fixture_role"] == {
     "authority": "schema_example_only",
     "production_source": "plugin.lua",
-    "source_revision": "botster-stack-delivery/2026-07-28.4",
+    "source_revision": "botster-stack-delivery/2026-07-28.6",
 }
 anchors = contract["manifest_anchors"]
 assert anchors["package_name"] == manifest["name"]
@@ -579,7 +579,6 @@ local finding_policy_gate_prompts = {
 }
 local checked_finding_policy_gates = 0
 for _, step in ipairs(stack_delivery.steps) do
-  assert(step.prompt:find("[[botster-tui-kit-playbook]]", 1, true), "every delivery role must carry the TUI-kit route")
   local expected_prompt = finding_policy_gate_prompts[step.id]
   if expected_prompt then
     assert(
@@ -593,10 +592,6 @@ assert(
   checked_finding_policy_gates == 2,
   "every sourced gate that states finding policy must be checked"
 )
-assert(
-  not string.find("[[botster-core-playbook]]", "[[botster-tui-kit-playbook]]", 1, true),
-  "routing assertion positive control must reject a prompt without the TUI-kit route"
-)
 local expected_routes = {
   ["botster-core"] = "[[botster-core-playbook]]",
   ["botster-hub"] = "[[botster-hub-playbook]]",
@@ -604,6 +599,7 @@ local expected_routes = {
   ["botster-web"] = "[[botster-web-playbook]]",
   ["botster-tui"] = "[[botster-tui-playbook]]",
   ["botster-tui-kit"] = "[[botster-tui-kit-playbook]]",
+  ["botster-workspaces"] = "[[botster-workspaces-playbook]]",
   ["botster-terminal-ghostty"] = "[[botster-terminal-ghostty-playbook]]",
   ["trybotster/botster-project-pipelines"] = "[[project-pipelines-playbook]]",
 }
@@ -611,7 +607,17 @@ for repository, playbook in pairs(expected_routes) do
   local route = tools["project_pipelines.resolve_repository_playbook"]({ repository = repository })
   assert(route.ok and route.playbook == playbook, repository .. " must resolve exactly one charter")
 end
-for _, excluded in ipairs({ "botster-workspaces", "trybotster/restty", "Ghostty" }) do
+local function assert_managed_prompt_routes(prompt, label)
+  assert(type(prompt) == "string" and #prompt > 500, label .. " must receive the full composed prompt")
+  for repository, playbook in pairs(expected_routes) do
+    assert(prompt:find(playbook, 1, true), label .. " must carry the " .. repository .. " charter")
+  end
+  assert(
+    prompt:find("Zero or multiple matches require a routing question; never substitute a generic charter or load every charter.", 1, true),
+    label .. " must carry the routing failure guard"
+  )
+end
+for _, excluded in ipairs({ "trybotster/restty", "Ghostty" }) do
   assert(tools["project_pipelines.resolve_repository_playbook"]({ repository = excluded }).ok == false, excluded .. " must remain outside the explicit routing allowlist")
 end
 assert(tools["project_pipelines.resolve_repository_playbook"]({ repository = "botster-core", path = "plugin.lua" }).ok == false, "multiple routing matches must require a question")
@@ -1675,6 +1681,34 @@ local sourced_run = reloaded_tools["project_pipelines.record_run"]({
   pipeline_definition_id = "botster_stack_delivery",
 })
 assert(sourced_run.ok and sourced_run.run.current_step_id == "botster_stack_plan", "sourced workflow must be executable")
+for _, step in ipairs(stack_delivery.steps) do
+  if step.kind ~= "manual" then
+    local route_run_id = "run_runtime_route_" .. step.id
+    local route_run = reloaded_tools["project_pipelines.record_run"]({
+      id = route_run_id,
+      ticket_id = "ticket_runtime_workspace",
+      pipeline_definition_id = "botster_stack_delivery",
+      current_step_id = step.id,
+      branch = "project-pipelines/route-prompt-" .. step.id,
+    })
+    assert(route_run.ok, step.id .. " route prompt run create failed")
+    local route_activation = reloaded_tools["project_pipelines.activate_step"]({
+      run_id = route_run_id,
+      step_id = step.id,
+      request_id = "session_request_route_" .. step.id,
+      session_template_id = "template_codex_runtime",
+    })
+    assert(
+      route_activation.ok,
+      step.id .. " route prompt activation failed: "
+        .. tostring(route_activation.error and (route_activation.error.message or route_activation.error.code))
+    )
+    assert_managed_prompt_routes(
+      route_activation.activation.request.context.prompt,
+      step.id .. " dispatched prompt"
+    )
+  end
+end
 assert(reloaded_tools["project_pipelines.request_step_advance"]({
   run_id = sourced_run.run.id,
   request_id = "advance_without_plan_gate",
@@ -1994,6 +2028,7 @@ for _, event in ipairs(reconciled_context.events) do
 end
 assert(reconciled_stack.steps[1].agent_name == "operator-selected-agent", "source reconciliation must preserve device-selected agent_name")
 assert(reconciled_stack.steps[1].prompt:find("repository charter"), "source reconciliation must refresh package-owned prompt fields")
+assert(reconciled_stack.steps[1].prompt:find("[[botster-workspaces-playbook]]", 1, true), "source reconciliation must refresh the Workspaces route")
 assert(initialized_events == initialized_events_before_reconcile, "reload and reconciliation must not duplicate initialization events")
 
 durable_store["v2/questions/corrupt_payload"] = {

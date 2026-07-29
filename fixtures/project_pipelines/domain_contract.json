@@ -3,7 +3,7 @@
   "fixture_role": {
     "authority": "schema_example_only",
     "production_source": "plugin.lua",
-    "source_revision": "botster-stack-delivery/2026-07-28.4"
+    "source_revision": "botster-stack-delivery/2026-07-28.6"
   },
   "manifest_anchors": {
     "package_name": "project-pipelines",
