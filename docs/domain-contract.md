@@ -63,6 +63,12 @@ prerequisites. `ticket.dependency_ticket_ids` is the canonical link set and can
 be changed after a run starts with `project_pipelines.add_ticket_dependency`
 and `project_pipelines.remove_ticket_dependency`; the referenced ticket's
 `open`/`closed` state is changed with `project_pipelines.update_ticket_status`.
+Starting an active run projects the owning ticket to `active` in the same
+package mutation. Step activation and advancement preserve that lifecycle pair.
+`project_pipelines.update_run_status` is the terminal lifecycle entrypoint:
+cancellation reopens the ticket, completion closes it, and merge completes the
+run, closes the ticket, and marks linked PR observations merged. Closing or
+reopening a ticket also reconciles any live run to completed or cancelled.
 Every target step is gated by default. Planning steps that must remain usable
 while prerequisites are open declare
 `allows_open_ticket_dependencies: true`; a missing field remains gated so
@@ -249,6 +255,7 @@ Expected event kinds include:
 - `ticket_dependency_removed`
 - `ticket_status_updated`
 - `run_started`
+- `run_cancelled`
 - `step_started`
 - `ticket_dependencies_blocked`
 - `step_activation_preserved`

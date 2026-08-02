@@ -260,6 +260,7 @@ for event in contract["events"]:
         "ticket_status_updated",
         "ticket_dependencies_blocked",
         "run_started",
+        "run_cancelled",
         "step_started",
         "step_activation_preserved",
         "session_template_spawn_requested",
@@ -558,6 +559,7 @@ assert(ui_actions == 5, "plugin must register every declared workbench ui_action
 assert(handlers["project_pipelines.create_ticket"] ~= nil, "create ticket ui_action must be wired")
 assert(handlers["project_pipelines.record_run"] ~= nil, "record run ui_action must be wired")
 assert(handlers["project_pipelines.activate_step"] ~= nil, "activate step ui_action must be wired")
+assert(tools["project_pipelines.update_run_status"] ~= nil, "run lifecycle tool must be wired")
 assert(handlers["project_pipelines.filter"] ~= nil, "filter ui_action must be wired")
 assert(handlers["project_pipelines.select_row"] ~= nil, "select row ui_action must be wired")
 
@@ -690,12 +692,34 @@ local run = tools["project_pipelines.record_run"]({
   worktree = { kind = "provider_owned_reference", id = "worktree_runtime_one", path = "worktree://runtime-one" },
 })
 assert(run.ok and run.run.current_step_id == "step_plan", "run record failed")
+do
+local started_ticket = tools["project_pipelines.show_ticket"]({ ticket_id = "ticket_runtime_one" })
+assert(started_ticket.ok and started_ticket.ticket.status == "active", "starting an active run must project its ticket active")
+local started_context = tools["project_pipelines.current_context"]({ run_id = "run_runtime_one" })
+assert(started_context.runs[1].status == "active", "started run must remain active in current_context")
+local started_entities = tools["project_pipelines.entities"]({})
+local active_ticket_frame = nil
+local active_run_frame = nil
+for _, frame in ipairs(started_entities.frames) do
+  if frame.family == "project-pipelines.ticket" and frame.id == "ticket_runtime_one" then active_ticket_frame = frame end
+  if frame.family == "project-pipelines.run" and frame.id == "run_runtime_one" then active_run_frame = frame end
+end
+assert(active_ticket_frame and active_ticket_frame.record.status == "active", "ticket entity projection must expose active status")
+assert(active_run_frame and active_run_frame.record.status == "active", "run entity projection must expose active status")
+local started_home = handlers["project-pipelines.home"]({})
+local started_running = nil
+for _, child in ipairs(started_home.children) do
+  if child.id == "project-pipelines-running" then started_running = child end
+end
+assert(started_running and started_running.children[1].children[1].id == "project-pipelines-running-run_runtime_one", "Running Pipelines must include the newly active run")
+end
 
 local manual_activation = tools["project_pipelines.activate_step"]({
   run_id = "run_runtime_one",
   step_id = "step_manual",
 })
 assert(manual_activation.ok and manual_activation.activation.spawned == false, "manual step must not spawn a session template")
+assert(tools["project_pipelines.show_ticket"]({ ticket_id = "ticket_runtime_one" }).ticket.status == "active", "step activation must preserve active ticket projection")
 
 local pty_activation = tools["project_pipelines.activate_step"]({
   run_id = "run_runtime_one",
@@ -1725,6 +1749,7 @@ local plan_advance = reloaded_tools["project_pipelines.request_step_advance"]({
   request_id = "advance_plan_once",
 })
 assert(plan_advance.ok and plan_advance.step_id == "botster_stack_plan_review", "valid plan gate must advance")
+assert(reloaded_tools["project_pipelines.show_ticket"]({ ticket_id = "ticket_runtime_one" }).ticket.status == "active", "step advance must preserve active ticket projection")
 local duplicate_plan_advance = reloaded_tools["project_pipelines.request_step_advance"]({
   run_id = sourced_run.run.id,
   request_id = "advance_plan_once",
@@ -1781,6 +1806,89 @@ assert(reloaded_tools["project_pipelines.request_step_advance"]({
   run_id = sourced_run.run.id,
   request_id = "advance_with_pr",
 }).ok, "committed implementation with PR link must advance")
+
+do
+local function assert_lifecycle_projection()
+local function lifecycle_run(suffix)
+  local ticket_id = "ticket_runtime_lifecycle_" .. suffix
+  local run_id = "run_runtime_lifecycle_" .. suffix
+  assert(reloaded_tools["project_pipelines.create_ticket"]({
+    id = ticket_id,
+    project_id = "proj_runtime_standalone",
+    title = "Lifecycle " .. suffix,
+  }).ok, suffix .. " lifecycle ticket create failed")
+  local created = reloaded_tools["project_pipelines.record_run"]({
+    id = run_id,
+    ticket_id = ticket_id,
+    pipeline_definition_id = "pipeline_runtime",
+  })
+  assert(created.ok and created.run.status == "active", suffix .. " lifecycle run create failed")
+  assert(reloaded_tools["project_pipelines.show_ticket"]({ ticket_id = ticket_id }).ticket.status == "active", suffix .. " lifecycle ticket must start active")
+  return ticket_id, run_id
+end
+
+local cancelled_ticket_id, cancelled_run_id = lifecycle_run("cancelled")
+local sibling_cancelled_run_id = "run_runtime_lifecycle_cancelled_sibling"
+assert(reloaded_tools["project_pipelines.record_run"]({
+  id = sibling_cancelled_run_id,
+  ticket_id = cancelled_ticket_id,
+  pipeline_definition_id = "pipeline_runtime",
+}).ok, "sibling cancellation run create failed")
+local cancelled = reloaded_tools["project_pipelines.update_run_status"]({ run_id = cancelled_run_id, status = "cancelled" })
+assert(cancelled.ok and cancelled.run.status == "cancelled", "run cancellation must persist")
+assert(cancelled.ticket.status == "active", "cancelling one of multiple live runs must keep the owning ticket active")
+local sibling_cancelled = reloaded_tools["project_pipelines.update_run_status"]({ run_id = sibling_cancelled_run_id, status = "cancelled" })
+assert(sibling_cancelled.ok and sibling_cancelled.ticket.status == "open", "cancelling the final live run must reopen the owning ticket")
+
+local completed_ticket_id, completed_run_id = lifecycle_run("completed")
+local completed = reloaded_tools["project_pipelines.update_run_status"]({ run_id = completed_run_id, status = "completed" })
+assert(completed.ok and completed.run.status == "completed", "run completion must persist")
+assert(completed.ticket.status == "closed", "run completion must close the owning ticket")
+
+local merged_ticket_id, merged_run_id = lifecycle_run("merged")
+local merged_pr = reloaded_tools["project_pipelines.link_pr"]({
+  run_id = merged_run_id,
+  url = "https://example.invalid/pull/lifecycle-merged",
+})
+assert(merged_pr.ok and merged_pr.pr_link.status == "open", "merge lifecycle PR link failed")
+local merged = reloaded_tools["project_pipelines.update_run_status"]({ run_id = merged_run_id, status = "merged" })
+assert(merged.ok and merged.run.status == "completed" and merged.run.terminal_disposition == "merged", "merge must complete the run with merged disposition")
+assert(merged.ticket.status == "closed", "merge must close the owning ticket")
+
+local closed_ticket_id, closed_run_id = lifecycle_run("closed")
+local closed = reloaded_tools["project_pipelines.update_ticket_status"]({ ticket_id = closed_ticket_id, status = "closed" })
+assert(closed.ok and closed.ticket.status == "closed", "ticket close must persist")
+assert(#closed.runs == 1 and closed.runs[1].id == closed_run_id and closed.runs[1].status == "completed", "ticket close must complete its live run")
+
+local lifecycle_context = reloaded_tools["project_pipelines.current_context"]({})
+local lifecycle_by_run = {}
+local lifecycle_by_ticket = {}
+local merged_link = nil
+for _, candidate in ipairs(lifecycle_context.runs) do lifecycle_by_run[candidate.id] = candidate end
+for _, candidate in ipairs(lifecycle_context.tickets) do lifecycle_by_ticket[candidate.id] = candidate end
+for _, candidate in ipairs(lifecycle_context.pr_links) do
+  if candidate.run_id == merged_run_id then merged_link = candidate end
+end
+assert(lifecycle_by_run[cancelled_run_id].status == "cancelled" and lifecycle_by_ticket[cancelled_ticket_id].status == "open", "cancelled lifecycle pair must remain reconciled")
+assert(lifecycle_by_run[sibling_cancelled_run_id].status == "cancelled", "sibling cancelled run must remain terminal")
+assert(lifecycle_by_run[completed_run_id].status == "completed" and lifecycle_by_ticket[completed_ticket_id].status == "closed", "completed lifecycle pair must remain reconciled")
+assert(lifecycle_by_run[merged_run_id].status == "completed" and lifecycle_by_ticket[merged_ticket_id].status == "closed", "merged lifecycle pair must remain reconciled")
+assert(merged_link and merged_link.status == "merged", "merge must project linked PR status")
+local lifecycle_home = handlers["project-pipelines.home"]({})
+local lifecycle_running = nil
+for _, child in ipairs(lifecycle_home.children) do
+  if child.id == "project-pipelines-running" then lifecycle_running = child end
+end
+for _, item in ipairs(lifecycle_running.children[1].children) do
+  assert(item.id ~= "project-pipelines-running-" .. cancelled_run_id, "cancelled run must leave Running Pipelines")
+  assert(item.id ~= "project-pipelines-running-" .. sibling_cancelled_run_id, "sibling cancelled run must leave Running Pipelines")
+  assert(item.id ~= "project-pipelines-running-" .. completed_run_id, "completed run must leave Running Pipelines")
+  assert(item.id ~= "project-pipelines-running-" .. merged_run_id, "merged run must leave Running Pipelines")
+  assert(item.id ~= "project-pipelines-running-" .. closed_run_id, "ticket-closed run must leave Running Pipelines")
+end
+end
+assert_lifecycle_projection()
+end
 
 local interruption_pipeline = reloaded_tools["project_pipelines.define_pipeline"]({
   id = "pipeline_runtime_interruptions",

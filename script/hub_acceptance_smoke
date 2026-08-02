@@ -298,6 +298,16 @@ run = call_tool(socket, "project_pipelines.record_run", {
   worktree: { kind: "provider_owned_reference", id: "worktree_live_authority" }
 })
 assert(run["ok"] == true && run.dig("run", "current_step_id") == "botster_stack_plan", "sourced run did not start at Plan")
+started_context = call_tool(socket, "project_pipelines.current_context", { run_id: run_id })
+started_ticket = started_context.fetch("tickets").find { |record| record["id"] == ticket_id }
+assert(started_ticket && started_ticket["status"] == "active", "real worker run start did not project the owning ticket active")
+started_entities = call_tool(socket, "project_pipelines.entities", {})
+assert(started_entities.fetch("frames").any? { |frame| frame["family"] == "project-pipelines.ticket" && frame["id"] == ticket_id && frame.dig("record", "status") == "active" }, "real worker ticket entity did not expose active status")
+assert(started_entities.fetch("frames").any? { |frame| frame["family"] == "project-pipelines.run" && frame["id"] == run_id && frame.dig("record", "status") == "active" }, "real worker run entity did not expose active status")
+started_surface = render_surface(socket)
+running_section = find_node(started_surface, "project-pipelines-running")
+running_item = find_node(running_section, "project-pipelines-running-#{run_id}")
+assert(running_item, "real worker Running Pipelines projection omitted the active run")
 
 blocked_plan = call_tool(socket, "project_pipelines.request_step_advance", {
   run_id: run_id,
@@ -433,6 +443,7 @@ assert(implement_advance["ok"] == true && implement_advance["step_id"] == "botst
 
 final_context = call_tool(socket, "project_pipelines.current_context", {})
 assert(final_context.fetch("runs").any? { |record| record["id"] == run_id }, "current context missing live run")
+assert(final_context.fetch("tickets").any? { |record| record["id"] == ticket_id && record["status"] == "active" }, "step transitions did not preserve the active ticket projection")
 assert(final_context.fetch("gate_results").count { |record| record["run_id"] == run_id } == 3, "run gate results missing")
 assert(final_context.fetch("reviews").count { |record| record["run_id"] == run_id } == 2, "run reviews missing")
 assert(final_context.fetch("findings").any? { |record| record["run_id"] == run_id && record["status"] == "resolved" }, "resolved finding missing")

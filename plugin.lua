@@ -6,6 +6,15 @@ local STORE_KEY_HEADROOM = 64
 local MAX_EVENTS = 256
 local BLOCKING_FINDING_SEVERITIES = { blocker = true, high = true }
 local BLOCKING_FINDING_POLICY = "blocker/high"
+local RUN_STATUSES = {
+  active = true,
+  ready_for_review = true,
+  review = true,
+  ready = true,
+  completed = true,
+  cancelled = true,
+}
+local LIVE_RUN_STATUSES = { active = true, ready_for_review = true, review = true, ready = true }
 
 local RECORD_FAMILIES = {
   -- Correlation records must become durable before the run records whose
@@ -455,6 +464,44 @@ local function push_event(state, kind, run_id, subject_id, payload)
     payload = payload,
   })
   while #state.events > MAX_EVENTS do table.remove(state.events, 1) end
+end
+
+local function set_ticket_status(state, ticket, status, run_id)
+  if ticket.status == status then return false end
+  ticket.status = status
+  push_event(state, "ticket_status_updated", run_id, ticket.id, { status = status })
+  return true
+end
+
+local function project_ticket_for_run(state, run, ticket)
+  for _, candidate in ipairs(state.runs) do
+    if candidate.ticket_id == ticket.id and LIVE_RUN_STATUSES[candidate.status] then
+      set_ticket_status(state, ticket, "active", run.id)
+      return
+    end
+  end
+  local ticket_status = run.status == "completed" and "closed"
+    or (run.status == "cancelled" and "open" or "active")
+  set_ticket_status(state, ticket, ticket_status, run.id)
+end
+
+local function set_run_status(state, run, ticket, status, disposition)
+  if run.status ~= status or run.terminal_disposition ~= disposition then
+    run.status = status
+    run.terminal_disposition = disposition
+    if status == "cancelled" then
+      push_event(state, "run_cancelled", run.id, run.id)
+    elseif status == "completed" then
+      if disposition == "merged" then
+        for _, link in ipairs(state.pr_links) do
+          if link.run_id == run.id then link.status = "merged" end
+        end
+        push_event(state, "provider_pr_merged", run.id, run.id)
+      end
+      push_event(state, "run_completed", run.id, run.id, { disposition = disposition })
+    end
+  end
+  project_ticket_for_run(state, run, ticket)
 end
 
 local function find_project_for_ticket(state, ticket)
@@ -946,13 +993,17 @@ local function create_ticket(arguments)
   if not title or title == "" then return failure("validation_failed", "title is required", { "title" }) end
   local state = load_state()
   if not find_by_id(state.projects, project_id) then return failure("not_found", "project not found: " .. project_id) end
+  local status = string_arg(arguments, "status") or "open"
+  if status ~= "open" and status ~= "closed" then
+    return failure("validation_failed", "new ticket status must be open or closed", { "status" })
+  end
   local ticket = {
     id = string_arg(arguments, "id") or next_id(state, "ticket"),
     project_id = project_id,
     workspace_id = string_arg(arguments, "workspace_id"),
     title = title,
     description = string_arg(arguments, "description"),
-    status = string_arg(arguments, "status") or "open",
+    status = status,
     dependency_ticket_ids = array(arguments.dependency_ticket_ids),
   }
   table.insert(state.tickets, ticket)
@@ -1044,12 +1095,21 @@ local function update_ticket_status(arguments)
   local state = load_state()
   local ticket = find_by_id(state.tickets, ticket_id)
   if not ticket then return failure("not_found", "ticket not found: " .. ticket_id) end
-  if ticket.status == status then return ok({ ticket = ticket }) end
-  ticket.status = status
-  push_event(state, "ticket_status_updated", nil, ticket.id, { status = status })
+  local reconciled_runs = {}
+  for _, run in ipairs(state.runs) do
+    if run.ticket_id == ticket.id and LIVE_RUN_STATUSES[run.status] then
+      if status == "closed" then
+        set_run_status(state, run, ticket, "completed", "closed")
+      elseif status == "open" then
+        set_run_status(state, run, ticket, "cancelled", "cancelled")
+      end
+      table.insert(reconciled_runs, run)
+    end
+  end
+  set_ticket_status(state, ticket, status)
   local err = save_state(state)
   if err then return err end
-  return ok({ ticket = ticket })
+  return ok({ ticket = ticket, runs = reconciled_runs })
 end
 
 local function unmet_ticket_dependencies(state, ticket)
@@ -1127,16 +1187,21 @@ local function record_run(arguments)
   local pipeline_id = trim(arguments.pipeline_definition_id)
   if not ticket_id or ticket_id == "" then return failure("validation_failed", "ticket_id is required", { "ticket_id" }) end
   if not pipeline_id or pipeline_id == "" then return failure("validation_failed", "pipeline_definition_id is required", { "pipeline_definition_id" }) end
-  if not find_by_id(state.tickets, ticket_id) then return failure("not_found", "ticket not found: " .. ticket_id) end
+  local ticket = find_by_id(state.tickets, ticket_id)
+  if not ticket then return failure("not_found", "ticket not found: " .. ticket_id) end
   local pipeline = find_by_id(state.pipeline_definitions, pipeline_id)
   if not pipeline then return failure("not_found", "pipeline definition not found: " .. pipeline_id) end
   local first_step = pipeline.steps[1] or {}
+  local status = string_arg(arguments, "status") or "active"
+  if not RUN_STATUSES[status] then
+    return failure("validation_failed", "unsupported run status: " .. status, { "status" })
+  end
   local run = {
     id = string_arg(arguments, "id") or next_id(state, "run"),
     ticket_id = ticket_id,
     pipeline_definition_id = pipeline_id,
     current_step_id = string_arg(arguments, "current_step_id") or first_step.id,
-    status = string_arg(arguments, "status") or "active",
+    status = status,
     workspace_session_group_id = string_arg(arguments, "workspace_session_group_id"),
     workspace_id = string_arg(arguments, "workspace_id"),
     repository = arguments.repository,
@@ -1146,10 +1211,36 @@ local function record_run(arguments)
     worktree = arguments.worktree or { kind = "provider_owned_reference", id = string_arg(arguments, "worktree_id") },
   }
   table.insert(state.runs, run)
+  project_ticket_for_run(state, run, ticket)
   push_event(state, "run_started", run.id, run.id)
   local err = save_state(state)
   if err then return err end
   return ok({ run = run })
+end
+
+local function update_run_status(arguments)
+  arguments = arguments or {}
+  local run_id = string_arg(arguments, "run_id")
+  local requested_status = string_arg(arguments, "status")
+  if not run_id then return failure("validation_failed", "run_id is required", { "run_id" }) end
+  if not requested_status then return failure("validation_failed", "status is required", { "status" }) end
+
+  local status = requested_status == "merged" and "completed" or requested_status
+  if not RUN_STATUSES[status] then
+    return failure("validation_failed", "unsupported run status: " .. requested_status, { "status" })
+  end
+  local state = load_state()
+  local run = find_by_id(state.runs, run_id)
+  if not run then return failure("not_found", "run not found: " .. run_id) end
+  local ticket = find_by_id(state.tickets, run.ticket_id)
+  if not ticket then return failure("not_found", "ticket not found: " .. run.ticket_id) end
+  local disposition = requested_status == "merged" and "merged"
+    or (status == "completed" and (string_arg(arguments, "disposition") or "completed"))
+    or (status == "cancelled" and "cancelled")
+  set_run_status(state, run, ticket, status, disposition)
+  local err = save_state(state)
+  if err then return err end
+  return ok({ run = run, ticket = ticket })
 end
 
 local function activate_step(arguments)
@@ -1211,6 +1302,8 @@ local function activate_step(arguments)
 
   if not step_uses_session_template(step) then
     run.current_step_id = step.id
+    run.status = "active"
+    project_ticket_for_run(state, run, ticket)
     push_event(state, "step_started", run.id, step.id)
     local activation = {
       run_id = run.id,
@@ -1299,6 +1392,8 @@ local function activate_step(arguments)
   session_request.prompt_summary = bounded_prompt(request.context and request.context.prompt)
   session_request.context_id = response and response.context_id
   run.current_step_id = step.id
+  run.status = "active"
+  project_ticket_for_run(state, run, ticket)
   run.session_request_id = session_request.id
   run.session_id = session_request.session_id
   push_event(state, "step_started", run.id, step.id)
@@ -1655,6 +1750,9 @@ local function request_step_advance(arguments)
         if run.current_step_id == request.previous_step_id then
           run.current_step_id = request.step_id
           run.status = "active"
+          local ticket = find_by_id(state.tickets, run.ticket_id)
+          if not ticket then return failure("not_found", "ticket not found: " .. run.ticket_id) end
+          project_ticket_for_run(state, run, ticket)
           push_event(state, "step_advanced", run.id, request.step_id, {
             from_step_id = request.previous_step_id,
             request_id = request.request_id,
@@ -1722,6 +1820,8 @@ local function request_step_advance(arguments)
   end
   run.current_step_id = next_step_id
   run.status = "active"
+  if not ticket then return failure("not_found", "ticket not found: " .. run.ticket_id) end
+  project_ticket_for_run(state, run, ticket)
   push_event(state, "step_advanced", run.id, next_step_id, {
     from_step_id = current_step.id,
     request_id = request_id,
@@ -2663,11 +2763,12 @@ return botster.register({
     { name = "project_pipelines.show_ticket", description = "Show one Project Pipelines ticket.", input_schema = object_schema({ ticket_id = { type = "string" } }, { "ticket_id" }), handler = "show_ticket", call = show_ticket },
     { name = "project_pipelines.add_ticket_dependency", description = "Add a blocking dependency to a Project Pipelines ticket.", input_schema = object_schema({ ticket_id = { type = "string" }, dependency_ticket_id = { type = "string" } }, { "ticket_id", "dependency_ticket_id" }), handler = "add_ticket_dependency", call = add_ticket_dependency },
     { name = "project_pipelines.remove_ticket_dependency", description = "Remove a blocking dependency from a Project Pipelines ticket.", input_schema = object_schema({ ticket_id = { type = "string" }, dependency_ticket_id = { type = "string" } }, { "ticket_id", "dependency_ticket_id" }), handler = "remove_ticket_dependency", call = remove_ticket_dependency },
-    { name = "project_pipelines.update_ticket_status", description = "Update a Project Pipelines ticket status.", input_schema = object_schema({ ticket_id = { type = "string" }, status = { type = "string", enum = { "open", "closed" } } }, { "ticket_id", "status" }), handler = "update_ticket_status", call = update_ticket_status },
+    { name = "project_pipelines.update_ticket_status", description = "Open or close a ticket and reconcile any live run to the matching terminal lifecycle state.", input_schema = object_schema({ ticket_id = { type = "string" }, status = { type = "string", enum = { "open", "closed" } } }, { "ticket_id", "status" }), handler = "update_ticket_status", call = update_ticket_status },
     { name = "project_pipelines.define_pipeline", description = "Define a simple Project Pipelines template.", input_schema = object_schema({ project_id = { type = "string" }, name = { type = "string" }, steps = { type = "array" } }, { "project_id", "name" }), handler = "define_pipeline", call = define_pipeline },
     { name = "project_pipelines.list_pipeline_definitions", description = "List Project Pipelines templates.", input_schema = empty_schema(), handler = "list_pipeline_definitions", call = list_pipeline_definitions },
     { name = "project_pipelines.show_pipeline_definition", description = "Show one Project Pipelines template.", input_schema = object_schema({ pipeline_definition_id = { type = "string" } }, { "pipeline_definition_id" }), handler = "show_pipeline_definition", call = show_pipeline_definition },
     { name = "project_pipelines.record_run", description = "Record a Project Pipelines run skeleton.", input_schema = object_schema({ ticket_id = { type = "string" }, pipeline_definition_id = { type = "string" }, current_step_id = { type = "string" }, status = { type = "string" }, workspace_session_group_id = { type = "string" }, workspace_id = { type = "string" }, repository = { type = "object" }, spawn_target_id = { type = "string" }, branch = { type = "string" }, base_ref = { type = "string" }, worktree = { type = "object" }, worktree_id = { type = "string" } }, { "ticket_id", "pipeline_definition_id" }), handler = "record_run", call = record_run },
+    { name = "project_pipelines.update_run_status", description = "Update a run lifecycle status and project the owning ticket plus linked PR state.", input_schema = object_schema({ run_id = { type = "string" }, status = { type = "string", enum = { "active", "ready_for_review", "review", "ready", "completed", "cancelled", "merged" } }, disposition = { type = "string" } }, { "run_id", "status" }), handler = "update_run_status", call = update_run_status },
     { name = "project_pipelines.activate_step", description = "Activate a run step and atomically ensure a managed Git worktree and Hub session template.", input_schema = object_schema({ run_id = { type = "string" }, step_id = { type = "string" }, request_id = { type = "string" }, session_template_id = { type = "string" }, repository = { type = "object" }, spawn_target_id = { type = "string" }, branch = { type = "string" }, worktree = { type = "object" }, workspace_id = { type = "string" }, prompt = { type = "string" }, environment = { type = "object" }, metadata = { type = "object" } }, { "run_id" }), handler = "activate_step", call = activate_step },
     { name = "project_pipelines.submit_gate", description = "Persist gate evidence for one run step.", input_schema = object_schema({ run_id = { type = "string" }, step_id = { type = "string" }, gate_id = { type = "string" }, status = { type = "string" }, summary = { type = "string" }, evidence = { type = "object" } }, { "run_id", "step_id", "gate_id" }), handler = "submit_gate", call = submit_gate },
     { name = "project_pipelines.submit_review", description = "Persist a review and its findings.", input_schema = object_schema({ run_id = { type = "string" }, step_id = { type = "string" }, verdict = { type = "string" }, summary = { type = "string" }, findings = { type = "array" } }, { "run_id", "step_id", "verdict" }), handler = "submit_review", call = submit_review },

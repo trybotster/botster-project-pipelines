@@ -99,6 +99,14 @@ Every delivery role uses the same exact routing source:
 Zero or multiple matches return `routing_question_required`; there is no
 generic fallback or load-all behavior.
 
+Run and ticket lifecycle is one package-owned mutation. Recording an active run
+projects its owning ticket to `active`; step activation and advancement preserve
+that pair. `project_pipelines.update_run_status` projects cancellation back to
+an `open` ticket, completion or merge to a `closed` ticket, and merge to linked
+PR state. Closing or reopening a ticket reconciles any live run to completed or
+cancelled respectively. The Running Pipelines workbench is derived from active
+run records, and the ticket/run entity frames expose the same persisted pair.
+
 Ticket dependencies use `ticket.dependency_ticket_ids` as their sole canonical
 representation. `project_pipelines.add_ticket_dependency`,
 `project_pipelines.remove_ticket_dependency`, and
