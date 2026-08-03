@@ -1,0 +1,116 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "English"
+require "fileutils"
+require "socket"
+require "tmpdir"
+
+ROOT = File.expand_path("..", __dir__)
+CUTOVER = File.join(ROOT, "script", "cutover")
+
+temporary_root = Dir.exist?("/private/tmp") ? "/private/tmp" : Dir.tmpdir
+Dir.mktmpdir("bpc-", temporary_root) do |dir|
+  database = File.join(dir, "legacy.sqlite")
+  archive = File.join(dir, "archive.json")
+  import_path = File.join(dir, "import.json")
+  sql = <<~SQL
+    CREATE TABLE runs(id text,ticket_id text,status text);
+    CREATE TABLE projects(id text,name text,description text,status text,created_at integer,updated_at integer);
+    CREATE TABLE project_targets(id text,project_id text,target_id text,created_at integer);
+    CREATE TABLE tickets(id text,project_id text,target_id text,title text,description text,status text,created_at integer,updated_at integer);
+    CREATE TABLE ticket_dependencies(id text,ticket_id text,depends_on_ticket_id text,created_at integer);
+    INSERT INTO projects VALUES('project-1','Project','', 'active',1,1);
+    INSERT INTO project_targets VALUES('target-link-1','project-1','target-1',1);
+    INSERT INTO tickets VALUES
+      ('ticket-1','project-1','target-1','Open','', 'open',1,1),
+      ('ticket-2','project-1','target-1','Blocked','', 'blocked',1,1),
+      ('ticket-closed','project-1','target-1','Closed','', 'closed',1,1);
+    INSERT INTO ticket_dependencies VALUES
+      ('dependency-carried','ticket-1','ticket-2',1),
+      ('dependency-satisfied','ticket-1','ticket-closed',1);
+  SQL
+  raise "fixture sqlite failed" unless system("sqlite3", database, sql)
+
+  report = JSON.parse(IO.popen([CUTOVER, "export", database, archive, import_path], &:read))
+  raise "export failed" unless $CHILD_STATUS.success?
+  raise "carried edge count mismatch" unless report["carried_dependencies"] == 1
+  raise "satisfied edge count mismatch" unless report["dropped_satisfied_dependencies"] == 1
+  raise "capacity gate missing" unless report["projected_keys"] <= report["maximum_cutover_keys"]
+
+  bundle = JSON.parse(File.read(import_path))
+  ticket_ids = bundle.fetch("tickets").map { |ticket| ticket.fetch("id") }
+  bundle.fetch("ticket_dependencies").each do |dependency|
+    raise "dangling carried dependency" unless ticket_ids.include?(dependency["ticket_id"]) && ticket_ids.include?(dependency["depends_on_ticket_id"])
+  end
+  raise "satisfied edges leaked into live import" if bundle.key?("satisfied_dependency_edges")
+
+  socket_path = File.join(dir, "hub.sock")
+  server = UNIXServer.new(socket_path)
+  child = fork do
+    projects = []
+    tickets = []
+    targets = []
+    dependencies = []
+    connection = server.accept
+    JSON.parse(connection.gets)
+    connection.puts(JSON.generate(type: "hello", protocol: "botster-hub-daemon-v1"))
+    while (line = connection.gets)
+      request = JSON.parse(line)
+      name = request.fetch("name")
+      arguments = request.fetch("arguments")
+      result = case name
+      when "project_pipelines.create_project"
+        projects << arguments
+        connection.puts(JSON.generate(error: "plugin worker invoke timeout"))
+        next
+      when "project_pipelines.list_projects"
+        { ok: true, projects: projects }
+      when "project_pipelines.add_project_target"
+        targets << arguments
+        { ok: true, project_target: arguments }
+      when "project_pipelines.create_ticket"
+        tickets << arguments
+        { ok: true, ticket: arguments }
+      when "project_pipelines.add_ticket_dependency"
+        dependencies << arguments
+        { ok: true, dependency: arguments }
+      when "project_pipelines.current_context"
+        { ok: true, tickets: tickets, project_targets: targets, ticket_dependencies: dependencies,
+          source_authority: "trybotster/botster-project-pipelines:plugin.lua" }
+      else
+        raise "unexpected tool #{name}"
+      end
+      connection.puts(JSON.generate(plugin_tool_result: result))
+    end
+  end
+  server.close
+
+  output = IO.popen([CUTOVER, "import", socket_path, import_path], &:read)
+  status = $CHILD_STATUS
+  Process.wait(child)
+  raise "resumable import failed: #{output}" unless status.success?
+  imported = JSON.parse(output)
+  raise "authoritative adoption proof missing" unless imported["imported"] == true
+  raise "wrong authority" unless imported["authoritative_source"] == "trybotster/botster-project-pipelines:plugin.lua"
+
+  active_sql = "INSERT INTO runs VALUES('run-active','ticket-1','active')"
+  raise "active fixture insert failed" unless system("sqlite3", database, active_sql)
+  rejected = system(CUTOVER, "export", database, File.join(dir, "rejected-archive.json"), File.join(dir, "rejected-import.json"),
+                    out: File::NULL, err: File::NULL)
+  raise "active-run export must fail closed" if rejected
+
+  legacy_path = File.join(dir, "legacy", "project-pipelines")
+  quarantine_path = File.join(dir, "quarantine", "project-pipelines")
+  FileUtils.mkdir_p(legacy_path)
+  File.write(File.join(legacy_path, "init.lua"), "return {}\n")
+  raise "legacy disable rehearsal failed" unless system(CUTOVER, "disable-legacy", legacy_path, quarantine_path, "--execute", out: File::NULL)
+  raise "legacy authority remained enabled" if File.exist?(legacy_path)
+  raise "legacy quarantine missing" unless File.exist?(quarantine_path)
+  raise "legacy rollback rehearsal failed" unless system(CUTOVER, "restore-legacy", legacy_path, quarantine_path, "--execute", out: File::NULL)
+  raise "legacy rollback did not restore authority" unless File.exist?(File.join(legacy_path, "init.lua"))
+  raise "rollback left two legacy copies" if File.exist?(quarantine_path)
+end
+
+puts "project-pipelines cutover checks passed"

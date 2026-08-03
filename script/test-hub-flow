@@ -9,7 +9,7 @@ require "json"
 ROOT = File.expand_path("..", __dir__)
 # This pin is the merged Hub revision for the contract proven by this package.
 # README.md documents when and how to advance it.
-EXPECTED_HUB_COMMIT = "35e92f46a98c445765b6ba7755e029f5dde702f8"
+EXPECTED_HUB_COMMIT = "11d73d27e01732981e803041ea702aa09db57112"
 
 def required_executable(name)
   path = File.expand_path(ENV.fetch(name) { raise "#{name} must point at an executable" }, ROOT)
@@ -111,7 +111,7 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
       response.fetch("plugin_tool_result")
     end
 
-    artifact = call_tool.call("project_pipelines.record_artifact", {
+    artifact = call_tool.call("project_pipelines.add_artifact", {
       id: "artifact_live_plan_agent",
       run_id: run_id,
       step_id: "botster_stack_plan",

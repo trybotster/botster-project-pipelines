@@ -1,6 +1,6 @@
 {
   "name": "project-pipelines",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "kind": "plugin",
   "botster": ">=0.1.0",
   "source": { "type": "path", "path": "." },
@@ -103,6 +103,10 @@
     {
       "id": "durable_workflow_engine",
       "label": "Durable workflow gates, reviews, findings, questions, and artifacts"
+    },
+    {
+      "id": "atomic_lifecycle_projection",
+      "label": "Atomic ticket, run, and run-step lifecycle projection"
     }
   ]
 }

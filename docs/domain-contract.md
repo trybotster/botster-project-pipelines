@@ -40,7 +40,7 @@ hub-admitted route descriptors and clients.
 Project Pipelines does not create an agent runtime. For a PTY-backed step with a
 `session_template_id`, `session_template_name`/`template_name`, or
 `session_template_capability`/`session_capability`,
-`project_pipelines.activate_step` resolves the Hub template selector and builds a
+`project_pipelines.spawn_ticket_session` resolves the Hub template selector and builds a
 managed-worktree payload. The request carries only semantic caller inputs:
 `template_id`, `target_id`, `branch`, optional environment, and `context`
 containing `prompt`, `ticket_id`, optional `workspace_id`, and metadata.
@@ -62,7 +62,7 @@ Ticket dependencies gate step activation independently of provider
 prerequisites. `ticket.dependency_ticket_ids` is the canonical link set and can
 be changed after a run starts with `project_pipelines.add_ticket_dependency`
 and `project_pipelines.remove_ticket_dependency`; the referenced ticket's
-`open`/`closed` state is changed with `project_pipelines.update_ticket_status`.
+state is changed with `project_pipelines.update_ticket`.
 Every target step is gated by default. Planning steps that must remain usable
 while prerequisites are open declare
 `allows_open_ticket_dependencies: true`; a missing field remains gated so
@@ -70,7 +70,7 @@ persisted legacy delivery definitions fail safe.
 
 Before changing `run.current_step_id`, emitting `step_started`, creating a
 session request, resolving a provider/template, or spawning a session,
-`project_pipelines.activate_step` resolves every referenced ticket. Any ticket
+`project_pipelines.spawn_ticket_session` resolves every referenced ticket. Any ticket
 that is not `closed`, including a missing referenced ticket, persists
 `run.blocked_transition` plus a `ticket_dependencies_blocked` event and returns
 `ok: false` with `error.status: "blocked"`,
@@ -120,13 +120,14 @@ persisted active status or current step.
 Workbench interactions remain renderer-neutral. Tables declare single-row
 selection and row-action metadata, while toolbar and form controls use
 plugin-owned action ids such as `project_pipelines.create_ticket`,
-`project_pipelines.record_run`, and `project_pipelines.activate_step`. CRUD and
+`project_pipelines.start_run`, and `project_pipelines.spawn_ticket_session`. CRUD and
 operator controls must remain structured UiNodes. Raw HTML is not a workbench
 transport, and iframes are reserved for later graph/report surfaces that need a
 custom full-screen visual app with an explicit plugin asset bridge.
 
-No workspace-owned grouping, PR lifecycle mutation, merge workflow, provider
-runtime, notification policy, or `botster-agents` class is added in this pass.
+No workspace-owned grouping, provider runtime, provider authentication client,
+or `botster-agents` class is added. The plugin owns merge-request workflow state
+while provider-specific merge execution remains outside this package.
 
 ## Domain Objects
 
@@ -173,17 +174,17 @@ instead of copied into plugin source files.
 ## Persistence Boundaries
 
 Plugin-owned durable records use the Hub's scoped plugin database capability and
-versioned, prefix-addressable keys (`v2/<family>/<id>`). Mutable runtime records
+versioned, prefix-addressable keys (`v3/<family>/<id>`). Mutable runtime records
 never live under the plugin source tree. The package does not read the retired
-all-domain blob or any catalog/runtime compatibility source. Records are
-independently retryable; counters are reserved before domain writes so an
-interrupted multi-key operation can leave an observable ID gap but cannot reuse
-an ID or overwrite a partially written record. Payload validators reject
-malformed family records, and writes use per-key expected revisions from the
-load snapshot. Session and advance correlation records are written before their
-effects. A retry refuses to redispatch a spawn whose final outcome is unknown
-and reconciles a durable pending advance against the run before returning its
-stored result. The package preflights new keys against the Hub's 1,024-key
+all-domain blob or any catalog/runtime compatibility source. Payload validators
+reject malformed family records. Every mutation is an ordered Hub
+`plugin_db.batch` with expected revisions; failure commits no counter, ticket,
+run, run-step, event, correlation, or entity-visible state. Starting, advancing,
+cancelling, merge-requesting, and closing therefore publish only committed
+ticket/run/run-step projections. Explicit package-owned `entity_provider`
+handlers expose fresh authoritative whole-family snapshots from that committed
+state for initial subscription and reconnect; MCP tool naming is not used as an
+implicit provider contract. The package preflights new keys against the Hub's 1,024-key
 namespace with 64 keys of reserved headroom, returning a structured
 `store_capacity_exhausted` failure before any write.
 

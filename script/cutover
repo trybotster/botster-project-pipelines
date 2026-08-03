@@ -1,0 +1,235 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "fileutils"
+require "open3"
+require "socket"
+
+MAX_CUTOVER_KEYS = 896
+SOURCED_PACKAGE_KEYS = 3
+WORST_CASE_E2E_KEYS = 128
+
+def abort!(message)
+  warn(message)
+  exit 1
+end
+
+def sqlite_json(database, sql)
+  stdout, stderr, status = Open3.capture3("sqlite3", "-json", database, sql)
+  abort!("sqlite query failed: #{stderr}") unless status.success?
+  JSON.parse(stdout.empty? ? "[]" : stdout)
+end
+
+def export_backlog(database)
+  active_runs = sqlite_json(database, "SELECT id, ticket_id, status FROM runs WHERE status = 'active' ORDER BY id")
+  abort!("cutover requires zero active legacy runs; found #{active_runs.length}") unless active_runs.empty?
+
+  tickets = sqlite_json(database, <<~SQL)
+    SELECT id, project_id, target_id, title, description, status, created_at, updated_at
+    FROM tickets WHERE status IN ('open', 'blocked') ORDER BY id
+  SQL
+  ticket_ids = tickets.map { |ticket| ticket.fetch("id") }
+  project_ids = tickets.map { |ticket| ticket.fetch("project_id") }.compact.uniq
+  quoted_projects = project_ids.map { |id| "'" + id.gsub("'", "''") + "'" }.join(",")
+  quoted_tickets = ticket_ids.map { |id| "'" + id.gsub("'", "''") + "'" }.join(",")
+
+  projects = project_ids.empty? ? [] : sqlite_json(database, <<~SQL)
+    SELECT id, name, description, status, created_at, updated_at
+    FROM projects WHERE id IN (#{quoted_projects}) ORDER BY id
+  SQL
+  project_targets = project_ids.empty? ? [] : sqlite_json(database, <<~SQL)
+    SELECT id, project_id, target_id, created_at
+    FROM project_targets WHERE project_id IN (#{quoted_projects}) ORDER BY id
+  SQL
+  dependencies = ticket_ids.empty? ? [] : sqlite_json(database, <<~SQL)
+    SELECT id, ticket_id, depends_on_ticket_id, created_at
+    FROM ticket_dependencies WHERE ticket_id IN (#{quoted_tickets}) ORDER BY id
+  SQL
+
+  migrated = ticket_ids.to_h { |id| [id, true] }
+  carried = []
+  satisfied = []
+  dependencies.each do |dependency|
+    target_id = dependency.fetch("depends_on_ticket_id")
+    if migrated[target_id]
+      carried << dependency
+      next
+    end
+    target = sqlite_json(database, <<~SQL).first
+      SELECT id, status FROM tickets WHERE id = '#{target_id.gsub("'", "''")}'
+    SQL
+    abort!("dependency #{dependency.fetch("id")} targets missing ticket #{target_id}") unless target
+    abort!("dependency #{dependency.fetch("id")} targets non-migrated non-closed ticket #{target_id}") unless target["status"] == "closed"
+    satisfied << dependency.merge("satisfaction" => "closed_before_export")
+  end
+
+  {
+    "format" => "project-pipelines-backlog-v1",
+    "source" => { "kind" => "legacy_sqlite", "database" => File.basename(database) },
+    "projects" => projects,
+    "project_targets" => project_targets,
+    "tickets" => tickets,
+    "ticket_dependencies" => carried,
+    "satisfied_dependency_edges" => satisfied,
+    "active_runs" => active_runs,
+    "history_imported" => false,
+  }
+end
+
+def preflight!(bundle)
+  abort!("unsupported bundle format") unless bundle["format"] == "project-pipelines-backlog-v1"
+  abort!("active runs are forbidden") unless Array(bundle["active_runs"]).empty?
+
+  ticket_ids = Array(bundle["tickets"]).map { |ticket| ticket.fetch("id") }
+  duplicate_ids = ticket_ids.group_by(&:itself).select { |_id, values| values.length > 1 }.keys
+  abort!("duplicate ticket ids: #{duplicate_ids.join(", ")}") unless duplicate_ids.empty?
+  ticket_set = ticket_ids.to_h { |id| [id, true] }
+  dangling = Array(bundle["ticket_dependencies"]).reject do |dependency|
+    ticket_set[dependency["ticket_id"]] && ticket_set[dependency["depends_on_ticket_id"]]
+  end
+  abort!("dangling imported dependency ids: #{dangling.map { |edge| edge["id"] }.join(", ")}") unless dangling.empty?
+
+  imported = %w[projects project_targets tickets ticket_dependencies].sum { |family| Array(bundle[family]).length }
+  receipts = imported
+  projected = SOURCED_PACKAGE_KEYS + imported + receipts + WORST_CASE_E2E_KEYS
+  abort!("capacity preflight failed: projected #{projected} keys exceeds #{MAX_CUTOVER_KEYS}") if projected > MAX_CUTOVER_KEYS
+
+  {
+    "projects" => Array(bundle["projects"]).length,
+    "project_targets" => Array(bundle["project_targets"]).length,
+    "tickets" => Array(bundle["tickets"]).length,
+    "carried_dependencies" => Array(bundle["ticket_dependencies"]).length,
+    "dropped_satisfied_dependencies" => Array(bundle["satisfied_dependency_edges"]).length,
+    "projected_keys" => projected,
+    "maximum_cutover_keys" => MAX_CUTOVER_KEYS,
+  }
+end
+
+class PublicMcp
+  def initialize(socket_path)
+    @socket = UNIXSocket.new(socket_path)
+    @socket.puts(JSON.generate({
+      protocol: "botster-hub-daemon-v1",
+      compatibility: {
+        protocol: "botster-hub-daemon-v1", minimum_protocol_version: 1,
+        required_features: [], minimum_conformance_fixture_revision: 1,
+        client_name: "project-pipelines-cutover"
+      }
+    }))
+    JSON.parse(@socket.gets || abort!("daemon closed before hello"))
+  end
+
+  def call(name, arguments)
+    @socket.puts(JSON.generate(type: "plugin_mcp_call_tool", name: name, arguments: arguments))
+    response = JSON.parse(@socket.gets || raise("ambiguous timeout calling #{name}"))
+    raise(response["error"]) if response["error"]
+    response.fetch("plugin_tool_result")
+  end
+end
+
+def exact_subset?(actual, expected)
+  expected.all? { |key, value| actual[key] == value }
+end
+
+def adopt_or_create(client, create_name, list_name, collection, record)
+  begin
+    response = client.call(create_name, record)
+    return response if response["ok"]
+  rescue StandardError
+    # A public MCP create may have committed before its response timed out.
+  end
+  listed = client.call(list_name, {})
+  existing = Array(listed[collection]).find { |candidate| candidate["id"] == record["id"] }
+  abort!("#{create_name} same-id/different-content conflict for #{record["id"]}") if existing && !exact_subset?(existing, record)
+  return { "ok" => true, "adopted" => true, collection.sub(/s\z/, "") => existing } if existing
+  response = client.call(create_name, record)
+  abort!("#{create_name} failed for #{record["id"]}: #{response.inspect}") unless response["ok"]
+  response
+end
+
+def import_backlog(socket_path, bundle)
+  preflight!(bundle)
+  client = PublicMcp.new(socket_path)
+
+  Array(bundle["projects"]).each do |project|
+    create = {
+      "id" => project["id"], "name" => project["name"], "description" => project["description"],
+      "status" => project["status"], "target_id" => "unassigned"
+    }
+    adopt_or_create(client, "project_pipelines.create_project", "project_pipelines.list_projects", "projects", create)
+  end
+  Array(bundle["project_targets"]).each do |target|
+    response = client.call("project_pipelines.add_project_target", target)
+    abort!("project target import failed: #{response.inspect}") unless response["ok"]
+  end
+  Array(bundle["tickets"]).each do |ticket|
+    adopt_or_create(client, "project_pipelines.create_ticket", "project_pipelines.list_tickets", "tickets", ticket)
+  end
+  Array(bundle["ticket_dependencies"]).each do |dependency|
+    response = client.call("project_pipelines.add_ticket_dependency", dependency)
+    abort!("dependency import failed: #{response.inspect}") unless response["ok"]
+  end
+
+  context = client.call("project_pipelines.current_context", {})
+  imported_ticket_ids = Array(bundle["tickets"]).map { |ticket| ticket["id"] }.sort
+  actual_ticket_ids = Array(context["tickets"]).map { |ticket| ticket["id"] }.select { |id| imported_ticket_ids.include?(id) }.sort
+  abort!("authoritative import verification failed") unless actual_ticket_ids == imported_ticket_ids
+  { "imported" => true, "authoritative_source" => context["source_authority"], "preflight" => preflight!(bundle) }
+end
+
+command = ARGV.shift
+case command
+when "export"
+  database, archive_path, import_path = ARGV
+  abort!("usage: script/cutover export LEGACY_DB ARCHIVE_JSON IMPORT_JSON") unless database && archive_path && import_path
+  bundle = export_backlog(database)
+  report = preflight!(bundle)
+  File.write(archive_path, JSON.pretty_generate(bundle) + "\n")
+  live = bundle.reject { |key, _| key == "satisfied_dependency_edges" }
+  File.write(import_path, JSON.pretty_generate(live) + "\n")
+  puts JSON.pretty_generate(report.merge("archive" => archive_path, "import" => import_path))
+when "preflight"
+  path = ARGV.shift or abort!("usage: script/cutover preflight IMPORT_JSON")
+  puts JSON.pretty_generate(preflight!(JSON.parse(File.read(path))))
+when "import"
+  socket_path, path = ARGV
+  abort!("usage: script/cutover import HUB_SOCKET IMPORT_JSON") unless socket_path && path
+  puts JSON.pretty_generate(import_backlog(socket_path, JSON.parse(File.read(path))))
+when "disable-legacy"
+  legacy_path, quarantine_path, execute = ARGV
+  abort!("usage: script/cutover disable-legacy LEGACY_PATH QUARANTINE_PATH --execute") unless legacy_path && quarantine_path && execute == "--execute"
+  abort!("legacy source is missing: #{legacy_path}") unless File.exist?(legacy_path)
+  abort!("quarantine path already exists: #{quarantine_path}") if File.exist?(quarantine_path)
+  FileUtils.mkdir_p(File.dirname(quarantine_path))
+  FileUtils.mv(legacy_path, quarantine_path)
+  puts JSON.generate(disabled: true, legacy_path: legacy_path, quarantine_path: quarantine_path)
+when "restore-legacy"
+  legacy_path, quarantine_path, execute = ARGV
+  abort!("usage: script/cutover restore-legacy LEGACY_PATH QUARANTINE_PATH --execute") unless legacy_path && quarantine_path && execute == "--execute"
+  abort!("refusing dual authority: legacy path already exists") if File.exist?(legacy_path)
+  abort!("quarantined legacy source is missing: #{quarantine_path}") unless File.exist?(quarantine_path)
+  FileUtils.mkdir_p(File.dirname(legacy_path))
+  FileUtils.mv(quarantine_path, legacy_path)
+  puts JSON.generate(restored: true, legacy_path: legacy_path, quarantine_path: quarantine_path)
+when "plan"
+  package_path = File.expand_path("..", __dir__)
+  puts <<~PLAN
+    Cold cut (execute only after every legacy run is terminal):
+      1. script/cutover export LEGACY_DB ARCHIVE_JSON IMPORT_JSON
+      2. Snapshot the complete legacy registry/plugin/store state.
+      3. Disable the legacy device plugin with:
+         script/cutover disable-legacy LEGACY_PATH QUARANTINE_PATH --execute
+         Remove its registry entry before package execution.
+      4. Through the running daemon owner: packages install --path #{package_path}; packages show project-pipelines; packages enable project-pipelines.
+      5. script/cutover import HUB_SOCKET IMPORT_JSON
+      6. Prove list_plugins package provenance, sourced Botster Stack Delivery, public MCP CRUD, Running Pipelines/entity snapshots, and one fresh E2E run.
+    Rollback is non-destructive only before the first post-verification write:
+      disable/remove the package, restore the single snapshot, then run:
+      script/cutover restore-legacy LEGACY_PATH QUARANTINE_PATH --execute
+      Restart and prove legacy-only authority.
+    After package writes, default to forward repair. Destructive rollback requires an export and explicit loss confirmation.
+  PLAN
+else
+  abort!("usage: script/cutover export|preflight|import|disable-legacy|restore-legacy|plan ...")
+end

@@ -34,7 +34,7 @@ socket.puts(JSON.generate({
   compatibility: {
     protocol: "botster-hub-daemon-v1",
     minimum_protocol_version: 1,
-    required_features: %w[plugin_surface_render plugin_surface_action],
+    required_features: %w[plugin_surface_render plugin_surface_action plugin_entity_subscriptions],
     minimum_conformance_fixture_revision: 1,
     client_name: "botster-project-pipelines-acceptance-smoke"
   }
@@ -58,6 +58,37 @@ def call_tool(socket, name, arguments)
   })
   assert(response["kind"] == "plugin_mcp_tool_result", "#{name} returned #{response["kind"]}")
   response.fetch("plugin_tool_result")
+end
+
+def subscribe_entity_snapshot(socket_path, entity_type, subscription_id)
+  subscription = UNIXSocket.new(socket_path)
+  subscription.puts(JSON.generate({
+    protocol: "botster-hub-daemon-v1",
+    compatibility: {
+      protocol: "botster-hub-daemon-v1",
+      minimum_protocol_version: 1,
+      required_features: ["plugin_entity_subscriptions"],
+      minimum_conformance_fixture_revision: 1,
+      client_name: "botster-project-pipelines-entity-acceptance"
+    }
+  }))
+  JSON.parse(subscription.gets || raise("daemon closed before entity hello"))
+  subscription.puts(JSON.generate({
+    type: "subscribe_entities",
+    entity_type: entity_type,
+    subscription_id: subscription_id
+  }))
+  accepted = JSON.parse(subscription.gets || raise("daemon closed before entity subscription response"))
+  assert(accepted["kind"] == "entity_subscribed", "#{entity_type} subscription was not admitted: #{accepted.inspect}")
+  frame = Timeout.timeout(5) do
+    JSON.parse(subscription.gets || raise("daemon closed before #{entity_type} snapshot"))
+  end
+  assert(frame["type"] == "entity_snapshot", "#{entity_type} did not return an authoritative snapshot")
+  assert(frame["subscription_id"] == subscription_id, "#{entity_type} subscription identity mismatch")
+  assert(frame["entity_type"] == entity_type, "#{entity_type} snapshot family mismatch")
+  frame
+ensure
+  subscription&.close
 end
 
 def render_surface(socket)
@@ -157,6 +188,8 @@ if restart_verification
   assert(initial_context.fetch("checklists").any?, "checklist did not survive Hub restart")
   assert(initial_context.fetch("pr_links").any?, "PR link did not survive Hub restart")
   render_surface(socket)
+  restart_snapshot = subscribe_entity_snapshot(socket_path, "project-pipelines.run", "project-pipelines-run-after-restart")
+  assert(restart_snapshot.fetch("items") == initial_context.fetch("runs"), "reconnect snapshot disagrees with authoritative restarted context")
   puts "script/hub_acceptance_smoke: restart persistence verified"
   exit 0
 end
@@ -187,6 +220,15 @@ assert(create_form, "rendered surface missing create ticket form")
 assert(create_button && record_button && activate_button, "rendered surface missing dialog toolbar buttons")
 assert(filter_button, "rendered surface missing filter button")
 assert(project_table, "rendered surface missing project table")
+bound_families = []
+each_node(surface) do |node|
+  bound_families << node["source"].delete_prefix("/") if node["$kind"] == "bind_list"
+end
+%w[project ticket run session_request].each do |family|
+  assert(bound_families.include?("project-pipelines.#{family}"), "surface missing admitted #{family} entity binding")
+end
+project_snapshot = subscribe_entity_snapshot(socket_path, "project-pipelines.project", "project-pipelines-project-initial")
+assert(project_snapshot.fetch("items") == call_tool(socket, "project_pipelines.current_context", {}).fetch("projects"), "project snapshot disagrees with committed context")
 
 create_action_id = create_form.dig("props", "action", "id")
 filter_action_id = filter_button.dig("props", "action", "id")
@@ -288,10 +330,10 @@ assert(selected && selected.dig("predicate", "value") == workspace_id, "selected
 assert(selected.dig("node", "props", "text") == "Workspace Live contract project selected", "selected workspace copy must derive from product data")
 
 run_id = "run_live_authority"
-run = call_tool(socket, "project_pipelines.record_run", {
+run = call_tool(socket, "project_pipelines.start_run", {
   id: run_id,
   ticket_id: ticket_id,
-  pipeline_definition_id: "botster_stack_delivery",
+  pipeline_id: "botster_stack_delivery",
   spawn_target_id: "tgt_71266a8d976d4535902ffed09c18a7ba",
   branch: "project-pipelines/live-authority",
   base_ref: "main",
@@ -305,7 +347,7 @@ blocked_plan = call_tool(socket, "project_pipelines.request_step_advance", {
 })
 assert(blocked_plan["ok"] == false && blocked_plan.dig("error", "code") == "transition_blocked", "missing Plan evidence must block")
 
-plan_activation = call_tool(socket, "project_pipelines.activate_step", {
+plan_activation = call_tool(socket, "project_pipelines.spawn_ticket_session", {
   run_id: run_id,
   step_id: "botster_stack_plan",
   request_id: "session_request_live_downstream_plan",
@@ -376,7 +418,7 @@ review_advance = call_tool(socket, "project_pipelines.request_step_advance", {
 })
 assert(review_advance["ok"] == true && review_advance["step_id"] == "botster_stack_implement", "approved review did not advance")
 
-call_tool(socket, "project_pipelines.record_artifact", {
+call_tool(socket, "project_pipelines.add_artifact", {
   id: "artifact_live_report",
   run_id: run_id,
   step_id: "botster_stack_implement",
@@ -396,7 +438,7 @@ call_tool(socket, "project_pipelines.add_checklist_item", {
   text: "Repository charter and targeted notes constrained the work",
   status: "completed"
 })
-question = call_tool(socket, "project_pipelines.record_question", {
+question = call_tool(socket, "project_pipelines.ask_human", {
   id: "question_live_authority",
   run_id: run_id,
   ticket_id: ticket_id,
@@ -439,5 +481,10 @@ assert(final_context.fetch("findings").any? { |record| record["run_id"] == run_i
 assert(final_context.fetch("questions").any? { |record| record["run_id"] == run_id && record["status"] == "answered" }, "answered question missing")
 assert(final_context.fetch("pr_links").count { |record| record["run_id"] == run_id } == 1, "PR link missing")
 assert(final_context.fetch("questions").none? { |record| record["question"].to_s.downcase.include?("routing") }, "downstream Plan asked a repository routing question")
+initial_run_snapshot = subscribe_entity_snapshot(socket_path, "project-pipelines.run", "project-pipelines-run-initial")
+reconnect_run_snapshot = subscribe_entity_snapshot(socket_path, "project-pipelines.run", "project-pipelines-run-reconnect")
+assert(initial_run_snapshot.fetch("items") == final_context.fetch("runs"), "initial run snapshot disagrees with committed context")
+assert(reconnect_run_snapshot.fetch("items") == final_context.fetch("runs"), "reconnect run snapshot disagrees with committed context")
+assert(reconnect_run_snapshot.fetch("snapshot_seq") == initial_run_snapshot.fetch("snapshot_seq") + 1, "reconnect must invoke a fresh run provider snapshot")
 
 puts "script/hub_acceptance_smoke: ok project_id=#{project_id} ticket_id=#{ticket_id} client_authored_kind=submit"

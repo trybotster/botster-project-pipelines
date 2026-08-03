@@ -2,63 +2,6 @@
 set -eu
 
 npm test
-
-python3 - <<'PY'
-import json
-from pathlib import Path
-
-manifest_path = Path("botster-package.json")
-manifest = json.loads(manifest_path.read_text())
-
-assert manifest["name"] == "project-pipelines"
-assert manifest["kind"] == "plugin"
-assert manifest["botster"].startswith(">=")
-assert manifest["source"] == {"type": "path", "path": "."}
-assert manifest["entrypoints"] == [
-    {"runtime": "lua", "path": "plugin.lua", "bootstrap": False}
-]
-plugin_source = Path("plugin.lua").read_text()
-assert "require(" not in plugin_source
-assert "botster.register" in plugin_source
-assert "tree_update" not in plugin_source
-assert "props.open" not in plugin_source
-assert "arguments and arguments.status" not in plugin_source
-assert "arguments and (arguments.row_id" not in plugin_source
-assert 'or (action_id .. "-request")' not in plugin_source
-assert [group["id"] for group in manifest["configuration"]["groups"]] == ["defaults", "integrations"]
-assert [field["key"] for field in manifest["configuration"]["fields"]] == [
-    "default_spawn_target_id",
-    "default_session_template_selector",
-    "default_pipeline_mode",
-    "workspace_id",
-]
-assert manifest["navigation"] == [
-    {
-        "id": "pipelines",
-        "label": "Pipelines",
-        "icon": "queue-list",
-        "description": "Open the Project Pipelines operator workbench.",
-        "target": {"kind": "surface", "surface_id": "project-pipelines.home"},
-    }
-]
-
-surfaces = {surface["id"]: surface for surface in manifest["surfaces"]}
-assert surfaces["project-pipelines.home"]["kind"] == "app"
-assert surfaces["project-pipelines.settings"]["kind"] == "settings"
-assert surfaces["project-pipelines.home"]["supports"] == ["render", "action"]
-assert surfaces["project-pipelines.settings"]["supports"] == ["render"]
-for surface in surfaces.values():
-    assert "path" not in surface
-    assert "route" not in surface
-    assert "route_path" not in surface
-assert {capability["surface"] for capability in manifest["capabilities"]} == {
-    "surfaces",
-    "mcp",
-    "plugin_db",
-    "session_actions",
-}
-PY
-
 python3 -m json.tool botster-package.json >/dev/null
 python3 -m json.tool fixtures/project_pipelines/domain_contract.json >/dev/null
 
@@ -67,1982 +10,305 @@ import json
 from pathlib import Path
 
 manifest = json.loads(Path("botster-package.json").read_text())
-contract = json.loads(Path("fixtures/project_pipelines/domain_contract.json").read_text())
-docs = Path("docs/domain-contract.md").read_text()
-
-assert contract["contract_version"] == 2
-assert contract["fixture_role"] == {
-    "authority": "schema_example_only",
-    "production_source": "plugin.lua",
-    "source_revision": "botster-stack-delivery/2026-07-28.6",
+source = Path("plugin.lua").read_text()
+assert manifest["name"] == "project-pipelines"
+assert manifest["entrypoints"] == [{"runtime": "lua", "path": "plugin.lua", "bootstrap": False}]
+assert {capability["surface"] for capability in manifest["capabilities"]} == {
+    "surfaces", "mcp", "plugin_db", "session_actions"
 }
-anchors = contract["manifest_anchors"]
-assert anchors["package_name"] == manifest["name"]
-assert anchors["capabilities"] == [capability["surface"] for capability in manifest["capabilities"]]
-assert anchors["entrypoint"] == manifest["entrypoints"][0]["path"]
-assert anchors["configuration"] == {
-    "groups": [group["id"] for group in manifest["configuration"]["groups"]],
-    "fields": [field["key"] for field in manifest["configuration"]["fields"]],
-}
-assert anchors["navigation"] == {
-    "pipelines": {
-        "label": "Pipelines",
-        "target_surface": "project-pipelines.home",
-    }
-}
-
-surfaces = {surface["id"]: surface for surface in manifest["surfaces"]}
-assert anchors["surfaces"] == {
-    "home": "project-pipelines.home",
-    "settings": "project-pipelines.settings",
-}
-assert anchors["route_contract"] == {
-    "manifest": "surface_ids_and_navigation_intent",
-    "home": "project-pipelines.home",
-    "settings": "project-pipelines.settings",
-    "path_support": "hub_admitted_route_descriptors",
-}
-assert anchors["surfaces"]["home"] in surfaces
-assert anchors["surfaces"]["settings"] in surfaces
-for surface in surfaces.values():
-    assert "path" not in surface
-    assert "route" not in surface
-    assert "route_path" not in surface
-assert anchors["runtime"] == "session_template_lua_plugin"
-
-required_domain_objects = {
-    "project",
-    "ticket",
-    "pipeline_definition",
-    "step",
-    "gate",
-    "artifact",
-    "checklist",
-    "gate_result",
-    "review",
-    "finding",
-    "question",
-    "answer",
-    "run",
-    "session_request",
-    "pr_link",
-    "provider_lifecycle_boundary",
-    "event",
-}
-assert required_domain_objects <= set(contract["domain_objects"])
-
-projects = {project["id"]: project for project in contract["projects"]}
-tickets = {ticket["id"]: ticket for ticket in contract["tickets"]}
-pipelines = {pipeline["id"]: pipeline for pipeline in contract["pipeline_definitions"]}
-runs = {run["id"]: run for run in contract["runs"]}
-session_requests = {request["id"]: request for request in contract["session_requests"]}
-artifacts = {artifact["id"]: artifact for artifact in contract["artifacts"]}
-questions = {question["id"]: question for question in contract["questions"]}
-gate_ids = {
-    gate["id"]
-    for pipeline in pipelines.values()
-    for step in pipeline["steps"]
-    for gate in step["gates"]
-}
-step_ids = {
-    step["id"]
-    for pipeline in pipelines.values()
-    for step in pipeline["steps"]
-}
-
-assert any(project["mode"] == "standalone" and project["workspace_id"] is None for project in projects.values())
-assert any(project["mode"] == "workspace_linked" and project["workspace_id"] for project in projects.values())
-
-for project in projects.values():
-    assert project["repository"]["id"]
-    assert project["repository"]["name"]
-    assert project["repository"]["remote"].startswith("https://example.invalid/")
-    assert project["spawn_target_id"]
-
-for ticket in tickets.values():
-    assert ticket["project_id"] in projects
-    if ticket["workspace_id"] is not None:
-        assert projects[ticket["project_id"]]["workspace_id"] == ticket["workspace_id"]
-    for dependency_id in ticket["dependency_ticket_ids"]:
-        assert dependency_id in tickets
-
-for pipeline in pipelines.values():
-    assert pipeline["project_id"] in projects
-    positions = [step["position"] for step in pipeline["steps"]]
-    assert positions == sorted(positions)
-    assert positions[0] == 1
-    assert pipeline["steps"][0]["allows_open_ticket_dependencies"] is True
-
-for run in runs.values():
-    assert run["ticket_id"] in tickets
-    assert run["pipeline_definition_id"] in pipelines
-    assert run["current_step_id"] in step_ids
-    assert run["worktree"]["kind"] == "provider_owned_reference"
-    ticket = tickets[run["ticket_id"]]
-    if ticket["workspace_id"] is None:
-        assert run["workspace_session_group_id"] is None
-    else:
-        assert run["workspace_session_group_id"]
-        assert run["workspace_id"]
-    blocked_transition = run.get("blocked_transition")
-    if blocked_transition:
-        assert blocked_transition["code"] == "ticket_dependencies_unmet"
-        assert blocked_transition["ticket_id"] == run["ticket_id"]
-        assert blocked_transition["step_id"] in step_ids
-        assert blocked_transition["unmet_dependencies"]
-        for dependency in blocked_transition["unmet_dependencies"]:
-            assert dependency["dependency_ticket_id"] in tickets
-            assert dependency["status"] == "open"
-
-for request in session_requests.values():
-    assert request["run_id"] in runs
-    assert request["step_id"] in step_ids
-    assert request["ticket_id"] in tickets
-    assert request["status"] in {"spawn_requested", "blocked"}
-    assert request["template_selector"]
-    if request["status"] == "spawn_requested":
-        assert request["template_id"]
-        assert request["session_id"]
-        assert request["result"]["session_id"] == request["session_id"]
-        assert request["result"]["template_id"] == request["template_id"]
-        assert request["result"]["context_id"]
-    else:
-        assert request["diagnostic"]["status"] == "blocked"
-        assert request["diagnostic"]["code"]
-        assert request["result"]["ok"] is False
-        assert request["result"]["error"]["status"] == "blocked"
-    daemon_request = request["request"]
-    if request["status"] == "spawn_requested":
-        assert set(daemon_request) == {"template_id", "session_id", "target_id", "cwd", "environment", "context"}
-        assert daemon_request["template_id"] == request["template_id"]
-        assert daemon_request["session_id"] == request["session_id"]
-    else:
-        assert set(daemon_request) == {"target_id", "cwd", "environment", "context"}
-    assert daemon_request["target_id"]
-    context = daemon_request["context"]
-    for field in ["worktree_path", "repo_path", "branch_name", "prompt", "ticket_id", "workspace_id", "metadata"]:
-        assert field in context
-    assert context["ticket_id"] == request["ticket_id"]
-    assert context["metadata"]["owner_plugin"] == "project-pipelines"
-
-for result in contract["gate_results"]:
-    assert result["run_id"] in runs
-    assert result["step_id"] in step_ids
-    assert result["gate_id"] in gate_ids
-    assert result["evidence_artifact_id"] in artifacts
-
-for artifact in artifacts.values():
-    assert artifact["run_id"] in runs
-    assert artifact["step_id"] in step_ids
-
-for finding in contract["findings"]:
-    assert finding["run_id"] in runs
-    assert finding["step_id"] in step_ids
-
-for question in questions.values():
-    assert question["run_id"] in runs
-    assert question["ticket_id"] in tickets
-
-for answer in contract["answers"]:
-    assert answer["question_id"] in questions
-
-for pr_link in contract["pr_links"]:
-    assert pr_link["run_id"] in runs
-    assert pr_link["ticket_id"] in tickets
-    assert pr_link["provider"] == "generic_pr_provider"
-
-for event in contract["events"]:
-    assert event["run_id"] in runs
-    assert event["kind"] in {
-        "ticket_created",
-        "ticket_dependency_added",
-        "ticket_dependency_removed",
-        "ticket_status_updated",
-        "ticket_dependencies_blocked",
-        "run_started",
-        "step_started",
-        "step_activation_preserved",
-        "session_template_spawn_requested",
-        "session_template_spawn_failed",
-        "session_template_spawn_blocked",
-        "gate_submitted",
-        "artifact_added",
-        "finding_opened",
-        "question_asked",
-        "answer_recorded",
-        "provider_pr_linked",
-        "provider_pr_ready_for_review",
-        "provider_pr_merged",
-        "run_completed",
-    }
-
-assert contract["persistence_boundaries"]["runtime_storage_namespace"] == "v2/<family>/<id>"
-assert "botster-workspaces" in contract["provider_capabilities"][0]["forbidden_runtime_imports"]
-assert "botster-agents" in contract["provider_capabilities"][0]["forbidden_runtime_imports"]
-assert "github" in contract["provider_capabilities"][0]["forbidden_runtime_imports"]
-assert "codex" in contract["provider_capabilities"][0]["forbidden_runtime_imports"]
-
-required_doc_phrases = [
-    "standalone",
-    "workspace-linked mode is additive",
-    "Provider Capability Contract",
-    "v2/<family>/<id>",
-    "project-pipelines.home",
-    "project-pipelines.settings",
-    "navigation",
-    "surface ids",
-    "hub-admitted route descriptors",
-    "route path fields",
-    "project-pipelines-provider-dependency-status",
-    "session_templates.ensure_worktree_and_spawn",
-    "session_templates.resolve",
-    "session_templates.list",
-    "session_template_spawn_blocked",
-    "status: \"blocked\"",
-    "github_auth",
-    "managed-worktree payload",
-    "plugin database capability",
-]
-for phrase in required_doc_phrases:
-    assert phrase in docs
-PY
-
-python3 - <<'PY'
-import re
-from pathlib import Path
-
-patterns = [
-    re.compile("/" + "Users" + "/"),
-    re.compile("jason" + "conigliari", re.IGNORECASE),
-    re.compile(r"[A-Za-z0-9._%+-]+" + "@" + r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
-]
-paths = [
-    Path(".gitignore"),
-    Path("README.md"),
-    Path("botster-package.json"),
-    Path("plugin.lua"),
-    Path("script/test"),
-    Path("docs/domain-contract.md"),
-    Path("fixtures/project_pipelines/domain_contract.json"),
-]
-
-for path in paths:
-    text = path.read_text()
-    for pattern in patterns:
-        if pattern.search(text):
-            raise SystemExit(f"PII-like content found in {path}")
-PY
-
-python3 - <<'PY'
-from pathlib import Path
-
-runtime_files = [
-    path
-    for path in Path(".").rglob("*")
-    if path.is_file()
-    and ".git" not in path.parts
-    and path.parts[:2] != ("fixtures", "project_pipelines")
-]
-
-for path in runtime_files:
-    text = path.read_text(errors="ignore")
-    if path == Path("script/test") or path.suffix == ".md":
-        continue
-    forbidden_markers = [
-        "require('github",
-        'require("github',
-        "require('codex",
-        'require("codex',
-        "require('botster-workspaces",
-        'require("botster-workspaces',
-        "require('botster-agents",
-        'require("botster-agents',
-        "github.com/",
-        "api.github.com",
-    ]
-    for marker in forbidden_markers:
-        if marker in text:
-            raise SystemExit(f"Provider/workspace implementation marker found in {path}: {marker}")
+assert "require(" not in source
+assert "plugin_db.batch" in source
+assert 'STORE_ROOT = "v3/"' in source
 PY
 
 lua_test="$(mktemp "${TMPDIR:-/tmp}/botster-project-pipelines-test.XXXXXX")"
 trap 'rm -f "$lua_test"' EXIT HUP INT TERM
+
 cat > "$lua_test" <<'LUA'
-package.path = "./?.lua;./?/init.lua;" .. package.path
-
 local durable_store = {}
-local fail_set_key_prefix = nil
-local conflict_set_key_prefix = nil
+local fail_batch_key_prefix = nil
 
-local function deep_copy(value)
+local function copy(value)
   if type(value) ~= "table" then return value end
   local result = {}
-  for key, nested in pairs(value) do
-    result[key] = deep_copy(nested)
-  end
+  for key, nested in pairs(value) do result[key] = copy(nested) end
   return result
 end
 
-local spawned_session_templates = {}
-local session_template_resolution_calls = 0
-local fail_next_spawn_error = nil
-local session_template_registry = {
-  { id = "template_codex_runtime", name = "Codex Runtime", capabilities = { "codex", "implementation" } },
-  { id = "template_workspace_runtime", name = "Workspace Runtime", capabilities = { "workspace" } },
-  { id = "template_named_runtime", name = "Named Runtime", capabilities = { "named" } },
-  { id = "template_capability_runtime", name = "Capability Runtime", capabilities = { "specialized.review" } },
-}
+local function list(args)
+  local entries = {}
+  for key, record in pairs(durable_store) do
+    if not args.prefix or key:sub(1, #args.prefix) == args.prefix then
+      table.insert(entries, { key = key, schema_version = record.schema_version, revision = record.revision })
+    end
+  end
+  table.sort(entries, function(left, right) return left.key < right.key end)
+  return { entries = entries }
+end
 
+local function batch(args)
+  local candidate = copy(durable_store)
+  local results = {}
+  local seen = {}
+  for index, mutation in ipairs(args.mutations or {}) do
+    local key = mutation.key
+    if fail_batch_key_prefix and key and key:sub(1, #fail_batch_key_prefix) == fail_batch_key_prefix then
+      return { ok = false, error_kind = "backend_failed", message = "injected batch failure", mutation_index = index, key = key }
+    end
+    if not key or seen[key] then
+      return { ok = false, error_kind = "invalid_request", message = "invalid or duplicate key", mutation_index = index, key = key }
+    end
+    seen[key] = true
+    local previous = candidate[key]
+    local actual_revision = previous and previous.revision or 0
+    if mutation.expected_revision ~= actual_revision then
+      return { ok = false, error_kind = "revision_conflict", message = "revision conflict", mutation_index = index, key = key }
+    end
+    if mutation.operation == "delete" then
+      if not previous then
+        return { ok = false, error_kind = "store_not_found", message = "record missing", mutation_index = index, key = key }
+      end
+      candidate[key] = nil
+      table.insert(results, { operation = "delete", key = key, revision = actual_revision + 1 })
+    elseif mutation.operation == "set" then
+      local record = {
+        key = key, schema_version = mutation.schema_version or 1,
+        revision = actual_revision + 1, payload = copy(mutation.payload),
+      }
+      candidate[key] = record
+      table.insert(results, { operation = "set", record = copy(record) })
+    else
+      return { ok = false, error_kind = "invalid_request", message = "unsupported operation", mutation_index = index, key = key }
+    end
+  end
+  durable_store = candidate
+  return { ok = true, results = results }
+end
+
+local spawned = {}
 botster = {
   capabilities = {
     plugin_db = {
       get = function(args)
         local record = durable_store[args.key]
-        if record == nil then
-          return {}
-        end
-        return { record = deep_copy(record) }
+        return record and { record = copy(record) } or {}
       end,
-      set = function(args)
-        if fail_set_key_prefix and args.key:sub(1, #fail_set_key_prefix) == fail_set_key_prefix then
-          error("injected write interruption for " .. args.key)
-        end
-        local previous = durable_store[args.key]
-        if conflict_set_key_prefix
-          and args.key:sub(1, #conflict_set_key_prefix) == conflict_set_key_prefix
-          and previous
-        then
-          previous.revision = previous.revision + 1
-          conflict_set_key_prefix = nil
-        end
-        local expected_revision = args.expected_revision
-        local actual_revision = previous and previous.revision or 0
-        if expected_revision ~= nil and expected_revision ~= actual_revision then
-          error("revision conflict for " .. args.key)
-        end
-        durable_store[args.key] = {
-          key = args.key,
-          schema_version = args.schema_version,
-          revision = previous and (previous.revision + 1) or 1,
-          payload = deep_copy(args.payload),
-        }
-        return { ok = true, record = deep_copy(durable_store[args.key]) }
-      end,
-      list = function(args)
-        local entries = {}
-        for key, record in pairs(durable_store) do
-          if args.prefix == nil or key:sub(1, #args.prefix) == args.prefix then
-            table.insert(entries, {
-              key = key,
-              schema_version = record.schema_version,
-              revision = record.revision,
-            })
-          end
-        end
-        table.sort(entries, function(left, right) return left.key < right.key end)
-        return { entries = entries }
-      end,
-      delete = function(args)
-        durable_store[args.key] = nil
-        return { ok = true }
-      end,
+      list = list,
+      batch = batch,
     },
+    config = { get = function() return { values = {} } end },
     session_templates = {
-      resolve = function(selector)
-        session_template_resolution_calls = session_template_resolution_calls + 1
-        assert(type(selector) == "table", "session_templates.resolve must receive one selector table")
-        if selector.kind == "name" then
-          for _, template in ipairs(session_template_registry) do
-            if template.name == selector.template_name then
-              return deep_copy(template)
-            end
-          end
-        elseif selector.kind == "capability" then
-          for _, template in ipairs(session_template_registry) do
-            for _, capability in ipairs(template.capabilities or {}) do
-              if capability == selector.capability then
-                return deep_copy(template)
-              end
-            end
-          end
-        end
-        return { ok = false, error = { code = "session_template_unavailable", message = "no matching test template" } }
-      end,
       list = function()
-        session_template_resolution_calls = session_template_resolution_calls + 1
-        return { templates = deep_copy(session_template_registry) }
+        return { templates = { { id = "template_codex", name = "Codex", capabilities = { "codex" } } } }
       end,
-      test_managed_spawn = function(args)
-        assert(type(args) == "table", "managed session template fixture must receive one request table")
-        assert(
-          args.template_id == "template_codex_runtime"
-            or args.template_id == "template_workspace_runtime"
-            or args.template_id == "template_named_runtime"
-            or args.template_id == "template_capability_runtime",
-          "spawn request must carry template_id"
-        )
-        assert(args.session_id == nil or type(args.session_id) == "string", "spawn request session_id must be optional string")
-        assert(type(args.target_id) == "string" and args.target_id ~= "", "spawn request must carry target_id")
-        assert(type(args.context) == "table", "spawn request must carry context")
-        assert(
-          args.context.ticket_id == "ticket_runtime_one"
-            or args.context.ticket_id == "ticket_runtime_workspace",
-          "spawn context must carry ticket_id"
-        )
-        assert(type(args.context.metadata) == "table", "spawn context must carry metadata")
-        for key, value in pairs(args.environment or {}) do
-          assert(type(key) == "string" and type(value) == "string", "spawn environment must be string keyed string values")
-        end
-        for key, value in pairs(args.context.metadata) do
-          assert(type(key) == "string" and type(value) == "string", "spawn metadata must be string keyed string values")
-        end
-        if fail_next_spawn_error then
-          local message = fail_next_spawn_error
-          fail_next_spawn_error = nil
-          error(message)
-        end
-        table.insert(spawned_session_templates, deep_copy(args))
-        return {
-          session_id = args.session_id or "session_from_hub_" .. tostring(#spawned_session_templates),
-          lifecycle = "spawned",
-          template_id = args.template_id,
-          context_id = "context_from_hub_" .. tostring(#spawned_session_templates),
-          context_keys = { "ticket_id", "metadata" },
-        }
+      spawn = function(args)
+        table.insert(spawned, copy(args))
+        return { ok = true, result = { request_id = args.request_id, session_uuid = "session-" .. tostring(#spawned) } }
       end,
     },
   },
-  register = function(spec)
-    return spec
-  end,
+  register = function(spec) return spec end,
 }
-
-botster.capabilities.session_templates.ensure_worktree_and_spawn = function(args)
-  assert(type(args.branch) == "string" and args.branch ~= "", "managed spawn must carry branch")
-  assert(args.context.branch_name == nil, "managed spawn must not smuggle trusted branch_name")
-  assert(args.context.worktree_path == nil, "managed spawn must not smuggle trusted worktree_path")
-  local result = botster.capabilities.session_templates.test_managed_spawn(args)
-  return {
-    ok = true,
-    result = {
-      session_id = result.session_id,
-      lifecycle = result.lifecycle,
-      template_id = result.template_id,
-      context_id = result.context_id,
-      target_id = args.target_id,
-      branch = args.branch,
-      worktree_path = "worktree://managed/" .. args.branch,
-    },
-  }
-end
 
 local plugin = dofile("plugin.lua")
-assert(type(plugin) == "table", "plugin.lua must return a registration table")
-assert(type(plugin.tools) == "table" and #plugin.tools >= 14, "plugin must register CRUD/context/entity/activation tools")
-assert(type(plugin.handlers) == "table" and #plugin.handlers == 7, "plugin must register app/settings surfaces and workbench actions")
-
 local tools = {}
-for _, tool in ipairs(plugin.tools) do
-  tools[tool.name] = tool.call
+for _, descriptor in ipairs(plugin.tools) do
+  assert(not tools[descriptor.name], "duplicate tool " .. descriptor.name)
+  tools[descriptor.name] = descriptor.call
 end
-local handlers = {}
-local surface_routes = 0
-local ui_actions = 0
-for _, handler in ipairs(plugin.handlers) do
-  handlers[handler.descriptor_id] = handler.call
-  if handler.kind == "surface_route" then surface_routes = surface_routes + 1 end
-  if handler.kind == "ui_action" then ui_actions = ui_actions + 1 end
-end
-assert(surface_routes == 2, "plugin must register app and settings surface routes")
-assert(ui_actions == 5, "plugin must register every declared workbench ui_action")
-assert(handlers["project_pipelines.create_ticket"] ~= nil, "create ticket ui_action must be wired")
-assert(handlers["project_pipelines.record_run"] ~= nil, "record run ui_action must be wired")
-assert(handlers["project_pipelines.activate_step"] ~= nil, "activate step ui_action must be wired")
-assert(handlers["project_pipelines.filter"] ~= nil, "filter ui_action must be wired")
-assert(handlers["project_pipelines.select_row"] ~= nil, "select row ui_action must be wired")
 
-local initialized_context = tools["project_pipelines.current_context"]({})
-local sourced_pipelines = 0
-local stack_delivery = nil
-for _, definition in ipairs(initialized_context.pipeline_definitions) do
-  if definition.source_id == "botster_stack_delivery" then
-    sourced_pipelines = sourced_pipelines + 1
-    stack_delivery = definition
-  end
-end
-assert(sourced_pipelines == 1, "empty store must initialize exactly one sourced Stack Delivery pipeline")
-assert(stack_delivery.source_authority == "trybotster/botster-project-pipelines:plugin.lua", "standalone plugin source must be authoritative")
-assert(#stack_delivery.steps == 6, "Stack Delivery must initialize each sourced step exactly once")
-local finding_policy_gate_prompts = {
-  botster_stack_plan_review = "Submit an approved plan review with no open blocker/high findings.",
-  botster_stack_review = "Submit an approved review with no open blocker/high findings.",
+local required = {
+  "add_artifact", "add_checklist_item", "add_project_target", "add_ticket_dependency",
+  "answer_question", "ask_agent", "ask_human", "cancel_run",
+  "checklist_instructions", "claim_question_orchestrator", "close_ticket",
+  "create_checklist", "create_child_run", "create_gate", "create_pipeline",
+  "create_project", "create_step", "create_ticket", "create_vault_checklist",
+  "current_context", "delete_gate", "delete_pipeline", "delete_project",
+  "delete_step", "delete_ticket", "escalate_question", "get_checklist",
+  "get_pipeline", "get_pr_link", "get_project", "get_ticket", "link_pr",
+  "list_agent_choices", "list_checklists", "list_pipelines", "list_pr_links",
+  "list_projects", "list_ticket_dependencies", "list_tickets",
+  "question_orchestrator_status", "receive_question_answers",
+  "release_question_orchestrator", "remove_project_target",
+  "remove_ticket_dependency", "request_merge", "request_step_advance",
+  "resolve_finding", "retry_step_agent", "search_tickets",
+  "spawn_ticket_session", "start_run", "submit_gate", "submit_review",
+  "update_checklist", "update_checklist_item", "update_gate",
+  "update_pipeline", "update_project", "update_step", "update_step_agent",
+  "update_ticket",
 }
-local checked_finding_policy_gates = 0
-for _, step in ipairs(stack_delivery.steps) do
-  local expected_prompt = finding_policy_gate_prompts[step.id]
-  if expected_prompt then
-    assert(
-      step.gates[1] and step.gates[1].prompt == expected_prompt,
-      "sourced " .. step.name .. " gate prompt must match the blocker/high transition policy"
-    )
-    checked_finding_policy_gates = checked_finding_policy_gates + 1
-  end
+for _, name in ipairs(required) do
+  assert(tools["project_pipelines." .. name], "missing required tool " .. name)
 end
-assert(
-  checked_finding_policy_gates == 2,
-  "every sourced gate that states finding policy must be checked"
-)
-local expected_routes = {
-  ["botster-core"] = "[[botster-core-playbook]]",
-  ["botster-hub"] = "[[botster-hub-playbook]]",
-  ["botster-hub-client"] = "[[botster-hub-client-playbook]]",
-  ["botster-web"] = "[[botster-web-playbook]]",
-  ["botster-tui"] = "[[botster-tui-playbook]]",
-  ["botster-tui-kit"] = "[[botster-tui-kit-playbook]]",
-  ["botster-workspaces"] = "[[botster-workspaces-playbook]]",
-  ["botster-terminal-ghostty"] = "[[botster-terminal-ghostty-playbook]]",
-  ["trybotster/botster-project-pipelines"] = "[[project-pipelines-playbook]]",
+local retired = {
+  "activate_step", "define_pipeline", "list_pipeline_definitions",
+  "show_pipeline_definition", "record_run", "record_artifact",
+  "record_question", "update_ticket_status", "show_project", "show_ticket",
 }
-for repository, playbook in pairs(expected_routes) do
-  local route = tools["project_pipelines.resolve_repository_playbook"]({ repository = repository })
-  assert(route.ok and route.playbook == playbook, repository .. " must resolve exactly one charter")
+for _, name in ipairs(retired) do
+  assert(not tools["project_pipelines." .. name], "retired tool remains " .. name)
 end
-local function assert_managed_prompt_routes(prompt, label)
-  assert(type(prompt) == "string" and #prompt > 500, label .. " must receive the full composed prompt")
-  for repository, playbook in pairs(expected_routes) do
-    assert(prompt:find(playbook, 1, true), label .. " must carry the " .. repository .. " charter")
-  end
-  assert(
-    prompt:find("Zero or multiple matches require a routing question; never substitute a generic charter or load every charter.", 1, true),
-    label .. " must carry the routing failure guard"
-  )
-end
-for _, excluded in ipairs({ "trybotster/restty", "Ghostty" }) do
-  assert(tools["project_pipelines.resolve_repository_playbook"]({ repository = excluded }).ok == false, excluded .. " must remain outside the explicit routing allowlist")
-end
-assert(tools["project_pipelines.resolve_repository_playbook"]({ repository = "botster-core", path = "plugin.lua" }).ok == false, "multiple routing matches must require a question")
-
-local empty_home = handlers["project-pipelines.home"]({})
-local empty_home_sections = {}
-for _, child in ipairs(empty_home.children) do
-  if child.id then empty_home_sections[child.id] = child end
-end
-assert(empty_home_sections["project-pipelines-workbench"].children[1].type == "table", "empty workbench must still render project table")
-assert(empty_home_sections["project-pipelines-workbench"].children[1].props.rows == nil, "empty table rows must be omitted so Lua does not serialize an empty map")
-assert(empty_home_sections["project-pipelines-workbench"].children[1].props.empty_state.type == "empty_state", "empty table must carry empty_state primitive")
+assert(tools["project_pipelines.resolve_repository_playbook"])
+assert(tools["project_pipelines.entities"])
+assert(#plugin.tools == #required + 2, "descriptor set must be closed")
 
 local project = tools["project_pipelines.create_project"]({
-  id = "proj_runtime_standalone",
-  name = "Runtime Standalone",
-  repository = {
-    id = "repo_runtime_standalone",
-    name = "example/runtime-standalone",
-    remote = "https://example.invalid/runtime-standalone.git",
-  },
-  spawn_target_id = "spawn_target_runtime",
+  id = "project-one", name = "Project One", target_id = "target-one",
 })
-assert(project.ok and project.project.workspace_id == nil, "standalone project create failed")
-
-local linked = tools["project_pipelines.create_project"]({
-  id = "proj_runtime_workspace",
-  name = "Runtime Workspace",
-  repository_id = "repo_runtime_workspace",
-  repository_name = "example/runtime-workspace",
-  repository_remote = "https://example.invalid/runtime-workspace.git",
-  spawn_target_id = "spawn_target_runtime_workspace",
-  workspace_id = "workspace_runtime_alpha",
-})
-assert(linked.ok and linked.project.workspace_id == "workspace_runtime_alpha", "workspace project create failed")
-
-local ticket = tools["project_pipelines.create_ticket"]({
-  id = "ticket_runtime_one",
-  project_id = "proj_runtime_standalone",
-  title = "Runtime ticket",
-})
-assert(ticket.ok and ticket.ticket.project_id == "proj_runtime_standalone", "ticket create failed")
-assert(durable_store["v2/projects/proj_runtime_standalone"].revision == 1, "ticket mutation must not rewrite unchanged project records")
-
-local pipeline = tools["project_pipelines.define_pipeline"]({
-  id = "pipeline_runtime",
-  project_id = "proj_runtime_standalone",
-  name = "Runtime Delivery",
+assert(project.ok)
+assert(tools["project_pipelines.add_project_target"]({
+  project_id = "project-one", target_id = "target-one",
+}).ok)
+assert(tools["project_pipelines.create_pipeline"]({
+  id = "pipeline-two-step", name = "Two Step",
   steps = {
-    { id = "step_plan", name = "Plan", position = 1, gates = {
-      { id = "gate_plan", kind = "attestation", prompt = "Plan is reviewable." },
-    } },
-    { id = "step_implement", name = "Implement", position = 2, kind = "pty", session_template_id = "template_codex_runtime", prompt = "Implement the ticket.", gates = {
-      { id = "gate_tests", kind = "command", prompt = "Run script/test.", command = "script/test" },
-    } },
-    { id = "step_named", name = "Named", position = 3, kind = "pty", session_template_name = "Named Runtime", gates = {} },
-    { id = "step_capability", name = "Capability", position = 4, kind = "pty", session_template_capability = "specialized.review", gates = {} },
-    { id = "step_manual", name = "Manual", position = 5, kind = "manual", session_template_id = "template_must_not_spawn", gates = {} },
+    { id = "step-one", name = "One", next_step_id = "step-two" },
+    { id = "step-two", name = "Two" },
   },
+}).ok)
+
+assert(tools["project_pipelines.create_ticket"]({
+  id = "dependency-open", project_id = "project-one", title = "Dependency",
+}).ok)
+assert(tools["project_pipelines.create_ticket"]({
+  id = "ticket-blocked", project_id = "project-one", target_id = "target-one", title = "Blocked",
+}).ok)
+assert(tools["project_pipelines.add_ticket_dependency"]({
+  ticket_id = "ticket-blocked", depends_on_ticket_id = "dependency-open",
+}).ok)
+local blocked = tools["project_pipelines.start_run"]({
+  id = "run-blocked", ticket_id = "ticket-blocked", pipeline_id = "pipeline-two-step",
 })
-assert(pipeline.ok and #pipeline.pipeline_definition.steps == 5, "pipeline definition failed")
+assert(not blocked.ok and blocked.error.code == "ticket_dependencies_unmet")
+assert(tools["project_pipelines.update_ticket"]({ ticket_id = "dependency-open", status = "closed" }).ok)
 
-local run = tools["project_pipelines.record_run"]({
-  id = "run_runtime_one",
-  ticket_id = "ticket_runtime_one",
-  pipeline_definition_id = "pipeline_runtime",
-  repository = { id = "repo_runtime_standalone", name = "example/runtime-standalone", remote = "https://example.invalid/runtime-standalone.git", path = "repo://runtime-standalone" },
-  spawn_target_id = "spawn_target_runtime_override",
-  branch = "project-pipelines/runtime-test",
-  worktree = { kind = "provider_owned_reference", id = "worktree_runtime_one", path = "worktree://runtime-one" },
+fail_batch_key_prefix = "v3/run_steps/"
+local failed = tools["project_pipelines.start_run"]({
+  id = "run-atomic", ticket_id = "ticket-blocked", pipeline_id = "pipeline-two-step",
 })
-assert(run.ok and run.run.current_step_id == "step_plan", "run record failed")
+assert(not failed.ok and failed.error.code == "persist_failed")
+local after_failure = tools["project_pipelines.current_context"]({})
+local failed_ticket
+for _, ticket in ipairs(after_failure.tickets) do if ticket.id == "ticket-blocked" then failed_ticket = ticket end end
+assert(failed_ticket.status == "open", "failed atomic start must not activate ticket")
+for _, run in ipairs(after_failure.runs) do assert(run.id ~= "run-atomic", "failed atomic start must not create run") end
 
-local manual_activation = tools["project_pipelines.activate_step"]({
-  run_id = "run_runtime_one",
-  step_id = "step_manual",
+fail_batch_key_prefix = nil
+local started = tools["project_pipelines.start_run"]({
+  id = "run-atomic", ticket_id = "ticket-blocked", pipeline_id = "pipeline-two-step",
 })
-assert(manual_activation.ok and manual_activation.activation.spawned == false, "manual step must not spawn a session template")
-
-local pty_activation = tools["project_pipelines.activate_step"]({
-  run_id = "run_runtime_one",
-  step_id = "step_implement",
-  request_id = "session_request_runtime_one",
-  prompt = "Runtime prompt body",
-  environment = { STRING_VALUE = "kept", NUMBER_VALUE = 1 },
-  metadata = { role = "implement", ignored = { "not scalar" }, numeric = 1, boolean = true },
+assert(started.ok and started.ticket.status == "active")
+assert(started.run.current_run_step_id == started.run_step.id)
+assert(#tools["project_pipelines.get_ticket"]({ ticket_id = "ticket-blocked" }).runs == 1)
+local checklist = tools["project_pipelines.create_checklist"]({
+  id = "checklist-one", run_id = "run-atomic", owner_id = "run-atomic", name = "Proof",
+  items = { { id = "item-one", prompt = "Verify atomic start" } },
 })
-assert(pty_activation.ok and pty_activation.activation.status == "spawn_requested", "PTY activation should request a hub session template spawn")
-assert(pty_activation.activation.session_id == "session_from_hub_1", "managed PTY activation should persist the Hub-owned session id")
-assert(pty_activation.activation.context_id == "context_from_hub_1", "PTY activation should store returned context id")
-
-local named_activation = tools["project_pipelines.activate_step"]({
-  run_id = "run_runtime_one",
-  step_id = "step_named",
-  request_id = "session_request_runtime_named",
+assert(checklist.ok)
+assert(#tools["project_pipelines.get_checklist"]({ checklist_id = "checklist-one" }).items == 1)
+assert(tools["project_pipelines.update_checklist_item"]({ item_id = "item-one", status = "done", evidence = { command = "script/test" } }).ok)
+assert(tools["project_pipelines.add_artifact"]({ run_id = "run-atomic", kind = "report", summary = "Atomic proof" }).ok)
+local question = tools["project_pipelines.ask_human"]({ run_id = "run-atomic", ticket_id = "ticket-blocked", question = "Continue?" })
+assert(question.ok)
+assert(tools["project_pipelines.answer_question"]({ question_id = question.question.id, answer = "Yes" }).ok)
+assert(#tools["project_pipelines.receive_question_answers"]({ all = true }).answers == 1)
+local review = tools["project_pipelines.submit_review"]({
+  run_id = "run-atomic", step_id = "step-one", verdict = "approved",
+  findings = { { id = "finding-one", title = "Carry forward", severity = "medium" } },
 })
-assert(named_activation.ok and named_activation.activation.status == "spawn_requested", "template-name activation should request a hub session template spawn")
-assert(named_activation.activation.template_id == "template_named_runtime", "template-name activation should resolve the template id")
-assert(named_activation.activation.template_selector.kind == "name", "template-name activation should persist selector metadata")
-
-local capability_activation = tools["project_pipelines.activate_step"]({
-  run_id = "run_runtime_one",
-  step_id = "step_capability",
-  request_id = "session_request_runtime_capability",
+assert(review.ok)
+assert(tools["project_pipelines.resolve_finding"]({ finding_id = "finding-one", resolution = "Verified" }).ok)
+local advanced = tools["project_pipelines.request_step_advance"]({
+  run_id = "run-atomic", request_id = "advance-once",
 })
-assert(capability_activation.ok and capability_activation.activation.status == "spawn_requested", "template-capability activation should request a hub session template spawn")
-assert(capability_activation.activation.template_id == "template_capability_runtime", "template-capability activation should resolve the template id")
-assert(capability_activation.activation.template_selector.kind == "capability", "template-capability activation should persist selector metadata")
+assert(advanced.ok and advanced.step_id == "step-two")
+local advanced_context = tools["project_pipelines.current_context"]({ run_id = "run-atomic" })
+assert(#advanced_context.run_steps == 2)
+assert(advanced_context.runs[1].current_step_id == "step-two")
+assert(tools["project_pipelines.cancel_run"]({ run_id = "run-atomic" }).ticket.status == "open")
 
-local linked_ticket = tools["project_pipelines.create_ticket"]({
-  id = "ticket_runtime_workspace",
-  project_id = "proj_runtime_workspace",
-  workspace_id = "workspace_runtime_alpha",
-  title = "Runtime workspace ticket",
+local restarted = tools["project_pipelines.start_run"]({
+  id = "run-close", ticket_id = "ticket-blocked", pipeline_id = "pipeline-two-step",
 })
-assert(linked_ticket.ok, "workspace ticket create failed")
+assert(restarted.ok)
+local closed = tools["project_pipelines.close_ticket"]({ ticket_id = "ticket-blocked" })
+assert(closed.ok and closed.ticket.status == "closed")
+local closed_context = tools["project_pipelines.current_context"]({ run_id = "run-close" })
+assert(closed_context.runs[1].status == "closed")
 
-local function action_request(request_id, action_id, node_id, kind, values, payload)
-  return {
-    request_id = request_id,
-    surface_id = "project-pipelines.home",
-    action_id = action_id,
-    node_id = node_id,
-    kind = kind or "submit",
-    values = values,
-    payload = payload,
-  }
-end
-
-local before_dialog_open = tools["project_pipelines.current_context"]({})
-for _, dialog in ipairs({
-  {
-    action_id = "project_pipelines.create_ticket",
-    node_id = "project-pipelines-toolbar-create-ticket",
-    key = "project-pipelines.create-ticket-dialog",
-  },
-  {
-    action_id = "project_pipelines.record_run",
-    node_id = "project-pipelines-toolbar-record-run",
-    key = "project-pipelines.record-run-dialog",
-  },
-  {
-    action_id = "project_pipelines.activate_step",
-    node_id = "project-pipelines-toolbar-activate-step",
-    key = "project-pipelines.activate-step-dialog",
-  },
-}) do
-  local opened = handlers[dialog.action_id](action_request(
-    dialog.action_id .. "-open",
-    dialog.action_id,
-    dialog.node_id,
-    "submit",
-    nil,
-    { intent = "open_dialog" }
-  ))
-  assert(opened.state == "accepted", dialog.action_id .. " toolbar action must open its dialog")
-  assert(opened.presentation[1].kind == "set", dialog.action_id .. " toolbar action must set presentation")
-  assert(opened.presentation[1].key == dialog.key, dialog.action_id .. " toolbar action must set its scoped dialog key")
-  assert(opened.presentation[1].value == true, dialog.action_id .. " toolbar action must make its dialog key present")
-  assert(opened.replacement == nil, dialog.action_id .. " toolbar open must not emit a replacement")
-end
-local after_dialog_open = tools["project_pipelines.current_context"]({})
-assert(#after_dialog_open.tickets == #before_dialog_open.tickets, "opening dialogs must not mutate tickets")
-assert(#after_dialog_open.runs == #before_dialog_open.runs, "opening dialogs must not mutate runs")
-assert(#after_dialog_open.events == #before_dialog_open.events, "opening dialogs must not create workflow events")
-
-local invalid_values = {
-  project_id = "proj_runtime_standalone",
-  title = "   ",
-}
-local invalid_ticket_action = handlers["project_pipelines.create_ticket"](action_request(
-  "invalid-ticket-action",
-  "project_pipelines.create_ticket",
-  "project-pipelines-create-ticket-form",
-  "submit",
-  invalid_values
-))
-assert(invalid_ticket_action.state == "rejected", "invalid create_ticket ui_action must reject")
-assert(invalid_ticket_action.request_id == "invalid-ticket-action", "invalid create_ticket request id must be preserved")
-assert(invalid_ticket_action.surface_id == "project-pipelines.home", "invalid create_ticket surface id must be preserved")
-assert(invalid_ticket_action.action_id == "project_pipelines.create_ticket", "invalid create_ticket action id must be preserved")
-assert(invalid_ticket_action.node_id == "project-pipelines-create-ticket-form", "invalid create_ticket node id must be preserved")
-assert(invalid_ticket_action.field_errors["project-pipelines-create-ticket-title"][1] == "title is required", "invalid create_ticket ui_action must expose stable field error")
-assert(invalid_ticket_action.normalized_values.title == "   ", "invalid create_ticket ui_action must retain submitted title")
-assert(invalid_ticket_action.normalized_values.project_id == "proj_runtime_standalone", "invalid create_ticket ui_action must retain submitted project")
-assert(invalid_ticket_action.presentation == nil, "rejected create_ticket must not emit presentation effects")
-assert(invalid_ticket_action.replacement == nil, "rejected create_ticket must not emit replacement effects")
-
-local valid_ticket_action = handlers["project_pipelines.create_ticket"](action_request(
-  "valid-ticket-action",
-  "project_pipelines.create_ticket",
-  "project-pipelines-create-ticket-form",
-  "submit",
-  {
-    id = "ticket_runtime_action",
-    project_id = "proj_runtime_standalone",
-    title = "Runtime action ticket",
-  },
-  { title = "payload title must not be used" }
-))
-assert(valid_ticket_action.state == "accepted", "valid create_ticket ui_action must accept")
-assert(valid_ticket_action.payload.ok == true, "valid create_ticket ui_action must include tool payload")
-assert(valid_ticket_action.payload.ticket.id == "ticket_runtime_action", "valid create_ticket ui_action must persist ticket")
-assert(valid_ticket_action.payload.ticket.title == "Runtime action ticket", "create_ticket ui_action must read form values")
-assert(valid_ticket_action.presentation[1].kind == "clear", "create_ticket ui_action must close its dialog")
-assert(valid_ticket_action.presentation[1].key == "project-pipelines.create-ticket-dialog", "create_ticket ui_action must clear the scoped dialog key")
-assert(valid_ticket_action.replacement.id == "project-pipelines-created-ticket", "create_ticket ui_action must return the smallest ticket replacement")
-
-local record_run_action = handlers["project_pipelines.record_run"](action_request(
-  "record-run-action",
-  "project_pipelines.record_run",
-  "project-pipelines-record-run-form",
-  "submit",
-  {
-    id = "run_runtime_action",
-    ticket_id = "ticket_runtime_one",
-    pipeline_definition_id = "pipeline_runtime",
-  }
-))
-assert(record_run_action.state == "accepted", "record_run ui_action must accept canonical values")
-assert(record_run_action.payload.run.id == "run_runtime_action", "record_run ui_action must persist the requested run")
-assert(record_run_action.presentation[1].key == "project-pipelines.record-run-dialog", "record_run ui_action must close its dialog")
-assert(record_run_action.replacement.id == "project-pipelines-recorded-run", "record_run ui_action must return a direct replacement")
-
-local activate_step_action = handlers["project_pipelines.activate_step"](action_request(
-  "activate-step-action",
-  "project_pipelines.activate_step",
-  "project-pipelines-action-feedback",
-  "submit",
-  {
-    run_id = "run_runtime_action",
-    step_id = "step_manual",
-  }
-))
-assert(activate_step_action.state == "accepted", "activate_step ui_action must accept canonical values")
-assert(activate_step_action.payload.activation.status == "preserved_non_pty", "activate_step ui_action must pass form values to the tool")
-assert(activate_step_action.presentation[1].key == "project-pipelines.activate-step-dialog", "activate_step ui_action must close its dialog")
-assert(activate_step_action.replacement.id == "project-pipelines-activated-step", "activate_step ui_action must return a direct replacement")
-
-local before_non_submit = tools["project_pipelines.current_context"]({})
-for _, kind in ipairs({ "reset", "validate", "cancel" }) do
-  local mutation_requests = {
-    {
-      handler = "project_pipelines.create_ticket",
-      node_id = "project-pipelines-create-ticket-form",
-      values = { id = "ticket_must_not_exist_" .. kind, project_id = "proj_runtime_standalone", title = "Must not exist" },
-    },
-    {
-      handler = "project_pipelines.record_run",
-      node_id = "project-pipelines-record-run-form",
-      values = { id = "run_must_not_exist_" .. kind, ticket_id = "ticket_runtime_one", pipeline_definition_id = "pipeline_runtime" },
-    },
-    {
-      handler = "project_pipelines.activate_step",
-      node_id = "project-pipelines-action-feedback",
-      values = { run_id = "run_runtime_action", step_id = "step_implement" },
-    },
-  }
-  for _, mutation in ipairs(mutation_requests) do
-    local result = handlers[mutation.handler](action_request(
-      mutation.handler .. "-" .. kind,
-      mutation.handler,
-      mutation.node_id,
-      kind,
-      mutation.values
-    ))
-    assert(result.state == "rejected", mutation.handler .. " must reject " .. kind)
-    assert(result.presentation == nil and result.replacement == nil, mutation.handler .. " non-submit rejection must not emit effects")
-    assert(type(result.normalized_values) == "table", mutation.handler .. " must retain non-submit form values")
-    for key, value in pairs(mutation.values) do
-      assert(result.normalized_values[key] == value, mutation.handler .. " must retain submitted " .. key)
-    end
-    for key, value in pairs(result.normalized_values) do
-      assert(mutation.values[key] == value, mutation.handler .. " must not invent normalized " .. key)
-    end
-  end
-end
-local after_non_submit = tools["project_pipelines.current_context"]({})
-assert(#after_non_submit.tickets == #before_non_submit.tickets, "non-submit create requests must not mutate tickets")
-assert(#after_non_submit.runs == #before_non_submit.runs, "non-submit record/activate requests must not mutate runs")
-assert(#after_non_submit.session_requests == #before_non_submit.session_requests, "non-submit activate requests must not create session requests")
-assert(#after_non_submit.events == #before_non_submit.events, "non-submit mutation requests must not create events")
-
-local filter_action = handlers["project_pipelines.filter"](action_request(
-  "filter-action",
-  "project_pipelines.filter",
-  "project-pipelines-toolbar-filter-running",
-  "submit",
-  { status = "values must not be used" },
-  { status = "active" }
-))
-assert(filter_action.state == "accepted", "filter ui_action must accept")
-assert(filter_action.payload.filter == "active", "filter ui_action must echo filter payload")
-assert(filter_action.presentation[1].kind == "set", "filter ui_action must set scoped presentation state")
-assert(filter_action.presentation[1].key == "project-pipelines.filter", "filter ui_action must use the scoped filter key")
-assert(filter_action.presentation[1].value == "active", "filter ui_action must use non-form payload")
-assert(filter_action.normalized_values == nil, "filter ui_action must not treat payload as form values")
-
-local select_row_action = handlers["project_pipelines.select_row"](action_request(
-  "select-row-action",
-  "project_pipelines.select_row",
-  nil,
-  "submit",
-  { row_id = "values must not be used" },
-  { row_id = "workspace_runtime_alpha" }
-))
-assert(select_row_action.state == "accepted", "select row ui_action must accept")
-assert(select_row_action.payload.row_id == "workspace_runtime_alpha", "select row ui_action must echo selected row payload")
-assert(select_row_action.node_id == nil, "select row ui_action must preserve absent node identity")
-assert(select_row_action.presentation[1].key == "selected-workspace", "select row ui_action must set selected-workspace presentation")
-assert(select_row_action.presentation[1].value == "workspace_runtime_alpha", "select row ui_action must set selected workspace from payload")
-
-local legacy_ok = pcall(handlers["project_pipelines.create_ticket"], {
-  request_id = "legacy-flat-action",
-  project_id = "proj_runtime_standalone",
-  title = "Legacy flat action",
-})
-assert(legacy_ok == false, "legacy flat-only ui_action calls must be rejected")
-
-local linked_pipeline = tools["project_pipelines.define_pipeline"]({
-  id = "pipeline_runtime_workspace",
-  project_id = "proj_runtime_workspace",
-  name = "Runtime Workspace Delivery",
-  steps = {
-    { id = "step_workspace_pty", name = "Workspace PTY", position = 1, kind = "pty", session_template_id = "template_workspace_runtime", gates = {} },
-  },
-})
-assert(linked_pipeline.ok, "workspace pipeline definition failed")
-
-local linked_run = tools["project_pipelines.record_run"]({
-  id = "run_runtime_workspace",
-  ticket_id = "ticket_runtime_workspace",
-  pipeline_definition_id = "pipeline_runtime_workspace",
-  workspace_id = "workspace_runtime_alpha",
-  branch = "project-pipelines/workspace-runtime-test",
-  worktree = { kind = "provider_owned_reference", id = "worktree_runtime_workspace" },
-})
-assert(linked_run.ok, "workspace run record failed")
-
-local linked_activation = tools["project_pipelines.activate_step"]({
-  run_id = "run_runtime_workspace",
-  step_id = "step_workspace_pty",
-  request_id = "session_request_runtime_workspace",
-})
-assert(linked_activation.ok and linked_activation.activation.status == "spawn_requested", "workspace-linked activation should use hub session template spawn")
-assert(linked_activation.activation.session_id == "session_from_hub_4", "workspace-linked activation should store returned session id")
-
-assert(#spawned_session_templates == 4, "only PTY-backed steps should spawn session templates")
-local first_spawn = spawned_session_templates[1]
-assert(first_spawn.template_id == "template_codex_runtime", "first spawn should use implement template")
-assert(first_spawn.session_id == nil, "managed spawn must not supply a trusted session_id")
-assert(first_spawn.target_id == "spawn_target_runtime_override", "first spawn should pass target_id")
-assert(first_spawn.context.ticket_id == "ticket_runtime_one", "first spawn should pass ticket_id")
-assert(spawned_session_templates[2].template_id == "template_named_runtime", "second spawn should use resolved name template")
-assert(spawned_session_templates[3].template_id == "template_capability_runtime", "third spawn should use resolved capability template")
-local spawned_context = tools["project_pipelines.current_context"]({})
-assert(spawned_context.ok and #spawned_context.session_requests == 4, "spawned session requests must be persisted")
-local standalone_request = nil
-local named_request = nil
-local capability_request = nil
-local workspace_request = nil
-for _, request in ipairs(spawned_context.session_requests) do
-  if request.id == "session_request_runtime_one" then standalone_request = request end
-  if request.id == "session_request_runtime_named" then named_request = request end
-  if request.id == "session_request_runtime_capability" then capability_request = request end
-  if request.id == "session_request_runtime_workspace" then workspace_request = request end
-end
-assert(standalone_request and named_request and capability_request and workspace_request, "persisted request ids must remain addressable")
-assert(standalone_request.status == "spawn_requested", "standalone request should record spawn-requested status")
-assert(standalone_request.result.lifecycle == "spawned", "standalone request should record real hub spawn lifecycle")
-assert(standalone_request.result.template_id == "template_codex_runtime", "standalone request should record returned template_id")
-assert(standalone_request.template_id == "template_codex_runtime", "first request should use implement template")
-assert(standalone_request.session_id == "session_from_hub_1", "Hub-owned session id should be preserved for correlation")
-assert(standalone_request.request.template_id == "template_codex_runtime", "persisted request should carry template_id")
-assert(standalone_request.request.session_id == nil, "managed request must not carry caller-owned session_id")
-assert(standalone_request.request.target_id == "spawn_target_runtime_override", "request must use DaemonSessionTemplateRequest target_id")
-assert(standalone_request.request.environment.STRING_VALUE == "kept", "environment string values should be kept")
-assert(standalone_request.request.environment.NUMBER_VALUE == nil, "environment non-string values should be dropped")
-assert(standalone_request.request.context.ticket_id == "ticket_runtime_one", "request context must use ticket_id")
-assert(standalone_request.request.branch == "project-pipelines/runtime-test", "managed request must carry semantic branch")
-assert(standalone_request.request.context.branch_name == nil, "managed request must not carry trusted branch_name")
-assert(standalone_request.request.context.prompt == "Runtime prompt body", "request context must use prompt")
-assert(standalone_request.request.context.metadata.owner_plugin == "project-pipelines", "request context metadata must include owner_plugin")
-assert(standalone_request.request.context.metadata.role == "implement", "request context metadata must keep string caller metadata")
-assert(standalone_request.request.context.metadata.ignored == nil, "request context metadata must drop table values")
-assert(standalone_request.request.context.metadata.numeric == nil, "request context metadata must drop numeric values")
-assert(standalone_request.request.context.metadata.boolean == nil, "request context metadata must drop boolean values")
-assert(standalone_request.request.context.workspace_id == nil, "standalone spawn context should omit workspace_id")
-assert(named_request.template_id == "template_named_runtime", "name selector request should persist resolved template_id")
-assert(named_request.template_selector.template_name == "Named Runtime", "name selector request should persist selector name")
-assert(capability_request.template_id == "template_capability_runtime", "capability selector request should persist resolved template_id")
-assert(capability_request.template_selector.capability == "specialized.review", "capability selector request should persist selector capability")
-assert(workspace_request.template_id == "template_workspace_runtime", "second request should use workspace template")
-assert(workspace_request.status == "spawn_requested", "workspace request should record spawn-requested status")
-assert(workspace_request.request.context.workspace_id == "workspace_runtime_alpha", "workspace spawn context should carry optional workspace_id")
-
-botster.capabilities.provider_dependencies = {
-  check = function(dependency)
-    assert(dependency.provider == "github", "provider dependency checker should receive provider")
-    assert(dependency.dependency == "github_auth", "provider dependency checker should receive dependency")
-    return { ok = true, available = true }
-  end,
-}
-
-local provider_available_pipeline = tools["project_pipelines.define_pipeline"]({
-  id = "pipeline_runtime_provider_available",
-  project_id = "proj_runtime_standalone",
-  name = "Runtime Provider Available Delivery",
-  steps = {
-    { id = "step_provider_available", name = "Provider Available", position = 1, kind = "pty", session_template_id = "template_codex_runtime", required_provider_dependencies = {
-      { provider = "github", dependency = "github_auth" },
-    }, gates = {} },
-  },
-})
-assert(provider_available_pipeline.ok, "provider-available pipeline definition failed")
-
-local provider_available_run = tools["project_pipelines.record_run"]({
-  id = "run_runtime_provider_available",
-  ticket_id = "ticket_runtime_one",
-  pipeline_definition_id = "pipeline_runtime_provider_available",
-  repository = { id = "repo_runtime_standalone", name = "example/runtime-standalone", remote = "https://example.invalid/runtime-standalone.git", path = "repo://runtime-standalone" },
-  spawn_target_id = "spawn_target_runtime_override",
-  branch = "project-pipelines/provider-available-test",
-  worktree = { kind = "provider_owned_reference", id = "worktree_runtime_provider_available", path = "worktree://runtime-provider-available" },
-})
-assert(provider_available_run.ok, "provider-available run record failed")
-
-local provider_available_activation = tools["project_pipelines.activate_step"]({
-  run_id = "run_runtime_provider_available",
-  step_id = "step_provider_available",
-  request_id = "session_request_runtime_provider_available",
-})
-assert(provider_available_activation.ok and provider_available_activation.activation.status == "spawn_requested", "available provider dependency should not block spawn")
-assert(provider_available_activation.activation.template_id == "template_codex_runtime", "available provider dependency should preserve id selector")
-assert(#spawned_session_templates == 5, "available provider dependency should spawn one session template")
-
-botster.capabilities.provider_dependencies = nil
-
-local blocked_provider_pipeline = tools["project_pipelines.define_pipeline"]({
-  id = "pipeline_runtime_provider_blocked",
-  project_id = "proj_runtime_standalone",
-  name = "Runtime Provider Blocked Delivery",
-  steps = {
-    { id = "step_provider_blocked", name = "Provider Blocked", position = 1, kind = "pty", session_template_id = "template_codex_runtime", required_provider_dependencies = {
-      { provider = "github", dependency = "github_auth" },
-    }, gates = {} },
-  },
-})
-assert(blocked_provider_pipeline.ok, "provider-blocked pipeline definition failed")
-
-local blocked_provider_run = tools["project_pipelines.record_run"]({
-  id = "run_runtime_provider_blocked",
-  ticket_id = "ticket_runtime_one",
-  pipeline_definition_id = "pipeline_runtime_provider_blocked",
-  repository = { id = "repo_runtime_standalone", name = "example/runtime-standalone", remote = "https://example.invalid/runtime-standalone.git", path = "repo://runtime-standalone" },
-  spawn_target_id = "spawn_target_runtime_override",
-  branch = "project-pipelines/provider-blocked-test",
-  worktree = { kind = "provider_owned_reference", id = "worktree_runtime_provider_blocked", path = "worktree://runtime-provider-blocked" },
-})
-assert(blocked_provider_run.ok, "provider-blocked run record failed")
-
-local blocked_provider_activation = tools["project_pipelines.activate_step"]({
-  run_id = "run_runtime_provider_blocked",
-  step_id = "step_provider_blocked",
-  request_id = "session_request_runtime_provider_blocked",
-})
-assert(blocked_provider_activation.ok == false, "missing provider dependency should block before spawn")
-assert(blocked_provider_activation.error.status == "blocked", "missing provider dependency should return blocked status")
-assert(blocked_provider_activation.error.code == "provider_dependency_missing", "missing provider dependency should use provider_dependency_missing")
-assert(blocked_provider_activation.error.provider == "github", "missing provider dependency should preserve provider")
-assert(blocked_provider_activation.error.dependency == "github_auth", "missing provider dependency should preserve dependency")
-
-local original_resolve = botster.capabilities.session_templates.resolve
-local original_list = botster.capabilities.session_templates.list
-botster.capabilities.session_templates.resolve = nil
-botster.capabilities.session_templates.list = nil
-
-local unsupported_selector_pipeline = tools["project_pipelines.define_pipeline"]({
-  id = "pipeline_runtime_unsupported_selector",
-  project_id = "proj_runtime_standalone",
-  name = "Runtime Unsupported Selector Delivery",
-  steps = {
-    { id = "step_unsupported_selector", name = "Unsupported Selector", position = 1, kind = "pty", session_template_name = "Named Runtime", gates = {} },
-  },
-})
-assert(unsupported_selector_pipeline.ok, "unsupported-selector pipeline definition failed")
-
-local unsupported_selector_run = tools["project_pipelines.record_run"]({
-  id = "run_runtime_unsupported_selector",
-  ticket_id = "ticket_runtime_one",
-  pipeline_definition_id = "pipeline_runtime_unsupported_selector",
-  repository = { id = "repo_runtime_standalone", name = "example/runtime-standalone", remote = "https://example.invalid/runtime-standalone.git", path = "repo://runtime-standalone" },
-  spawn_target_id = "spawn_target_runtime_override",
-  branch = "project-pipelines/unsupported-selector-test",
-  worktree = { kind = "provider_owned_reference", id = "worktree_runtime_unsupported_selector", path = "worktree://runtime-unsupported-selector" },
-})
-assert(unsupported_selector_run.ok, "unsupported-selector run record failed")
-
-local unsupported_selector_activation = tools["project_pipelines.activate_step"]({
-  run_id = "run_runtime_unsupported_selector",
-  step_id = "step_unsupported_selector",
-  request_id = "session_request_runtime_unsupported_selector",
-})
-assert(unsupported_selector_activation.ok == false, "missing template resolution support should block before spawn")
-assert(unsupported_selector_activation.error.status == "blocked", "missing template resolution support should return blocked status")
-assert(unsupported_selector_activation.error.code == "session_template_resolution_unavailable", "missing template resolution support should use resolution-unavailable code")
-assert(unsupported_selector_activation.error.template_selector.template_name == "Named Runtime", "missing template resolution support should preserve selector")
-
-botster.capabilities.session_templates.resolve = original_resolve
-botster.capabilities.session_templates.list = original_list
-
-local blocked_context = tools["project_pipelines.current_context"]({})
-assert(blocked_context.ok and #blocked_context.session_requests == 7, "blocked session requests must be persisted")
-local provider_available_request = nil
-local provider_blocked_request = nil
-local unsupported_selector_request = nil
-for _, request in ipairs(blocked_context.session_requests) do
-  if request.id == "session_request_runtime_provider_available" then provider_available_request = request end
-  if request.id == "session_request_runtime_provider_blocked" then provider_blocked_request = request end
-  if request.id == "session_request_runtime_unsupported_selector" then unsupported_selector_request = request end
-end
-assert(provider_available_request.status == "spawn_requested", "available provider dependency request should persist spawn-requested status")
-assert(provider_available_request.template_selector.template_id == "template_codex_runtime", "available provider dependency request should persist id selector")
-assert(provider_blocked_request.status == "blocked", "provider dependency request should persist blocked status")
-assert(provider_blocked_request.diagnostic.code == "provider_dependency_missing", "provider dependency request should persist diagnostic code")
-assert(provider_blocked_request.diagnostic.provider == "github", "provider dependency request should persist diagnostic provider")
-assert(provider_blocked_request.diagnostic.dependency == "github_auth", "provider dependency request should persist diagnostic dependency")
-assert(unsupported_selector_request.status == "blocked", "unsupported selector request should persist blocked status")
-assert(unsupported_selector_request.diagnostic.code == "session_template_resolution_unavailable", "unsupported selector request should persist diagnostic code")
-assert(#spawned_session_templates == 5, "blocked activations must not spawn session templates")
-
-local failing_pipeline = tools["project_pipelines.define_pipeline"]({
-  id = "pipeline_runtime_failure",
-  project_id = "proj_runtime_standalone",
-  name = "Runtime Failure Delivery",
-  steps = {
-    { id = "step_failing_pty", name = "Failing PTY", position = 1, kind = "pty", session_template_id = "template_codex_runtime", gates = {} },
-  },
-})
-assert(failing_pipeline.ok, "failure pipeline definition failed")
-
-local failing_run = tools["project_pipelines.record_run"]({
-  id = "run_runtime_failure",
-  ticket_id = "ticket_runtime_one",
-  pipeline_definition_id = "pipeline_runtime_failure",
-  repository = { id = "repo_runtime_standalone", name = "example/runtime-standalone", remote = "https://example.invalid/runtime-standalone.git", path = "repo://runtime-standalone" },
-  spawn_target_id = "spawn_target_runtime_override",
-  branch = "project-pipelines/runtime-failure-test",
-  worktree = { kind = "provider_owned_reference", id = "worktree_runtime_failure", path = "worktree://runtime-failure" },
-})
-assert(failing_run.ok, "failure run record failed")
-
-fail_next_spawn_error = "hub rejected spawn target"
-local failed_activation = tools["project_pipelines.activate_step"]({
-  run_id = "run_runtime_failure",
-  step_id = "step_failing_pty",
-  request_id = "session_request_runtime_failure",
-})
-assert(failed_activation.ok == false, "thrown hub spawn error should return structured failure")
-assert(failed_activation.error.code == "session_template_spawn_failed", "thrown hub spawn error should use structured failure code")
-
-local failed_context = tools["project_pipelines.current_context"]({})
-assert(failed_context.ok and #failed_context.session_requests == 8, "failed session request must still be persisted")
-local failed_request = nil
-for _, request in ipairs(failed_context.session_requests) do
-  if request.id == "session_request_runtime_failure" then failed_request = request end
-end
-assert(failed_request.status == "failed", "failed request should record failed status")
-assert(failed_request.result.error.code == "session_template_spawn_failed", "failed request should store structured error")
-assert(failed_request.result.error.message:find("hub rejected spawn target", 1, true), "failed request should store hub error message")
-
-local prerequisite_ticket = tools["project_pipelines.create_ticket"]({
-  id = "ticket_runtime_prerequisite",
-  project_id = "proj_runtime_standalone",
-  title = "Runtime prerequisite",
-})
-assert(prerequisite_ticket.ok, "prerequisite ticket create failed")
-
-local dependency_pipeline = tools["project_pipelines.define_pipeline"]({
-  id = "pipeline_runtime_dependencies",
-  project_id = "proj_runtime_standalone",
-  name = "Runtime Dependency Delivery",
-  steps = {
-    { id = "step_dependency_plan", name = "Plan", position = 1, kind = "manual", allows_open_ticket_dependencies = true, gates = {} },
-    { id = "step_dependency_implement", name = "Implement", position = 2, kind = "pty", session_template_id = "template_codex_runtime", gates = {} },
-  },
-})
-assert(dependency_pipeline.ok, "dependency pipeline definition failed")
-assert(dependency_pipeline.pipeline_definition.steps[1].allows_open_ticket_dependencies == true, "planning exemption must persist")
-assert(dependency_pipeline.pipeline_definition.steps[2].allows_open_ticket_dependencies == nil, "legacy unclassified delivery step must retain safe gated default")
-
-local dependency_run = tools["project_pipelines.record_run"]({
-  id = "run_runtime_dependencies_close",
-  ticket_id = "ticket_runtime_one",
-  pipeline_definition_id = "pipeline_runtime_dependencies",
-  repository = { id = "repo_runtime_standalone", name = "example/runtime-standalone", remote = "https://example.invalid/runtime-standalone.git", path = "repo://runtime-standalone" },
-  spawn_target_id = "spawn_target_runtime_override",
-  branch = "project-pipelines/dependency-close-test",
-  worktree = { kind = "provider_owned_reference", id = "worktree_runtime_dependencies_close", path = "worktree://runtime-dependencies-close" },
-})
-assert(dependency_run.ok and dependency_run.run.current_step_id == "step_dependency_plan", "dependency close run record failed")
-
-local added_dependency = tools["project_pipelines.add_ticket_dependency"]({
-  ticket_id = "ticket_runtime_one",
-  dependency_ticket_id = "ticket_runtime_prerequisite",
-})
-assert(added_dependency.ok and #added_dependency.ticket.dependency_ticket_ids == 1, "dependency add failed")
-local duplicate_dependency = tools["project_pipelines.add_ticket_dependency"]({
-  ticket_id = "ticket_runtime_one",
-  dependency_ticket_id = "ticket_runtime_prerequisite",
-})
-assert(duplicate_dependency.ok and #duplicate_dependency.ticket.dependency_ticket_ids == 1, "dependency add must be idempotent")
-
-local planning_activation = tools["project_pipelines.activate_step"]({
-  run_id = "run_runtime_dependencies_close",
-  step_id = "step_dependency_plan",
-})
-assert(planning_activation.ok and planning_activation.activation.status == "preserved_non_pty", "explicit planning exemption must remain activatable")
-
-local before_dependency_block = tools["project_pipelines.current_context"]({})
-local before_dependency_events = #before_dependency_block.events
-local before_dependency_requests = #before_dependency_block.session_requests
-local before_dependency_spawns = #spawned_session_templates
-local before_dependency_resolutions = session_template_resolution_calls
-local before_dependency_session_id = dependency_run.run.session_id
-local before_dependency_request_id = dependency_run.run.session_request_id
-local blocked_dependency_activation = tools["project_pipelines.activate_step"]({
-  run_id = "run_runtime_dependencies_close",
-  step_id = "step_dependency_implement",
-  request_id = "session_request_runtime_dependency_close",
-})
-assert(blocked_dependency_activation.ok == false, "open ticket dependency must block activation")
-assert(blocked_dependency_activation.error.status == "blocked", "ticket dependency failure must report blocked status")
-assert(blocked_dependency_activation.error.code == "ticket_dependencies_unmet", "ticket dependency failure must use stable code")
-assert(blocked_dependency_activation.error.ticket_id == "ticket_runtime_one", "ticket dependency failure must name the dependent ticket")
-assert(blocked_dependency_activation.error.step_id == "step_dependency_implement", "ticket dependency failure must name attempted step")
-assert(blocked_dependency_activation.error.unmet_dependencies[1].dependency_ticket_id == "ticket_runtime_prerequisite", "ticket dependency failure must name prerequisite ticket")
-assert(blocked_dependency_activation.error.unmet_dependencies[1].status == "open", "ticket dependency failure must report prerequisite status")
-local blocked_dependency_context = tools["project_pipelines.current_context"]({})
-local blocked_dependency_run = nil
-for _, persisted_run in ipairs(blocked_dependency_context.runs) do
-  if persisted_run.id == "run_runtime_dependencies_close" then blocked_dependency_run = persisted_run end
-end
-assert(blocked_dependency_run.current_step_id == "step_dependency_plan", "blocked activation must preserve current step")
-assert(blocked_dependency_run.session_id == before_dependency_session_id, "blocked activation must preserve session id")
-assert(blocked_dependency_run.session_request_id == before_dependency_request_id, "blocked activation must preserve session request id")
-assert(blocked_dependency_run.blocked_transition.step_id == "step_dependency_implement", "blocked transition must persist attempted step")
-assert(#blocked_dependency_context.session_requests == before_dependency_requests, "blocked activation must not create a session request")
-assert(#spawned_session_templates == before_dependency_spawns, "blocked activation must not spawn")
-assert(session_template_resolution_calls == before_dependency_resolutions, "blocked activation must not resolve session templates")
-assert(#blocked_dependency_context.events == before_dependency_events + 1, "blocked activation must record only its diagnostic event")
-assert(blocked_dependency_context.events[#blocked_dependency_context.events].kind == "ticket_dependencies_blocked", "blocked activation must record dependency diagnostic event")
-
-local closed_dependency = tools["project_pipelines.update_ticket_status"]({
-  ticket_id = "ticket_runtime_prerequisite",
-  status = "closed",
-})
-assert(closed_dependency.ok and closed_dependency.ticket.status == "closed", "dependency close failed")
-local closed_context = tools["project_pipelines.current_context"]({})
-for _, persisted_run in ipairs(closed_context.runs) do
-  if persisted_run.id == "run_runtime_dependencies_close" then
-    assert(persisted_run.current_step_id == "step_dependency_plan", "closing dependency must not auto-advance")
-  end
-end
-local close_retry = tools["project_pipelines.activate_step"]({
-  run_id = "run_runtime_dependencies_close",
-  step_id = "step_dependency_implement",
-  request_id = "session_request_runtime_dependency_close",
-})
-assert(close_retry.ok and close_retry.activation.status == "spawn_requested", "explicit retry after close must activate")
-assert(close_retry.run.blocked_transition == nil, "successful retry must clear blocked transition")
-assert(#spawned_session_templates == before_dependency_spawns + 1, "close retry must spawn exactly once")
-local close_repeat = tools["project_pipelines.activate_step"]({
-  run_id = "run_runtime_dependencies_close",
-  step_id = "step_dependency_implement",
-})
-assert(close_repeat.ok and close_repeat.activation.id == "session_request_runtime_dependency_close", "repeat activation must reuse existing request")
-assert(#spawned_session_templates == before_dependency_spawns + 1, "repeat activation must not spawn again")
-
-local reopened_dependency = tools["project_pipelines.update_ticket_status"]({
-  ticket_id = "ticket_runtime_prerequisite",
-  status = "open",
-})
-assert(reopened_dependency.ok, "dependency reopen failed")
-local existing_request_block = tools["project_pipelines.activate_step"]({
-  run_id = "run_runtime_dependencies_close",
-  step_id = "step_dependency_implement",
-})
-assert(existing_request_block.ok == false and existing_request_block.error.code == "ticket_dependencies_unmet", "open dependency must block a step with an existing request")
-local existing_request_close = tools["project_pipelines.update_ticket_status"]({
-  ticket_id = "ticket_runtime_prerequisite",
-  status = "closed",
-})
-assert(existing_request_close.ok, "existing-request dependency close failed")
-local existing_request_retry = tools["project_pipelines.activate_step"]({
-  run_id = "run_runtime_dependencies_close",
-  step_id = "step_dependency_implement",
-})
-assert(existing_request_retry.ok and existing_request_retry.activation.id == "session_request_runtime_dependency_close", "existing-request retry must reuse the persisted request")
-assert(#spawned_session_templates == before_dependency_spawns + 1, "existing-request retry must not spawn again")
-local existing_request_context = tools["project_pipelines.current_context"]({})
-for _, persisted_run in ipairs(existing_request_context.runs) do
-  if persisted_run.id == "run_runtime_dependencies_close" then
-    assert(persisted_run.blocked_transition == nil, "existing-request retry must persist clearing blocked transition")
-  end
-end
-local reopened_removal_dependency = tools["project_pipelines.update_ticket_status"]({
-  ticket_id = "ticket_runtime_prerequisite",
-  status = "open",
-})
-assert(reopened_removal_dependency.ok, "dependency reopen for removal failed")
-local removal_run = tools["project_pipelines.record_run"]({
-  id = "run_runtime_dependencies_remove",
-  ticket_id = "ticket_runtime_one",
-  pipeline_definition_id = "pipeline_runtime_dependencies",
-  repository = { id = "repo_runtime_standalone", name = "example/runtime-standalone", remote = "https://example.invalid/runtime-standalone.git", path = "repo://runtime-standalone" },
-  spawn_target_id = "spawn_target_runtime_override",
-  branch = "project-pipelines/dependency-remove-test",
-  worktree = { kind = "provider_owned_reference", id = "worktree_runtime_dependencies_remove", path = "worktree://runtime-dependencies-remove" },
-})
-assert(removal_run.ok, "dependency removal run record failed")
-local removal_block = tools["project_pipelines.activate_step"]({
-  run_id = "run_runtime_dependencies_remove",
-  step_id = "step_dependency_implement",
-})
-assert(removal_block.ok == false and removal_block.error.code == "ticket_dependencies_unmet", "open dependency must block removal scenario")
-local removed_dependency = tools["project_pipelines.remove_ticket_dependency"]({
-  ticket_id = "ticket_runtime_one",
-  dependency_ticket_id = "ticket_runtime_prerequisite",
-})
-assert(removed_dependency.ok and #removed_dependency.ticket.dependency_ticket_ids == 0, "dependency removal failed")
-local removed_context = tools["project_pipelines.current_context"]({})
-for _, persisted_run in ipairs(removed_context.runs) do
-  if persisted_run.id == "run_runtime_dependencies_remove" then
-    assert(persisted_run.current_step_id == "step_dependency_plan", "removing dependency must not auto-advance")
-  end
-end
-local remove_retry = tools["project_pipelines.activate_step"]({
-  run_id = "run_runtime_dependencies_remove",
-  step_id = "step_dependency_implement",
-  request_id = "session_request_runtime_dependency_remove",
-})
-assert(remove_retry.ok and remove_retry.activation.status == "spawn_requested", "explicit retry after removal must activate")
-assert(#spawned_session_templates == before_dependency_spawns + 2, "remove retry must spawn exactly once")
-local remove_repeat = tools["project_pipelines.activate_step"]({
-  run_id = "run_runtime_dependencies_remove",
-  step_id = "step_dependency_implement",
-})
-assert(remove_repeat.ok and remove_repeat.activation.id == "session_request_runtime_dependency_remove", "removal repeat must reuse existing request")
-assert(#spawned_session_templates == before_dependency_spawns + 2, "removal repeat must not spawn again")
-
-local missing_dependency_ticket = tools["project_pipelines.create_ticket"]({
-  id = "ticket_runtime_missing_dependency",
-  project_id = "proj_runtime_standalone",
-  title = "Runtime missing dependency",
-  dependency_ticket_ids = { "ticket_runtime_deleted_prerequisite" },
-})
-assert(missing_dependency_ticket.ok, "missing dependency ticket create failed")
-local missing_dependency_run = tools["project_pipelines.record_run"]({
-  id = "run_runtime_missing_dependency",
-  ticket_id = "ticket_runtime_missing_dependency",
-  pipeline_definition_id = "pipeline_runtime_dependencies",
-  repository = { id = "repo_runtime_standalone", name = "example/runtime-standalone", remote = "https://example.invalid/runtime-standalone.git", path = "repo://runtime-standalone" },
-  spawn_target_id = "spawn_target_runtime_override",
-  branch = "project-pipelines/missing-dependency-test",
-  worktree = { kind = "provider_owned_reference", id = "worktree_runtime_missing_dependency", path = "worktree://runtime-missing-dependency" },
-})
-assert(missing_dependency_run.ok, "missing dependency run record failed")
-local missing_dependency_block = tools["project_pipelines.activate_step"]({
-  run_id = "run_runtime_missing_dependency",
-  step_id = "step_dependency_implement",
-})
-assert(missing_dependency_block.ok == false and missing_dependency_block.error.unmet_dependencies[1].status == "missing", "missing referenced ticket must fail safe")
-assert(#spawned_session_templates == before_dependency_spawns + 2, "missing dependency must not spawn")
-assert(tools["project_pipelines.add_ticket_dependency"]({ ticket_id = "ticket_runtime_one", dependency_ticket_id = "ticket_runtime_one" }).ok == false, "self dependency must reject")
-assert(tools["project_pipelines.update_ticket_status"]({ ticket_id = "ticket_runtime_one", status = "done" }).ok == false, "unknown ticket status must reject")
-
-local artifact = tools["project_pipelines.record_artifact"]({
-  id = "artifact_runtime_one",
-  run_id = "run_runtime_one",
-  step_id = "step_plan",
-  kind = "report",
-  summary = "Runtime harness artifact",
-})
-assert(artifact.ok and artifact.artifact.run_id == "run_runtime_one", "artifact record failed")
-
-local question = tools["project_pipelines.record_question"]({
-  id = "question_runtime_one",
-  run_id = "run_runtime_one",
-  ticket_id = "ticket_runtime_one",
-  step_id = "step_plan",
-  question = "Does standalone mode require workspace data?",
-})
-assert(question.ok and question.question.status == "open", "question record failed")
-
-local allowed_ui_node_types = {
-  stack = true,
-  inline = true,
-  form = true,
-  form_section = true,
-  form_field = true,
-  panel = true,
-  section = true,
-  toolbar = true,
-  metric_grid = true,
-  metric = true,
-  scroll_area = true,
-  text = true,
-  icon = true,
-  badge = true,
-  status_badge = true,
-  status_dot = true,
-  empty_state = true,
-  list = true,
-  list_item = true,
-  tree = true,
-  tree_item = true,
-  table = true,
-  button = true,
-  icon_button = true,
-  menu = true,
-  menu_item = true,
-  dialog = true,
-  text_input = true,
-  textarea = true,
-  checkbox = true,
-  select = true,
-  select_option = true,
-  terminal_view = true,
-  connection_code_view = true,
-  iframe = true,
-}
-
-local function validate_ui_child_contract(child, path)
-  assert(type(child) == "table", path .. " must be a table")
-  if child["$kind"] ~= nil then
-    assert(child["$kind"] == "bind_list" or child["$kind"] == "bind_if" or child["$kind"] == "presentation_if" or child["$kind"] == "when" or child["$kind"] == "hidden", path .. " has unsupported $kind")
-    if child["$kind"] == "bind_list" then
-      assert(type(child.source) == "string" and child.source:sub(1, 1) == "/", path .. " bind_list source must be absolute")
-      validate_ui_child_contract(child.item_template, path .. ".item_template")
-      if child.empty_template ~= nil then
-        validate_ui_child_contract(child.empty_template, path .. ".empty_template")
-      end
-    elseif child.node ~= nil then
-      validate_ui_child_contract(child.node, path .. ".node")
-    end
-    return
-  end
-  assert(allowed_ui_node_types[child.type] == true, path .. " has unsupported UiNode type " .. tostring(child.type))
-  if child.type == "text" then
-    assert(child.props ~= nil and child.props.text ~= nil, path .. " text node must use props.text")
-  end
-  if child.children ~= nil then
-    assert(#child.children > 0, path .. " must omit empty children arrays for hub Lua-to-JSON compatibility")
-  end
-  for index, nested in ipairs(child.children or {}) do
-    validate_ui_child_contract(nested, path .. ".children[" .. tostring(index) .. "]")
-  end
-  for slot_name, slot_children in pairs(child.slots or {}) do
-    assert(type(slot_children) == "table", path .. ".slots." .. tostring(slot_name) .. " must be a child array")
-    for index, nested in ipairs(slot_children) do
-      validate_ui_child_contract(nested, path .. ".slots." .. tostring(slot_name) .. "[" .. tostring(index) .. "]")
-    end
-  end
-end
-
-local function collect_contract_nodes(child, forms, dialogs, predicates)
-  if child["$kind"] ~= nil then
-    if child["$kind"] == "presentation_if" then
-      table.insert(predicates, child.predicate)
-    end
-    if child.node then collect_contract_nodes(child.node, forms, dialogs, predicates) end
-    if child.item_template then collect_contract_nodes(child.item_template, forms, dialogs, predicates) end
-    if child.empty_template then collect_contract_nodes(child.empty_template, forms, dialogs, predicates) end
-    return
-  end
-  if child.type == "form" then table.insert(forms, child) end
-  if child.type == "dialog" then table.insert(dialogs, child) end
-  for _, nested in ipairs(child.children or {}) do
-    collect_contract_nodes(nested, forms, dialogs, predicates)
-  end
-  for _, slot_children in pairs(child.slots or {}) do
-    for _, nested in ipairs(slot_children) do
-      collect_contract_nodes(nested, forms, dialogs, predicates)
-    end
-  end
-end
-
-local function assert_unique_node_ids(child, seen)
-  if child["$kind"] ~= nil then
-    if child.node then assert_unique_node_ids(child.node, seen) end
-    if child.item_template then assert_unique_node_ids(child.item_template, seen) end
-    if child.empty_template then assert_unique_node_ids(child.empty_template, seen) end
-    return
-  end
-  if child.id then
-    assert(seen[child.id] == nil, "rendered node id must be unique: " .. child.id)
-    seen[child.id] = true
-  end
-  for _, nested in ipairs(child.children or {}) do
-    assert_unique_node_ids(nested, seen)
-  end
-  for _, slot_children in pairs(child.slots or {}) do
-    for _, nested in ipairs(slot_children) do
-      assert_unique_node_ids(nested, seen)
-    end
-  end
-end
-
-local home = handlers["project-pipelines.home"]({})
-validate_ui_child_contract(home, "home")
-assert_unique_node_ids(home, {})
-local contract_forms = {}
-local contract_dialogs = {}
-local presentation_predicates = {}
-collect_contract_nodes(home, contract_forms, contract_dialogs, presentation_predicates)
-assert(#contract_forms == 3, "home must render each dialog form exactly once")
-for _, form in ipairs(contract_forms) do
-  assert(type(form.props.submit_label) == "string" and form.props.submit_label:match("%S"), "every Form must declare a nonblank submit_label")
-end
-assert(#contract_dialogs == 3, "home must render create, record, and activate dialogs")
-for _, dialog in ipairs(contract_dialogs) do
-  assert(dialog.props.presentation == "auto", "every Dialog must use presentation=auto")
-  assert(dialog.props.open == nil, "Dialog props.open is forbidden")
-end
-local presence_keys = {}
-local selected_workspace_equality = nil
-for _, predicate in ipairs(presentation_predicates) do
-  if predicate.kind == "present" then presence_keys[predicate.key] = true end
-  if predicate.kind == "equals" and predicate.key == "selected-workspace" then
-    selected_workspace_equality = predicate
-  end
-end
-assert(presence_keys["project-pipelines.create-ticket-dialog"], "create dialog must use a presence predicate")
-assert(presence_keys["project-pipelines.record-run-dialog"], "record dialog must use a presence predicate")
-assert(presence_keys["project-pipelines.activate-step-dialog"], "activate dialog must use a presence predicate")
-assert(selected_workspace_equality and selected_workspace_equality.value == "workspace_runtime_alpha", "selected workspace must use an equality predicate")
-assert(home.type == "panel", "home surface must use hub UiNode panel primitive")
-assert(home.id == "project-pipelines-home", "home surface id missing")
-assert(home.props.title == "Project Pipelines", "home surface title missing")
-local home_sections = {}
-for _, child in ipairs(home.children) do
-  if child.id then home_sections[child.id] = child end
-end
-assert(home_sections["project-pipelines-command-center"] ~= nil, "home surface must render command center")
-assert(home_sections["project-pipelines-command-center"].type == "panel", "command center must use panel primitive")
-assert(home.children[1].id == "project-pipelines-command-center", "home first viewport must start with command center")
-assert(home.children[2].id == "project-pipelines-needs-attention", "home first viewport must put attention before drilldown")
-assert(home.children[3].id == "project-pipelines-running", "home first viewport must put running before drilldown")
-assert(home.children[4].id == "project-pipelines-ready-for-review", "home first viewport must put review before drilldown")
-assert(home_sections["project-pipelines-command-center"].children[1].type == "toolbar", "command center must use toolbar primitive")
-assert(home_sections["project-pipelines-command-center"].children[1].slots.commands[1].props.action.id == "project_pipelines.create_ticket", "toolbar must expose command actions")
-assert(home_sections["project-pipelines-command-center"].children[1].slots.commands[1].props.action.payload.intent == "open_dialog", "create toolbar action must author dialog-open intent")
-assert(home_sections["project-pipelines-command-center"].children[1].slots.commands[2].props.action.payload.intent == "open_dialog", "record toolbar action must author dialog-open intent")
-assert(home_sections["project-pipelines-command-center"].children[1].slots.actions[1].props.action.payload.intent == "open_dialog", "activate toolbar action must author dialog-open intent")
-assert(home_sections["project-pipelines-command-center"].children[2].type == "metric_grid", "command center metrics must use metric_grid primitive")
-assert(home_sections["project-pipelines-command-center"].children[2].children[1].type == "metric", "command center metrics must use metric primitive")
-assert(home_sections["project-pipelines-command-center"].children[2].children[1].props.label == "Needs attention", "attention metric must be first")
-assert(home_sections["project-pipelines-needs-attention"] ~= nil, "home surface must render attention section")
-assert(home_sections["project-pipelines-needs-attention"].type == "section", "attention section must use section primitive")
-assert(#home_sections["project-pipelines-needs-attention"].children[1].children == 5, "attention section must count dependency blocks, blocked sessions, failures, and open questions")
-assert(home_sections["project-pipelines-needs-attention"].children[1].children[1].slots.subtitle[1].children[1].props.text:find("ticket_runtime_deleted_prerequisite", 1, true), "dependency attention row must name missing prerequisite")
-assert(home_sections["project-pipelines-needs-attention"].children[1].children[1].slots.subtitle[1].children[1].props.text:find("step_dependency_implement", 1, true), "dependency attention row must name attempted step")
-assert(home_sections["project-pipelines-needs-attention"].children[1].children[1].slots.subtitle[1].children[2].type == "status_badge", "attention rows must use status_badge state")
-assert(home_sections["project-pipelines-running"] ~= nil, "home surface must render running section")
-assert(home_sections["project-pipelines-running"].type == "section", "running section must use section primitive")
-assert(#home_sections["project-pipelines-running"].children[1].children == 10, "running section must count active runs")
-assert(home_sections["project-pipelines-ready-for-review"] ~= nil, "home surface must render review section")
-assert(home_sections["project-pipelines-ready-for-review"].type == "section", "review section must use section primitive")
-assert(home_sections["project-pipelines-workbench"] ~= nil, "home surface must render workbench section")
-assert(home_sections["project-pipelines-workbench"].type == "section", "workbench drilldown must use section primitive")
-assert(home_sections["project-pipelines-workbench"].children[1].type == "table", "workbench must use table primitive for projects")
-assert(home_sections["project-pipelines-workbench"].children[1].props.columns[1].id == "name", "project table must declare columns")
-assert(home_sections["project-pipelines-workbench"].children[1].props.rows[1].cells.name == "Runtime Standalone", "project table must expose current records")
-assert(home_sections["project-pipelines-workbench"].children[3].id == "project-pipelines-run-table", "workbench must include run table")
-assert(home_sections["project-pipelines-workbench"].children[3].props.selection.mode == "single", "run table must declare selection semantics")
-assert(home_sections["project-pipelines-workbench"].children[3].props.row_action == nil, "table-level row_action must not claim implicit row identity")
-local workspace_project_row = nil
-for _, row in ipairs(home_sections["project-pipelines-workbench"].children[1].props.rows) do
-  if row.id == "proj_runtime_workspace" then workspace_project_row = row end
-end
-assert(workspace_project_row.action.id == "project_pipelines.select_row", "workspace project row must author its select action")
-assert(workspace_project_row.action.payload.row_id == "workspace_runtime_alpha", "workspace project row must carry its workspace identity")
-local missing_dependency_row = nil
-for _, row in ipairs(home_sections["project-pipelines-workbench"].children[3].props.rows) do
-  if row.id == "run_runtime_missing_dependency" then missing_dependency_row = row end
-end
-assert(missing_dependency_row.cells.step == "step_dependency_implement", "blocked run row must expose attempted step")
-assert(missing_dependency_row.cells.blocker == "ticket_runtime_deleted_prerequisite", "blocked run row must expose prerequisite")
-assert(missing_dependency_row.cells.status == "blocked", "blocked run row must expose blocked status")
-assert(home_sections["project-pipelines-entity-streams"] ~= nil, "home surface must preserve entity stream bindings")
-local workbench_list = home_sections["project-pipelines-entity-streams"].children[1]
-assert(workbench_list.type == "list", "workbench must use list primitive")
-assert(#workbench_list.children == 4, "workbench must include project, ticket, run, and session request lists")
-assert(workbench_list.children[1]["$kind"] == "bind_list", "workbench child must use hub bind_list child wrapper")
-assert(workbench_list.children[1].source == "/project-pipelines.project", "project binding must use absolute entity family path")
-assert(workbench_list.children[1].item_template.type == "list_item", "bound rows must render list_item primitives")
-assert(workbench_list.children[1].item_template.slots.title[1].props.text["$bind"] == "@/title", "bound row title must use hub $bind shape")
-assert(home_sections["project-pipelines-create-guidance"].type == "section", "create guidance must use section primitive")
-assert(home_sections["project-pipelines-create-guidance"].children[2].children[2].slots.subtitle[1].children[1].props.text == "project_pipelines.create_ticket", "home surface must expose create ticket action hint")
-assert(#home_sections["project-pipelines-create-guidance"].children == 2, "create guidance must not duplicate the activate-step dialog form")
-
-local settings = handlers["project-pipelines.settings"]({})
-validate_ui_child_contract(settings, "settings")
-assert(settings.type == "panel", "settings surface must use hub UiNode panel primitive")
-assert(settings.id == "project-pipelines-settings", "settings surface id missing")
-assert(settings.props.title == "Project Pipelines Settings", "settings surface title missing")
-local provider_status_section = nil
-local readiness_section = nil
-local defaults_section = nil
-for _, child in ipairs(settings.children) do
-  if child.id == "project-pipelines-provider-dependency-status" then
-    provider_status_section = child
-  elseif child.id == "project-pipelines-readiness" then
-    readiness_section = child
-  elseif child.id == "project-pipelines-settings-defaults" then
-    defaults_section = child
-  end
-end
-assert(readiness_section ~= nil, "settings surface must render readiness section")
-assert(readiness_section.type == "panel", "settings readiness section must use panel primitive")
-assert(#readiness_section.children[1].children == 3, "settings readiness section must include storage, provider, and session template readiness")
-assert(provider_status_section ~= nil, "settings surface must render provider dependency status node")
-assert(provider_status_section.type == "panel", "settings provider status node must use a supported structural primitive")
-assert(provider_status_section.children[1].id == "project-pipelines-provider-dependency-status-summary", "settings provider status node must include stable summary text node")
-assert(provider_status_section.children[1].props.text:find("github_auth", 1, true), "settings provider status summary must name missing dependency")
-assert(provider_status_section.children[2].props.label == "blocked: 1", "settings provider status badge must expose blocked count")
-assert(defaults_section ~= nil, "settings surface must render defaults configuration section")
-assert(defaults_section.children[2].children[1].slots.subtitle[1].children[1].props.text == "default_spawn_target_id", "settings defaults must expose spawn target config field")
+assert(tools["project_pipelines.create_ticket"]({
+  id = "ticket-merge", project_id = "project-one", title = "Merge",
+}).ok)
+assert(tools["project_pipelines.start_run"]({
+  id = "run-merge", ticket_id = "ticket-merge", pipeline_id = "pipeline-two-step",
+}).ok)
+fail_batch_key_prefix = "v3/run_steps/"
+assert(not tools["project_pipelines.request_merge"]({ run_id = "run-merge" }).ok)
+local merge_failure = tools["project_pipelines.current_context"]({ run_id = "run-merge" })
+assert(merge_failure.runs[1].status == "active")
+fail_batch_key_prefix = nil
+assert(tools["project_pipelines.link_pr"]({
+  run_id = "run-merge", pr_url = "https://example.invalid/pr/1", repo = "example/repo", pr_number = 1,
+}).ok)
+assert(tools["project_pipelines.request_merge"]({ run_id = "run-merge" }).ok)
 
 local entities = tools["project_pipelines.entities"]({})
-assert(entities.ok and #entities.frames >= 5, "entity output must expose persisted state")
-local session_frames = 0
-for _, frame in ipairs(entities.frames) do
-  if frame.family == "project-pipelines.session_request" then
-    session_frames = session_frames + 1
+assert(entities.ok and #entities.frames >= 5)
+local handlers = {}
+local entity_providers = {}
+for _, handler in ipairs(plugin.handlers) do
+  handlers[handler.descriptor_id] = handler.call
+  if handler.kind == "entity_provider" then
+    assert(handler.descriptor.entity_type == handler.descriptor_id)
+    assert(handler.descriptor.id_field == "id")
+    entity_providers[handler.descriptor_id] = handler.call
   end
 end
-assert(session_frames == 10, "entity output must expose session request state")
-
-local reloaded_plugin = dofile("plugin.lua")
-local reloaded_tools = {}
-for _, tool in ipairs(reloaded_plugin.tools) do
-  reloaded_tools[tool.name] = tool.call
-end
-local reloaded_context = reloaded_tools["project_pipelines.current_context"]({})
-assert(reloaded_context.ok, "reloaded context failed")
-assert(#reloaded_context.projects == 2, "projects must survive plugin reload")
-assert(#reloaded_context.tickets == 5, "tickets must survive plugin reload")
-assert(#reloaded_context.runs == 10, "runs must survive plugin reload")
-assert(#reloaded_context.session_requests == 10, "session requests must survive plugin reload")
-local reloaded_missing_run = nil
-for _, persisted_run in ipairs(reloaded_context.runs) do
-  if persisted_run.id == "run_runtime_missing_dependency" then reloaded_missing_run = persisted_run end
-end
-assert(reloaded_missing_run.blocked_transition.code == "ticket_dependencies_unmet", "blocked transition must survive plugin reload")
-
-local sourced_run = reloaded_tools["project_pipelines.record_run"]({
-  id = "run_runtime_sourced",
-  ticket_id = "ticket_runtime_one",
-  pipeline_definition_id = "botster_stack_delivery",
-})
-assert(sourced_run.ok and sourced_run.run.current_step_id == "botster_stack_plan", "sourced workflow must be executable")
-for _, step in ipairs(stack_delivery.steps) do
-  if step.kind ~= "manual" then
-    local route_run_id = "run_runtime_route_" .. step.id
-    local route_run = reloaded_tools["project_pipelines.record_run"]({
-      id = route_run_id,
-      ticket_id = "ticket_runtime_workspace",
-      pipeline_definition_id = "botster_stack_delivery",
-      current_step_id = step.id,
-      branch = "project-pipelines/route-prompt-" .. step.id,
-    })
-    assert(route_run.ok, step.id .. " route prompt run create failed")
-    local route_activation = reloaded_tools["project_pipelines.activate_step"]({
-      run_id = route_run_id,
-      step_id = step.id,
-      request_id = "session_request_route_" .. step.id,
-      session_template_id = "template_codex_runtime",
-    })
-    assert(
-      route_activation.ok,
-      step.id .. " route prompt activation failed: "
-        .. tostring(route_activation.error and (route_activation.error.message or route_activation.error.code))
-    )
-    assert_managed_prompt_routes(
-      route_activation.activation.request.context.prompt,
-      step.id .. " dispatched prompt"
-    )
-  end
-end
-assert(reloaded_tools["project_pipelines.request_step_advance"]({
-  run_id = sourced_run.run.id,
-  request_id = "advance_without_plan_gate",
-}).ok == false, "missing required gate must block transition")
-assert(reloaded_tools["project_pipelines.submit_gate"]({
-  run_id = sourced_run.run.id,
-  step_id = "botster_stack_plan",
-  gate_id = "plan_artifact",
-  status = "passed",
-  evidence = { artifact_id = "artifact_runtime_one" },
-}).ok, "plan gate submission failed")
-local plan_advance = reloaded_tools["project_pipelines.request_step_advance"]({
-  run_id = sourced_run.run.id,
-  request_id = "advance_plan_once",
-})
-assert(plan_advance.ok and plan_advance.step_id == "botster_stack_plan_review", "valid plan gate must advance")
-local duplicate_plan_advance = reloaded_tools["project_pipelines.request_step_advance"]({
-  run_id = sourced_run.run.id,
-  request_id = "advance_plan_once",
-})
-assert(duplicate_plan_advance.ok and duplicate_plan_advance.step_id == "botster_stack_plan_review", "duplicate request_id must reuse durable result")
-assert(reloaded_tools["project_pipelines.submit_gate"]({
-  run_id = sourced_run.run.id,
-  step_id = "botster_stack_plan_review",
-  gate_id = "plan_review",
-  status = "passed",
-}).ok, "plan review gate submission failed")
-local changes_required = reloaded_tools["project_pipelines.submit_review"]({
-  run_id = sourced_run.run.id,
-  step_id = "botster_stack_plan_review",
-  verdict = "changes_required",
-  findings = {
-    { id = "finding_runtime_plan", severity = "high", title = "Plan correction" },
-  },
-})
-assert(changes_required.ok, "changes-required review must persist")
-assert(reloaded_tools["project_pipelines.request_step_advance"]({
-  run_id = sourced_run.run.id,
-  request_id = "advance_blocked_review",
-}).ok == false, "changes-required review and open finding must block")
-assert(reloaded_tools["project_pipelines.resolve_finding"]({
-  finding_id = "finding_runtime_plan",
-  resolution = "corrected",
-}).ok, "finding resolution failed")
-assert(reloaded_tools["project_pipelines.submit_review"]({
-  run_id = sourced_run.run.id,
-  step_id = "botster_stack_plan_review",
-  verdict = "approved",
-}).ok, "approved review must persist")
-assert(reloaded_tools["project_pipelines.request_step_advance"]({
-  run_id = sourced_run.run.id,
-  request_id = "advance_approved_review",
-}).ok, "approved review with resolved findings must advance")
-assert(reloaded_tools["project_pipelines.submit_gate"]({
-  run_id = sourced_run.run.id,
-  step_id = "botster_stack_implement",
-  gate_id = "implementation",
-  status = "passed",
-  evidence = { commit_sha = "abc123", diff_against_base = "1 file changed" },
-}).ok, "implementation gate submission failed")
-assert(reloaded_tools["project_pipelines.request_step_advance"]({
-  run_id = sourced_run.run.id,
-  request_id = "advance_without_pr",
-}).ok == false, "PR-backed implementation must not advance without a link")
-assert(reloaded_tools["project_pipelines.link_pr"]({
-  run_id = sourced_run.run.id,
-  url = "https://example.invalid/pull/1",
-}).ok, "PR link failed")
-assert(reloaded_tools["project_pipelines.request_step_advance"]({
-  run_id = sourced_run.run.id,
-  request_id = "advance_with_pr",
-}).ok, "committed implementation with PR link must advance")
-
-local interruption_pipeline = reloaded_tools["project_pipelines.define_pipeline"]({
-  id = "pipeline_runtime_interruptions",
-  project_id = "proj_runtime_standalone",
-  name = "Runtime interruption recovery",
-  steps = {
-    {
-      id = "step_interrupt_spawn",
-      name = "Spawn",
-      position = 1,
-      kind = "pty",
-      session_template_id = "template_codex_runtime",
-      prompt = "Exercise durable spawn correlation.",
-      next_step_id = "step_interrupt_middle",
-      gates = {},
-    },
-    {
-      id = "step_interrupt_middle",
-      name = "Middle",
-      position = 2,
-      kind = "manual",
-      next_step_id = "step_interrupt_final",
-      gates = {},
-    },
-    {
-      id = "step_interrupt_final",
-      name = "Final",
-      position = 3,
-      kind = "manual",
-      gates = {},
-    },
-  },
-})
-assert(interruption_pipeline.ok, "interruption recovery pipeline create failed")
-
-local interrupted_spawn_run = reloaded_tools["project_pipelines.record_run"]({
-  id = "run_runtime_interrupted_spawn",
-  ticket_id = "ticket_runtime_one",
-  pipeline_definition_id = "pipeline_runtime_interruptions",
-  spawn_target_id = "spawn_target_runtime",
-  branch = "project-pipelines/interrupted-spawn",
-})
-assert(interrupted_spawn_run.ok, "interrupted spawn run create failed")
-local spawns_before_interruption = #spawned_session_templates
-fail_set_key_prefix = "v2/runs/"
-local interrupted_spawn = reloaded_tools["project_pipelines.activate_step"]({
-  run_id = interrupted_spawn_run.run.id,
-  request_id = "session_request_interrupted_once",
-})
-assert(interrupted_spawn.ok == false and interrupted_spawn.error.code == "persist_failed", "post-spawn write interruption must be structured")
-assert(
-  #spawned_session_templates == spawns_before_interruption + 1,
-  "interrupted activation must dispatch only once: before="
-    .. tostring(spawns_before_interruption)
-    .. " after="
-    .. tostring(#spawned_session_templates)
-    .. " reason="
-    .. tostring(interrupted_spawn.error and interrupted_spawn.error.reason)
-)
-fail_set_key_prefix = nil
-local recovered_spawn = reloaded_tools["project_pipelines.activate_step"]({
-  run_id = interrupted_spawn_run.run.id,
-  request_id = "session_request_interrupted_once",
-})
-assert(recovered_spawn.ok and recovered_spawn.activation.status == "spawn_requested", "retry must reuse the durable spawn result")
-assert(#spawned_session_templates == spawns_before_interruption + 1, "retry must not dispatch another managed spawn")
-
-local ticket_before_conflict = deep_copy(durable_store["v2/tickets/ticket_runtime_one"].payload)
-conflict_set_key_prefix = "v2/tickets/"
-local revision_conflict = reloaded_tools["project_pipelines.update_ticket_status"]({
-  ticket_id = "ticket_runtime_one",
-  status = "closed",
-})
-assert(revision_conflict.ok == false and revision_conflict.error.code == "persist_failed", "CAS conflict must return a structured persistence failure")
-assert(
-  durable_store["v2/tickets/ticket_runtime_one"].payload.status == ticket_before_conflict.status,
-  "CAS conflict must preserve the concurrently revised record"
-)
-
-local interrupted_advance_run = reloaded_tools["project_pipelines.record_run"]({
-  id = "run_runtime_interrupted_advance",
-  ticket_id = "ticket_runtime_one",
-  pipeline_definition_id = "pipeline_runtime_interruptions",
-  current_step_id = "step_interrupt_middle",
-})
-assert(interrupted_advance_run.ok, "interrupted advance run create failed")
-fail_set_key_prefix = "v2/advance_requests/"
-local interrupted_before_correlation = reloaded_tools["project_pipelines.request_step_advance"]({
-  run_id = interrupted_advance_run.run.id,
-  request_id = "advance_interrupted_before_correlation",
-})
-assert(interrupted_before_correlation.ok == false and interrupted_before_correlation.error.code == "persist_failed", "correlation write interruption must be structured")
-fail_set_key_prefix = nil
-local recovered_before_correlation = reloaded_tools["project_pipelines.request_step_advance"]({
-  run_id = interrupted_advance_run.run.id,
-  request_id = "advance_interrupted_before_correlation",
-})
-assert(recovered_before_correlation.ok and recovered_before_correlation.step_id == "step_interrupt_final", "retry must advance once after correlation write interruption")
-
-local interrupted_run_write = reloaded_tools["project_pipelines.record_run"]({
-  id = "run_runtime_interrupted_run_write",
-  ticket_id = "ticket_runtime_one",
-  pipeline_definition_id = "pipeline_runtime_interruptions",
-  current_step_id = "step_interrupt_middle",
-})
-assert(interrupted_run_write.ok, "interrupted run-write scenario create failed")
-fail_set_key_prefix = "v2/runs/"
-local interrupted_after_correlation = reloaded_tools["project_pipelines.request_step_advance"]({
-  run_id = interrupted_run_write.run.id,
-  request_id = "advance_interrupted_after_correlation",
-})
-assert(interrupted_after_correlation.ok == false and interrupted_after_correlation.error.code == "persist_failed", "run write interruption must be structured")
-fail_set_key_prefix = nil
-local recovered_after_correlation = reloaded_tools["project_pipelines.request_step_advance"]({
-  run_id = interrupted_run_write.run.id,
-  request_id = "advance_interrupted_after_correlation",
-})
-assert(recovered_after_correlation.ok and recovered_after_correlation.step_id == "step_interrupt_final", "retry must reconcile the durable advance")
-local recovered_advance_context = reloaded_tools["project_pipelines.current_context"]({})
-local recovered_durable_run = nil
-for _, candidate in ipairs(recovered_advance_context.runs) do
-  if candidate.id == interrupted_run_write.run.id then recovered_durable_run = candidate end
-end
-assert(recovered_durable_run.current_step_id == "step_interrupt_final", "recovered advance must move the durable run exactly one step")
-
-for _, severity_case in ipairs({
-  { severity = "info", blocks = false },
-  { severity = "low", blocks = false },
-  { severity = "medium", blocks = false },
-  { severity = "high", blocks = true },
-  { severity = "blocker", blocks = true },
-}) do
-  local severity_run_id = "run_runtime_finding_" .. severity_case.severity
-  assert(reloaded_tools["project_pipelines.record_run"]({
-    id = severity_run_id,
-    ticket_id = "ticket_runtime_one",
-    pipeline_definition_id = "botster_stack_delivery",
-    current_step_id = "botster_stack_plan_review",
-  }).ok, "severity run create failed")
-  assert(reloaded_tools["project_pipelines.submit_gate"]({
-    run_id = severity_run_id,
-    step_id = "botster_stack_plan_review",
-    gate_id = "plan_review",
-    status = "passed",
-  }).ok, "severity gate submit failed")
-  assert(reloaded_tools["project_pipelines.submit_review"]({
-    run_id = severity_run_id,
-    step_id = "botster_stack_plan_review",
-    verdict = "approved",
-    findings = {
-      { id = "finding_runtime_" .. severity_case.severity, severity = severity_case.severity, title = "Severity policy probe" },
-    },
-  }).ok, "severity review submit failed")
-  local severity_advance = reloaded_tools["project_pipelines.request_step_advance"]({
-    run_id = severity_run_id,
-    request_id = "advance_finding_" .. severity_case.severity,
-  })
-  assert(
-    (severity_case.blocks and severity_advance.ok == false)
-      or (not severity_case.blocks and severity_advance.ok == true),
-    severity_case.severity .. " finding blocker policy mismatch"
-  )
-end
-
-local question_answer = reloaded_tools["project_pipelines.answer_question"]({
-  question_id = "question_runtime_one",
-  answer = "No.",
-})
-assert(question_answer.ok and question_answer.question.status == "answered", "question answer must persist")
-local checklist = reloaded_tools["project_pipelines.create_checklist"]({
-  run_id = sourced_run.run.id,
-  step_id = "botster_stack_review",
-  source = "vault",
-  name = "Runtime vault evidence",
-})
-assert(checklist.ok, "checklist create failed")
-assert(reloaded_tools["project_pipelines.add_checklist_item"]({
-  checklist_id = checklist.checklist.id,
-  text = "Loaded the Project Pipelines ownership charter",
-  status = "completed",
-}).ok, "checklist item failed")
-
-for index = 1, 280 do
-  assert(reloaded_tools["project_pipelines.submit_gate"]({
-    run_id = "run_runtime_finding_info",
-    step_id = "botster_stack_plan_review",
-    gate_id = "plan_review",
-    status = "passed",
-    summary = "Event retention probe " .. tostring(index),
-  }).ok, "event retention probe failed")
-end
-local bounded_context = reloaded_tools["project_pipelines.current_context"]({})
-assert(#bounded_context.events == 256, "diagnostic event retention must stay bounded")
-assert(durable_store["v2/events/event_1"] == nil, "event retention must delete the oldest durable event keys")
-
-local key_count = 0
-for _ in pairs(durable_store) do key_count = key_count + 1 end
-local quota_probe_keys = {}
-for index = key_count + 1, 960 do
-  local key = "v2/quota_probe/" .. tostring(index)
-  durable_store[key] = {
-    key = key,
-    schema_version = 2,
-    revision = 1,
-    payload = { id = "quota_probe_" .. tostring(index) },
-  }
-  table.insert(quota_probe_keys, key)
-end
-local counters_revision_before_quota = durable_store["v2/meta/counters"].revision
-local quota_failure = reloaded_tools["project_pipelines.create_ticket"]({
-  id = "ticket_runtime_over_quota",
-  project_id = "proj_runtime_standalone",
-  title = "Must not partially persist",
-})
-assert(quota_failure.ok == false and quota_failure.error.code == "store_capacity_exhausted", "store ceiling must fail diagnostically")
-assert(durable_store["v2/tickets/ticket_runtime_over_quota"] == nil, "capacity failure must not partially persist the domain record")
-assert(durable_store["v2/meta/counters"].revision == counters_revision_before_quota, "capacity failure must not partially reserve counters")
-for _, key in ipairs(quota_probe_keys) do durable_store[key] = nil end
-
-for key in pairs(durable_store) do
-  assert(key ~= "state", "retired all-domain state key must not be read or written")
-  assert(key:sub(1, 3) == "v2/", "all runtime records must use versioned prefix-addressable keys")
-end
-
-local source_record = durable_store["v2/pipeline_definitions/botster_stack_delivery"]
-source_record.payload.source_revision = "stale-source"
-source_record.payload.steps[1].agent_name = "operator-selected-agent"
-local initialized_events_before_reconcile = 0
-for key, record in pairs(durable_store) do
-  if key:sub(1, #"v2/events/") == "v2/events/" and record.payload.kind == "pipeline_source_initialized" then
-    initialized_events_before_reconcile = initialized_events_before_reconcile + 1
-  end
-end
-local reconciled_plugin = dofile("plugin.lua")
-local reconciled_tools = {}
-for _, tool in ipairs(reconciled_plugin.tools) do reconciled_tools[tool.name] = tool.call end
-local reconciled_context = reconciled_tools["project_pipelines.current_context"]({})
-local reconciled_stack = nil
-local initialized_events = 0
-for _, definition in ipairs(reconciled_context.pipeline_definitions) do
-  if definition.id == "botster_stack_delivery" then reconciled_stack = definition end
-end
-for _, event in ipairs(reconciled_context.events) do
-  if event.kind == "pipeline_source_initialized" then initialized_events = initialized_events + 1 end
-end
-assert(reconciled_stack.steps[1].agent_name == "operator-selected-agent", "source reconciliation must preserve device-selected agent_name")
-assert(reconciled_stack.steps[1].prompt:find("repository charter"), "source reconciliation must refresh package-owned prompt fields")
-assert(reconciled_stack.steps[1].prompt:find("[[botster-workspaces-playbook]]", 1, true), "source reconciliation must refresh the Workspaces route")
-assert(initialized_events == initialized_events_before_reconcile, "reload and reconciliation must not duplicate initialization events")
-
-durable_store["v2/questions/corrupt_payload"] = {
-  key = "v2/questions/corrupt_payload",
-  schema_version = 2,
-  revision = 1,
-  payload = { id = "corrupt_payload", run_id = "run_runtime_sourced", status = "open" },
+local expected_entity_families = {
+  "project", "project_target", "ticket", "ticket_dependency",
+  "pipeline_definition", "run", "run_step", "gate_result", "review",
+  "finding", "artifact", "checklist", "checklist_item", "question",
+  "answer", "question_orchestrator", "pr_link", "event", "session_request",
 }
-local corrupt_load_ok, corrupt_load_error = pcall(dofile, "plugin.lua")
-assert(not corrupt_load_ok and tostring(corrupt_load_error):find("missing required field question", 1, true), "payload validator must reject malformed durable records")
-durable_store["v2/questions/corrupt_payload"] = nil
-LUA
-lua "$lua_test"
-rm -f "$lua_test"
-trap - EXIT HUP INT TERM
+local provider_count = 0
+for _ in pairs(entity_providers) do provider_count = provider_count + 1 end
+assert(provider_count == #expected_entity_families, "entity provider set must be closed")
+for _, family in ipairs(expected_entity_families) do
+  local entity_type = "project-pipelines." .. family
+  local provider = entity_providers[entity_type]
+  assert(provider, "missing entity provider " .. entity_type)
+  local first_snapshot = provider({ entity_type = entity_type })
+  local reconnect_snapshot = provider({ entity_type = entity_type })
+  assert(first_snapshot.type == "entity_snapshot" and first_snapshot.entity_type == entity_type)
+  assert(reconnect_snapshot.snapshot_seq == first_snapshot.snapshot_seq + 1, "reconnect snapshot must be fresh")
+end
+local run_snapshot = entity_providers["project-pipelines.run"]({ entity_type = "project-pipelines.run" })
+assert(#run_snapshot.items == #tools["project_pipelines.current_context"]({}).runs, "run snapshot must match committed context")
+local merged = handlers["pr_merged"]({ repo = "example/repo", pr_number = 1, merge_commit = "abc123" })
+assert(merged.ok and merged.ticket.status == "closed" and merged.run.status == "closed")
+local home = handlers["project-pipelines.home"]({})
+assert(home.id == "project-pipelines-home")
 
-echo "standalone package authority checks passed"
+local source_key = "v3/pipeline_definitions/botster_stack_delivery"
+assert(durable_store[source_key], "sourced delivery definition missing")
+durable_store[source_key].payload.steps[1].agent_name = "operator-selected"
+durable_store[source_key].payload.source_revision = "stale"
+local reloaded = dofile("plugin.lua")
+local reloaded_tools = {}
+for _, descriptor in ipairs(reloaded.tools) do reloaded_tools[descriptor.name] = descriptor.call end
+local sourced
+for _, pipeline in ipairs(reloaded_tools["project_pipelines.list_pipelines"]({}).pipelines) do
+  if pipeline.id == "botster_stack_delivery" then sourced = pipeline end
+end
+assert(sourced and sourced.steps[1].agent_name == "operator-selected")
+local routed = false
+for _, step in ipairs(sourced.steps) do
+  if step.prompt and step.prompt:find("botster%-workspaces%-playbook") then routed = true end
+end
+assert(routed, "Botster Stack Delivery must retain botster-workspaces routing")
+
+print("project-pipelines authoritative package checks passed")
+LUA
+
+lua "$lua_test"
+script/test-cutover
