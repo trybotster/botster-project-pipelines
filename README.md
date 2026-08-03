@@ -27,14 +27,13 @@ persistence ownership.
 
 The executable contract fixture is
 [`fixtures/project_pipelines/domain_contract.json`](fixtures/project_pipelines/domain_contract.json).
-`script/test` validates the fixture relationships, standalone mode, optional
-workspace-linked mode, session-template request shape, template selector
-resolution, blocked provider diagnostics, provider capability boundaries,
-manifest anchors, and PII/raw-path absence. It also loads the
-production `plugin.lua` entrypoint with Botster capability stubs, creates
-persisted records, activates PTY and non-PTY steps, reloads the entrypoint, and
-proves the app workbench and settings surfaces expose persisted
-project/ticket/run/session state. The settings surface also renders
+`script/test` validates fixture and manifest anchors, the closed MCP descriptor
+contract, repository routing (including negative and ambiguous cases),
+PII/operator-path absence, atomic lifecycle failure, dependency and gate
+blocking, verdict-based review routing, correlated spawn replay, malformed
+record rejection, v2 namespace removal, entity snapshots, and source reload.
+It also proves the app workbench and settings surfaces expose committed state.
+The settings surface renders
 `project-pipelines-provider-dependency-status`, a stable provider/dependency
 status section derived from persisted session request diagnostics.
 
@@ -49,14 +48,17 @@ artifact/checklist, question/orchestrator, PR, context, and lifecycle behavior.
 `update_ticket_status`, `show_project`, and `show_ticket`. Two package-owned
 additions remain explicit outside the 61-name legacy contract:
 `resolve_repository_playbook` enforces the repository routing allowlist, and
-`entities` returns committed entity snapshots for Web/TUI reconnect hydration.
-There are no aliases or fallback registrations.
+`entities` is a request-facing inspection tool returning committed entity
+frames. Reconnect hydration is served only by the explicitly declared
+`project-pipelines.*` entity providers. There are no aliases or fallback
+registrations.
 
 ## Drain-first Cold Cut
 
 The real device cut is a post-merge operator action after every legacy run is
 terminal. `script/cutover export LEGACY_DB ARCHIVE_JSON IMPORT_JSON` rejects
-active runs, exports only owning projects/targets plus open or blocked tickets,
+every run outside the terminal `closed`, `done`, and `cancelled` allowlist,
+exports only owning projects/targets plus open or blocked tickets,
 omits already-satisfied edges to closed tickets from the live import while
 keeping them in the immutable archive, rejects dangling carried edges, and
 aborts above the 896-key cutover budget. `script/cutover import HUB_SOCKET
@@ -72,13 +74,12 @@ write: disable/remove the package before restoring the single legacy snapshot.
 After package writes, forward repair is the default; destructive rollback
 requires export plus explicit loss confirmation.
 
-The harness also exercises the public ticket-dependency lifecycle through the
-registered production tools: it adds a dependency after a run starts, proves an
-open prerequisite blocks Implement without changing the current step or
-creating a session request, closes/removes the prerequisite, explicitly retries,
-and proves each run spawns only once. Missing referenced tickets fail safe and
-planning steps remain available only when they explicitly set
-`allows_open_ticket_dependencies=true`.
+The harness also proves that an open ticket dependency prevents run creation,
+closing the prerequisite permits an explicit retry, and atomic failure still
+leaves the ticket open with no run or run-step. A separate correlated-spawn case
+proves `retry_step_agent` reuses the durable result without a second dispatch.
+Missing referenced tickets fail safe and planning steps remain available only
+when they explicitly set `allows_open_ticket_dependencies=true`.
 
 `plugin.lua` is the single production entrypoint consumed by the current Hub
 worker sandbox. It contains the versioned prefix-addressable record repository,

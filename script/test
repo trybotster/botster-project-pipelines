@@ -7,11 +7,14 @@ python3 -m json.tool fixtures/project_pipelines/domain_contract.json >/dev/null
 
 python3 - <<'PY'
 import json
+import re
 from pathlib import Path
 
 manifest = json.loads(Path("botster-package.json").read_text())
+fixture = json.loads(Path("fixtures/project_pipelines/domain_contract.json").read_text())
 source = Path("plugin.lua").read_text()
 assert manifest["name"] == "project-pipelines"
+assert manifest["version"] == "0.2.0"
 assert manifest["entrypoints"] == [{"runtime": "lua", "path": "plugin.lua", "bootstrap": False}]
 assert {capability["surface"] for capability in manifest["capabilities"]} == {
     "surfaces", "mcp", "plugin_db", "session_actions"
@@ -19,6 +22,34 @@ assert {capability["surface"] for capability in manifest["capabilities"]} == {
 assert "require(" not in source
 assert "plugin_db.batch" in source
 assert 'STORE_ROOT = "v3/"' in source
+assert fixture["contract_version"] == 3
+assert fixture["persistence_boundaries"]["runtime_storage_namespace"] == "v3/<family>/<id>"
+for family in ["project_target", "ticket_dependency", "run_step"]:
+    assert family in fixture["domain_objects"]
+surface_ids = {surface["id"] for surface in manifest["surfaces"]}
+assert {"project-pipelines.home", "project-pipelines.settings"} <= surface_ids
+navigation_targets = {item["target"]["surface_id"] for item in manifest["navigation"]}
+assert "project-pipelines.home" in navigation_targets
+readme = Path("README.md").read_text()
+domain_contract = Path("docs/domain-contract.md").read_text()
+for phrase in ["Public MCP Contract", "Drain-first Cold Cut", "plugin_db.batch", "entity_provider"]:
+    assert phrase in readme
+for phrase in ["Persistence Boundaries", "entity_provider", "provider-specific merge execution"]:
+    assert phrase in domain_contract
+for dead_name in ["empty_schema", "repository_from", "show_project", "show_ticket", "update_ticket_status", "list_pipeline_definitions", "record_run"]:
+    assert f"local function {dead_name}" not in source
+
+scan_paths = [
+    ".gitignore", "README.md", "botster-package.json", "plugin.lua",
+    "script/test", "script/cutover", "script/test-cutover", "script/test-hub-flow",
+    "script/hub_acceptance_smoke", "docs/domain-contract.md",
+    "fixtures/project_pipelines/domain_contract.json",
+]
+pii_pattern = re.compile(r"/" + r"Users/|/" + r"home/|jason" + r"conigliari|[A-Za-z0-9._%+-]+@(gmail|icloud|me)\\.com", re.I)
+assert pii_pattern.search("/" + "Users/example/known-positive")
+for path in scan_paths:
+    match = pii_pattern.search(Path(path).read_text())
+    assert not match, f"PII or operator path in {path}: {match.group(0)}"
 PY
 
 lua_test="$(mktemp "${TMPDIR:-/tmp}/botster-project-pipelines-test.XXXXXX")"
@@ -105,6 +136,10 @@ botster = {
         table.insert(spawned, copy(args))
         return { ok = true, result = { request_id = args.request_id, session_uuid = "session-" .. tostring(#spawned) } }
       end,
+      ensure_worktree_and_spawn = function(args)
+        table.insert(spawned, copy(args))
+        return { session_id = "session-" .. tostring(#spawned), worktree_id = "worktree-" .. tostring(#spawned) }
+      end,
     },
   },
   register = function(spec) return spec end,
@@ -112,9 +147,19 @@ botster = {
 
 local plugin = dofile("plugin.lua")
 local tools = {}
+local descriptors = {}
 for _, descriptor in ipairs(plugin.tools) do
   assert(not tools[descriptor.name], "duplicate tool " .. descriptor.name)
   tools[descriptor.name] = descriptor.call
+  descriptors[descriptor.name] = descriptor
+  assert(type(descriptor.description) == "string" and #descriptor.description > 20, "tool description must be authored")
+  local generated = descriptor.name:gsub("^project_pipelines%.", ""):gsub("_", " ") .. "."
+  assert(descriptor.description ~= generated, "generated tool description remains " .. descriptor.name)
+  assert(type(descriptor.input_schema) == "table" and descriptor.input_schema.type == "object")
+  assert(type(descriptor.input_schema.properties) == "table" and next(descriptor.input_schema.properties), "tool properties must be discoverable")
+  if descriptor.input_schema.required ~= nil then
+    assert(type(descriptor.input_schema.required) == "table" and #descriptor.input_schema.required > 0, "required must be a nonempty array")
+  end
 end
 
 local required = {
@@ -151,6 +196,43 @@ end
 assert(tools["project_pipelines.resolve_repository_playbook"])
 assert(tools["project_pipelines.entities"])
 assert(#plugin.tools == #required + 2, "descriptor set must be closed")
+assert(descriptors["project_pipelines.submit_review"].input_schema.properties.verdict.enum[2] == "changes_required")
+assert(descriptors["project_pipelines.submit_review"].input_schema.properties.findings.items.properties.severity.enum[1] == "blocker")
+assert(descriptors["project_pipelines.update_ticket"].input_schema.properties.status.enum[4] == "closed")
+assert(descriptors["project_pipelines.create_checklist"].input_schema.properties.scope.enum[3] == "run")
+assert(descriptors["project_pipelines.create_checklist"].input_schema.properties.run_id.type == "string")
+assert(descriptors["project_pipelines.list_checklists"].input_schema.properties.run_id.type == "string")
+assert(descriptors["project_pipelines.retry_step_agent"].input_schema.required[1] == "run_id")
+assert(descriptors["project_pipelines.remove_project_target"].input_schema.properties.project_target_id.type == "string")
+
+for _, name in ipairs({
+  "add_project_target", "remove_project_target", "update_project", "delete_project",
+  "update_ticket", "get_ticket", "get_project", "delete_ticket", "update_pipeline",
+  "delete_pipeline", "create_step", "update_step", "delete_step", "create_gate",
+  "update_gate", "delete_gate", "start_run", "create_child_run", "close_ticket",
+  "spawn_ticket_session", "get_checklist", "update_checklist", "update_checklist_item",
+  "create_vault_checklist", "get_pr_link", "escalate_question",
+}) do
+  assert(pcall(tools["project_pipelines." .. name], nil), name .. " must reject nil arguments without crashing")
+end
+
+local resolve_playbook = tools["project_pipelines.resolve_repository_playbook"]
+local expected_routes = {
+  ["botster-core"] = "[[botster-core-playbook]]",
+  ["botster-hub"] = "[[botster-hub-playbook]]",
+  ["botster-hub-client"] = "[[botster-hub-client-playbook]]",
+  ["botster-web"] = "[[botster-web-playbook]]",
+  ["botster-workspaces"] = "[[botster-workspaces-playbook]]",
+  ["botster-tui"] = "[[botster-tui-playbook]]",
+  ["botster-tui-kit"] = "[[botster-tui-kit-playbook]]",
+  ["botster-terminal-ghostty"] = "[[botster-terminal-ghostty-playbook]]",
+  ["botster-project-pipelines"] = "[[project-pipelines-playbook]]",
+}
+for repository, playbook in pairs(expected_routes) do
+  assert(resolve_playbook({ repository = "trybotster/" .. repository }).playbook == playbook)
+end
+assert(not resolve_playbook({ repository = "trybotster/restty" }).ok, "unsupported repository must require a routing question")
+assert(not resolve_playbook({ repository = "botster-core", path = "plugin.lua" }).ok, "ambiguous routing must require a question")
 
 local project = tools["project_pipelines.create_project"]({
   id = "project-one", name = "Project One", target_id = "target-one",
@@ -159,13 +241,38 @@ assert(project.ok)
 assert(tools["project_pipelines.add_project_target"]({
   project_id = "project-one", target_id = "target-one",
 }).ok)
+local removable_target = tools["project_pipelines.add_project_target"]({
+  id = "project-target-two", project_id = "project-one", target_id = "target-two",
+})
+assert(removable_target.ok)
+assert(tools["project_pipelines.remove_project_target"]({ project_target_id = "project-target-two" }).ok)
 assert(tools["project_pipelines.create_pipeline"]({
   id = "pipeline-two-step", name = "Two Step",
   steps = {
-    { id = "step-one", name = "One", next_step_id = "step-two" },
+    { id = "step-one", name = "One", next_step_id = "step-two", gates = {
+      { id = "gate-one", prompt = "Prove step one", required = true },
+    } },
     { id = "step-two", name = "Two" },
   },
 }).ok)
+
+assert(tools["project_pipelines.create_project"]({ id = "project-disposable", name = "Disposable" }).ok)
+assert(tools["project_pipelines.update_project"]({ project_id = "project-disposable", description = "Updated" }).project.description == "Updated")
+assert(tools["project_pipelines.list_projects"]({ status = "active" }).ok)
+assert(tools["project_pipelines.delete_project"]({ project_id = "project-disposable" }).ok)
+assert(tools["project_pipelines.create_pipeline"]({ id = "pipeline-disposable", name = "Disposable" }).ok)
+assert(tools["project_pipelines.update_pipeline"]({ pipeline_id = "pipeline-disposable", description = "Updated" }).pipeline.description == "Updated")
+local disposable_step = tools["project_pipelines.create_step"]({
+  pipeline_id = "pipeline-disposable", id = "step-disposable", name = "Disposable step",
+})
+assert(disposable_step.ok)
+assert(tools["project_pipelines.update_step"]({ step_id = "step-disposable", prompt = "Updated prompt" }).step.prompt == "Updated prompt")
+assert(tools["project_pipelines.update_step_agent"]({ step_id = "step-disposable", agent_name = "codex" }).step.agent_name == "codex")
+assert(tools["project_pipelines.create_gate"]({ step_id = "step-disposable", id = "gate-disposable", prompt = "Prove it" }).ok)
+assert(tools["project_pipelines.update_gate"]({ gate_id = "gate-disposable", prompt = "Updated proof" }).gate.prompt == "Updated proof")
+assert(tools["project_pipelines.delete_gate"]({ gate_id = "gate-disposable" }).ok)
+assert(tools["project_pipelines.delete_step"]({ step_id = "step-disposable" }).ok)
+assert(tools["project_pipelines.delete_pipeline"]({ pipeline_id = "pipeline-disposable" }).ok)
 
 assert(tools["project_pipelines.create_ticket"]({
   id = "dependency-open", project_id = "project-one", title = "Dependency",
@@ -180,6 +287,13 @@ local blocked = tools["project_pipelines.start_run"]({
   id = "run-blocked", ticket_id = "ticket-blocked", pipeline_id = "pipeline-two-step",
 })
 assert(not blocked.ok and blocked.error.code == "ticket_dependencies_unmet")
+local dependency_rows = tools["project_pipelines.list_ticket_dependencies"]({ ticket_id = "ticket-blocked" }).dependencies
+assert(#dependency_rows == 1)
+assert(tools["project_pipelines.remove_ticket_dependency"]({ dependency_id = dependency_rows[1].id }).ok)
+assert(#tools["project_pipelines.list_ticket_dependencies"]({ ticket_id = "ticket-blocked" }).dependencies == 0)
+assert(tools["project_pipelines.add_ticket_dependency"]({
+  ticket_id = "ticket-blocked", depends_on_ticket_id = "dependency-open",
+}).ok)
 assert(tools["project_pipelines.update_ticket"]({ ticket_id = "dependency-open", status = "closed" }).ok)
 
 fail_batch_key_prefix = "v3/run_steps/"
@@ -200,11 +314,26 @@ local started = tools["project_pipelines.start_run"]({
 assert(started.ok and started.ticket.status == "active")
 assert(started.run.current_run_step_id == started.run_step.id)
 assert(#tools["project_pipelines.get_ticket"]({ ticket_id = "ticket-blocked" }).runs == 1)
+fail_batch_key_prefix = "v3/run_steps/"
+local failed_child = tools["project_pipelines.create_child_run"]({
+  id = "run-child", ticket_id = "ticket-child", parent_run_id = "run-atomic", title = "Child",
+})
+assert(not failed_child.ok and failed_child.error.code == "persist_failed")
+local after_failed_child = tools["project_pipelines.current_context"]({})
+for _, ticket in ipairs(after_failed_child.tickets) do assert(ticket.id ~= "ticket-child", "failed atomic child creation must not create ticket") end
+for _, run in ipairs(after_failed_child.runs) do assert(run.id ~= "run-child", "failed atomic child creation must not create run") end
+fail_batch_key_prefix = nil
+local child = tools["project_pipelines.create_child_run"]({
+  id = "run-child", ticket_id = "ticket-child", parent_run_id = "run-atomic", title = "Child",
+})
+assert(child.ok and child.ticket.id == "ticket-child" and child.run.ticket_id == "ticket-child")
+assert(child.ticket.parent_ticket_id == "ticket-blocked" and child.run.parent_run_id == "run-atomic")
 local checklist = tools["project_pipelines.create_checklist"]({
   id = "checklist-one", run_id = "run-atomic", owner_id = "run-atomic", name = "Proof",
   items = { { id = "item-one", prompt = "Verify atomic start" } },
 })
 assert(checklist.ok)
+assert(#tools["project_pipelines.list_checklists"]({ run_id = "run-atomic", scope = "run" }).checklists == 1)
 assert(#tools["project_pipelines.get_checklist"]({ checklist_id = "checklist-one" }).items == 1)
 assert(tools["project_pipelines.update_checklist_item"]({ item_id = "item-one", status = "done", evidence = { command = "script/test" } }).ok)
 assert(tools["project_pipelines.add_artifact"]({ run_id = "run-atomic", kind = "report", summary = "Atomic proof" }).ok)
@@ -212,12 +341,31 @@ local question = tools["project_pipelines.ask_human"]({ run_id = "run-atomic", t
 assert(question.ok)
 assert(tools["project_pipelines.answer_question"]({ question_id = question.question.id, answer = "Yes" }).ok)
 assert(#tools["project_pipelines.receive_question_answers"]({ all = true }).answers == 1)
+local claim = tools["project_pipelines.claim_question_orchestrator"]({ project_id = "project-one" }, { session_uuid = "orchestrator-one" })
+assert(claim.ok and #tools["project_pipelines.question_orchestrator_status"]({}).orchestrators == 1)
+local agent_question = tools["project_pipelines.ask_agent"]({
+  run_id = "run-atomic", ticket_id = "ticket-blocked", question = "Review?",
+}, { session_uuid = "requester-one" })
+assert(agent_question.ok)
+assert(tools["project_pipelines.escalate_question"]({ question_id = agent_question.question.id }).question.kind == "human")
+assert(tools["project_pipelines.answer_question"]({ question_id = agent_question.question.id, answer = "Reviewed" }).ok)
+assert(#tools["project_pipelines.receive_question_answers"]({ all = true, ticket_id = "ticket-blocked", status = "answered" }).answers == 2)
+assert(tools["project_pipelines.release_question_orchestrator"]({ project_id = "project-one" }, { session_uuid = "orchestrator-one" }).ok)
+assert(#tools["project_pipelines.question_orchestrator_status"]({}).orchestrators == 0)
 local review = tools["project_pipelines.submit_review"]({
   run_id = "run-atomic", step_id = "step-one", verdict = "approved",
   findings = { { id = "finding-one", title = "Carry forward", severity = "medium" } },
 })
 assert(review.ok)
 assert(tools["project_pipelines.resolve_finding"]({ finding_id = "finding-one", resolution = "Verified" }).ok)
+local gate_blocked = tools["project_pipelines.request_step_advance"]({
+  run_id = "run-atomic", request_id = "advance-before-gate",
+})
+assert(not gate_blocked.ok and gate_blocked.error.code == "transition_blocked", "missing gate must block transition")
+assert(tools["project_pipelines.submit_gate"]({
+  run_id = "run-atomic", step_id = "step-one", gate_id = "gate-one", status = "passed",
+  evidence = { command = "script/test" },
+}).ok)
 local advanced = tools["project_pipelines.request_step_advance"]({
   run_id = "run-atomic", request_id = "advance-once",
 })
@@ -250,7 +398,59 @@ fail_batch_key_prefix = nil
 assert(tools["project_pipelines.link_pr"]({
   run_id = "run-merge", pr_url = "https://example.invalid/pr/1", repo = "example/repo", pr_number = 1,
 }).ok)
+local pr_links = tools["project_pipelines.list_pr_links"]({ run_id = "run-merge", repo = "example/repo" }).pr_links
+assert(#pr_links == 1 and tools["project_pipelines.get_pr_link"]({ pr_link_id = pr_links[1].id }).pr_link.id == pr_links[1].id)
 assert(tools["project_pipelines.request_merge"]({ run_id = "run-merge" }).ok)
+
+assert(tools["project_pipelines.create_pipeline"]({
+  id = "pipeline-spawn", name = "Spawn",
+  steps = { { id = "spawn-step", name = "Spawn", kind = "pty", session_template_id = "template_codex" } },
+}).ok)
+assert(tools["project_pipelines.create_ticket"]({
+  id = "ticket-spawn", project_id = "project-one", target_id = "target-one", title = "Spawn",
+}).ok)
+assert(tools["project_pipelines.start_run"]({
+  id = "run-spawn", ticket_id = "ticket-spawn", pipeline_id = "pipeline-spawn",
+}).ok)
+local first_spawn = tools["project_pipelines.spawn_ticket_session"]({
+  run_id = "run-spawn", request_id = "spawn-once", session_template_id = "template_codex",
+})
+assert(first_spawn.ok and #spawned == 1, "first correlated spawn must dispatch once")
+local retry_spawn = tools["project_pipelines.retry_step_agent"]({ run_id = "run-spawn" })
+assert(retry_spawn.ok and retry_spawn.activation.id == first_spawn.activation.id, "retry must reuse durable spawn result")
+assert(#spawned == 1, "retry must not dispatch a second managed spawn")
+
+assert(tools["project_pipelines.create_pipeline"]({
+  id = "pipeline-review-routing", name = "Review routing",
+  steps = {
+    { id = "implement", name = "Implement", next_step_id = "review" },
+    { id = "review", name = "Review", next_step_id = "verify", on_approved_step_id = "verify",
+      on_changes_requested_step_id = "implement", on_blocked_step_id = "implement" },
+    { id = "verify", name = "Verify" },
+  },
+}).ok)
+assert(tools["project_pipelines.create_ticket"]({
+  id = "ticket-review-routing", project_id = "project-one", title = "Review routing",
+}).ok)
+assert(tools["project_pipelines.start_run"]({
+  id = "run-review-routing", ticket_id = "ticket-review-routing", pipeline_id = "pipeline-review-routing",
+}).ok)
+assert(tools["project_pipelines.request_step_advance"]({ run_id = "run-review-routing" }).step_id == "review")
+assert(tools["project_pipelines.submit_review"]({
+  run_id = "run-review-routing", step_id = "review", verdict = "changes_required",
+  findings = { { id = "finding-rework", title = "Rework", severity = "high" } },
+}).ok)
+local returned = tools["project_pipelines.request_step_advance"]({ run_id = "run-review-routing" })
+assert(returned.ok and returned.step_id == "implement", "changes_required must route back to Implement")
+assert(tools["project_pipelines.resolve_finding"]({ finding_id = "finding-rework", resolution = "fixed" }).ok)
+assert(tools["project_pipelines.request_step_advance"]({ run_id = "run-review-routing" }).step_id == "review")
+assert(tools["project_pipelines.submit_review"]({
+  run_id = "run-review-routing", step_id = "review", verdict = "approved",
+}).ok)
+local approved_route = tools["project_pipelines.request_step_advance"]({ run_id = "run-review-routing" })
+assert(approved_route.ok and approved_route.step_id == "verify", "approved review must route forward")
+local review_route_context = tools["project_pipelines.current_context"]({ run_id = "run-review-routing" })
+assert(#review_route_context.run_steps == 5, "each review route must create a durable run-step visit")
 
 local entities = tools["project_pipelines.entities"]({})
 assert(entities.ok and #entities.frames >= 5)
@@ -288,6 +488,44 @@ local merged = handlers["pr_merged"]({ repo = "example/repo", pr_number = 1, mer
 assert(merged.ok and merged.ticket.status == "closed" and merged.run.status == "closed")
 local home = handlers["project-pipelines.home"]({})
 assert(home.id == "project-pipelines-home")
+local function find_node(node, id)
+  if type(node) ~= "table" then return nil end
+  if node.id == id then return node end
+  if type(node.node) == "table" then
+    local found = find_node(node.node, id)
+    if found then return found end
+  end
+  for _, child in ipairs(node.children or {}) do
+    local found = find_node(child, id)
+    if found then return found end
+  end
+  for _, children in pairs(node.slots or {}) do
+    for _, child in ipairs(children) do
+      local found = find_node(child, id)
+      if found then return found end
+    end
+  end
+  return nil
+end
+assert(find_node(home, "project-pipelines-workbench-toolbar").type == "toolbar")
+assert(find_node(home, "project-pipelines-project-table").type == "table")
+local settings = handlers["project-pipelines.settings"]({})
+assert(find_node(settings, "project-pipelines-provider-dependency-status"), "settings must expose provider diagnostics")
+
+durable_store["v3/tickets/malformed"] = {
+  key = "v3/tickets/malformed", schema_version = 3, revision = 1,
+  payload = { id = "malformed" },
+}
+local malformed_ok = pcall(tools["project_pipelines.current_context"], {})
+assert(not malformed_ok, "malformed durable record must fail closed")
+durable_store["v3/tickets/malformed"] = nil
+
+durable_store["v2/tickets/legacy"] = {
+  key = "v2/tickets/legacy", schema_version = 2, revision = 1,
+  payload = { id = "legacy", project_id = "project-one", title = "Legacy", status = "open" },
+}
+local cleaned = dofile("plugin.lua")
+assert(cleaned and durable_store["v2/tickets/legacy"] == nil, "v2 namespace must be removed atomically on load")
 
 local source_key = "v3/pipeline_definitions/botster_stack_delivery"
 assert(durable_store[source_key], "sourced delivery definition missing")
@@ -301,6 +539,11 @@ for _, pipeline in ipairs(reloaded_tools["project_pipelines.list_pipelines"]({})
   if pipeline.id == "botster_stack_delivery" then sourced = pipeline end
 end
 assert(sourced and sourced.steps[1].agent_name == "operator-selected")
+local sourced_review
+for _, step in ipairs(sourced.steps) do if step.id == "botster_stack_review" then sourced_review = step end end
+assert(sourced_review.on_approved_step_id == "botster_stack_verify")
+assert(sourced_review.on_changes_requested_step_id == "botster_stack_implement")
+assert(sourced_review.on_blocked_step_id == "botster_stack_implement")
 local routed = false
 for _, step in ipairs(sourced.steps) do
   if step.prompt and step.prompt:find("botster%-workspaces%-playbook") then routed = true end

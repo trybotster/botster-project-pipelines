@@ -1,6 +1,6 @@
 local STORE_SCHEMA_VERSION = 3
 local STORE_ROOT = "v3/"
-local SOURCE_REVISION = "botster-stack-delivery/2026-08-02.1"
+local SOURCE_REVISION = "botster-stack-delivery/2026-08-03.1"
 local MAX_STORE_KEYS = 1024
 local STORE_KEY_HEADROOM = 64
 local MAX_EVENTS = 256
@@ -33,17 +33,14 @@ local RECORD_FAMILIES = {
   "events",
 }
 
-local function empty_schema()
-  return { type = "object", properties = {}, additionalProperties = false }
-end
-
 local function object_schema(properties, required)
-  return {
+  local schema = {
     type = "object",
     properties = properties,
-    required = required or {},
     additionalProperties = true,
   }
+  if type(required) == "table" and #required > 0 then schema.required = required end
+  return schema
 end
 
 local function trim(value)
@@ -314,7 +311,28 @@ local function load_state()
     return state
   end
 
-  state._store_key_count = #list_entries(plugin_db.list({ prefix = STORE_ROOT }))
+  local namespace_entries = list_entries(plugin_db.list({ prefix = "" }))
+  local legacy_mutations = {}
+  for _, entry in ipairs(namespace_entries) do
+    if type(entry.key) == "string" and entry.key:sub(1, 3) == "v2/" then
+      table.insert(legacy_mutations, {
+        operation = "delete",
+        key = entry.key,
+        expected_revision = entry.revision or 0,
+      })
+    end
+  end
+  if #legacy_mutations > 0 then
+    if type(plugin_db.batch) ~= "function" then
+      error("legacy_store_cleanup_failed: atomic plugin_db.batch capability is unavailable")
+    end
+    local cleanup = plugin_db.batch({ mutations = legacy_mutations })
+    if type(cleanup) ~= "table" or cleanup.ok ~= true then
+      error("legacy_store_cleanup_failed: " .. tostring(cleanup and (cleanup.error_kind or cleanup.message) or "unknown error"))
+    end
+    namespace_entries = list_entries(plugin_db.list({ prefix = "" }))
+  end
+  state._store_key_count = #namespace_entries
   local counter_response = plugin_db.get({ key = STORE_ROOT .. "meta/counters" })
   local counters = record_payload(counter_response)
   if counters then
@@ -594,6 +612,9 @@ local function sourced_step(id, name, position, agent_name, role_prompt, options
     allows_open_ticket_dependencies = options.allows_open_ticket_dependencies == true,
     gates = options.gates or {},
     next_step_id = options.next_step_id,
+    on_approved_step_id = options.on_approved_step_id or options.next_step_id,
+    on_changes_requested_step_id = options.on_changes_requested_step_id,
+    on_blocked_step_id = options.on_blocked_step_id,
     source_revision = SOURCE_REVISION,
   }
 end
@@ -617,6 +638,8 @@ local function botster_stack_delivery_source()
       sourced_step("botster_stack_plan_review", "Plan Review", 2, "claude", "Independently verify repository routing, ownership, risks, and executable acceptance checks.", {
         allows_open_ticket_dependencies = true,
         next_step_id = "botster_stack_implement",
+        on_changes_requested_step_id = "botster_stack_plan",
+        on_blocked_step_id = "botster_stack_plan",
         gates = {
           {
             id = "plan_review",
@@ -633,6 +656,8 @@ local function botster_stack_delivery_source()
       }),
       sourced_step("botster_stack_review", "Review", 4, "claude", "Review correctness, regressions, architecture fit, tests, docs, dead paths, and hidden assumptions.", {
         next_step_id = "botster_stack_verify",
+        on_changes_requested_step_id = "botster_stack_implement",
+        on_blocked_step_id = "botster_stack_implement",
         gates = {
           {
             id = "review",
@@ -930,21 +955,6 @@ local function spawn_session_template(resolved_template, request)
   return response, dispatched_request
 end
 
-local function repository_from(arguments)
-  local repository = table_arg(arguments, "repository") or {}
-  repository = {
-    id = trim(repository.id or arguments.repository_id),
-    name = trim(repository.name or arguments.repository_name),
-    remote = trim(repository.remote or arguments.repository_remote),
-  }
-  local missing = {}
-  if not repository.id or repository.id == "" then table.insert(missing, "repository.id") end
-  if not repository.name or repository.name == "" then table.insert(missing, "repository.name") end
-  if not repository.remote or repository.remote == "" then table.insert(missing, "repository.remote") end
-  if #missing > 0 then return nil, missing end
-  return repository, nil
-end
-
 local function create_project(arguments)
   arguments = arguments or {}
   local name = trim(arguments.name)
@@ -982,16 +992,13 @@ local function create_project(arguments)
   return ok({ project = project })
 end
 
-local function list_projects()
-  return ok({ projects = load_state().projects })
-end
-
-local function show_project(arguments)
-  local id = string_arg(arguments, "project_id") or string_arg(arguments, "id")
-  if not id then return failure("missing_argument", "project_id is required") end
-  local project = find_by_id(load_state().projects, id)
-  if not project then return failure("not_found", "project not found: " .. id) end
-  return ok({ project = project })
+local function list_projects(arguments)
+  arguments = arguments or {}
+  local projects = {}
+  for _, project in ipairs(load_state().projects) do
+    if not arguments.status or project.status == arguments.status then table.insert(projects, project) end
+  end
+  return ok({ projects = projects })
 end
 
 local function create_ticket(arguments)
@@ -1026,22 +1033,16 @@ local function create_ticket(arguments)
 end
 
 local function list_tickets(arguments)
+  arguments = arguments or {}
   local state = load_state()
-  local project_id = string_arg(arguments or {}, "project_id")
-  if not project_id then return ok({ tickets = state.tickets }) end
+  local project_id = string_arg(arguments, "project_id")
   local tickets = {}
   for _, ticket in ipairs(state.tickets) do
-    if ticket.project_id == project_id then table.insert(tickets, ticket) end
+    if (not project_id or ticket.project_id == project_id)
+      and (not arguments.status or ticket.status == arguments.status)
+    then table.insert(tickets, ticket) end
   end
   return ok({ tickets = tickets })
-end
-
-local function show_ticket(arguments)
-  local id = string_arg(arguments, "ticket_id") or string_arg(arguments, "id")
-  if not id then return failure("missing_argument", "ticket_id is required") end
-  local ticket = find_by_id(load_state().tickets, id)
-  if not ticket then return failure("not_found", "ticket not found: " .. id) end
-  return ok({ ticket = ticket })
 end
 
 local function add_ticket_dependency(arguments)
@@ -1079,10 +1080,17 @@ end
 local function remove_ticket_dependency(arguments)
   arguments = arguments or {}
   local ticket_id = string_arg(arguments, "ticket_id")
-  local dependency_ticket_id = string_arg(arguments, "dependency_ticket_id")
+  local dependency_ticket_id = string_arg(arguments, "dependency_ticket_id") or string_arg(arguments, "depends_on_ticket_id")
+  local state = load_state()
+  local dependency_id = string_arg(arguments, "dependency_id")
+  if dependency_id then
+    local dependency = find_by_id(state.ticket_dependencies, dependency_id)
+    if not dependency then return failure("not_found", "ticket dependency not found: " .. dependency_id) end
+    ticket_id = ticket_id or dependency.ticket_id
+    dependency_ticket_id = dependency_ticket_id or dependency.depends_on_ticket_id
+  end
   if not ticket_id then return failure("validation_failed", "ticket_id is required", { "ticket_id" }) end
   if not dependency_ticket_id then return failure("validation_failed", "dependency_ticket_id is required", { "dependency_ticket_id" }) end
-  local state = load_state()
   local ticket = find_by_id(state.tickets, ticket_id)
   if not ticket then return failure("not_found", "ticket not found: " .. ticket_id) end
   local dependencies = {}
@@ -1103,25 +1111,6 @@ local function remove_ticket_dependency(arguments)
     end
   end
   push_event(state, "ticket_dependency_removed", nil, ticket.id, { dependency_ticket_id = dependency_ticket_id })
-  local err = save_state(state)
-  if err then return err end
-  return ok({ ticket = ticket })
-end
-
-local function update_ticket_status(arguments)
-  arguments = arguments or {}
-  local ticket_id = string_arg(arguments, "ticket_id")
-  local status = string_arg(arguments, "status")
-  if not ticket_id then return failure("validation_failed", "ticket_id is required", { "ticket_id" }) end
-  if status ~= "open" and status ~= "closed" then
-    return failure("validation_failed", "status must be open or closed", { "status" })
-  end
-  local state = load_state()
-  local ticket = find_by_id(state.tickets, ticket_id)
-  if not ticket then return failure("not_found", "ticket not found: " .. ticket_id) end
-  if ticket.status == status then return ok({ ticket = ticket }) end
-  ticket.status = status
-  push_event(state, "ticket_status_updated", nil, ticket.id, { status = status })
   local err = save_state(state)
   if err then return err end
   return ok({ ticket = ticket })
@@ -1190,48 +1179,12 @@ local function define_pipeline(arguments)
   return ok({ pipeline_definition = pipeline, pipeline = pipeline })
 end
 
-local function list_pipeline_definitions()
-  return ok({ pipeline_definitions = load_state().pipeline_definitions })
-end
-
 local function show_pipeline_definition(arguments)
   local id = string_arg(arguments, "pipeline_definition_id") or string_arg(arguments, "id")
   if not id then return failure("missing_argument", "pipeline_definition_id is required") end
   local pipeline = find_by_id(load_state().pipeline_definitions, id)
   if not pipeline then return failure("not_found", "pipeline definition not found: " .. id) end
   return ok({ pipeline_definition = pipeline })
-end
-
-local function record_run(arguments)
-  arguments = arguments or {}
-  local state = load_state()
-  local ticket_id = trim(arguments.ticket_id)
-  local pipeline_id = trim(arguments.pipeline_definition_id)
-  if not ticket_id or ticket_id == "" then return failure("validation_failed", "ticket_id is required", { "ticket_id" }) end
-  if not pipeline_id or pipeline_id == "" then return failure("validation_failed", "pipeline_definition_id is required", { "pipeline_definition_id" }) end
-  if not find_by_id(state.tickets, ticket_id) then return failure("not_found", "ticket not found: " .. ticket_id) end
-  local pipeline = find_by_id(state.pipeline_definitions, pipeline_id)
-  if not pipeline then return failure("not_found", "pipeline definition not found: " .. pipeline_id) end
-  local first_step = pipeline.steps[1] or {}
-  local run = {
-    id = string_arg(arguments, "id") or next_id(state, "run"),
-    ticket_id = ticket_id,
-    pipeline_definition_id = pipeline_id,
-    current_step_id = string_arg(arguments, "current_step_id") or first_step.id,
-    status = string_arg(arguments, "status") or "active",
-    workspace_session_group_id = string_arg(arguments, "workspace_session_group_id"),
-    workspace_id = string_arg(arguments, "workspace_id"),
-    repository = arguments.repository,
-    spawn_target_id = string_arg(arguments, "spawn_target_id"),
-    branch = string_arg(arguments, "branch"),
-    base_ref = string_arg(arguments, "base_ref") or "main",
-    worktree = arguments.worktree or { kind = "provider_owned_reference", id = string_arg(arguments, "worktree_id") },
-  }
-  table.insert(state.runs, run)
-  push_event(state, "run_started", run.id, run.id)
-  local err = save_state(state)
-  if err then return err end
-  return ok({ run = run })
 end
 
 local function activate_step(arguments)
@@ -1798,13 +1751,31 @@ local function request_step_advance(arguments)
   if not pipeline then return failure("not_found", "pipeline definition not found: " .. run.pipeline_definition_id) end
   local current_step = find_pipeline_step(pipeline, run.current_step_id)
   if not current_step then return failure("not_found", "current step not found: " .. tostring(run.current_step_id)) end
-  local next_step_id = string_arg(arguments, "next_step_id") or current_step.next_step_id
+  local latest_review
+  for _, review in ipairs(state.reviews) do
+    if review.run_id == run.id and review.step_id == current_step.id then latest_review = review end
+  end
+  local review_rework = latest_review
+    and (latest_review.verdict == "changes_required" or latest_review.verdict == "blocked")
+  local next_step_id
+  if latest_review and latest_review.verdict == "approved" then
+    next_step_id = current_step.on_approved_step_id or current_step.next_step_id
+  elseif latest_review and latest_review.verdict == "changes_required" then
+    next_step_id = current_step.on_changes_requested_step_id
+  elseif latest_review and latest_review.verdict == "blocked" then
+    next_step_id = current_step.on_blocked_step_id
+  else
+    next_step_id = string_arg(arguments, "next_step_id") or current_step.next_step_id
+  end
+  if review_rework and not next_step_id then
+    return failure("review_route_missing", "current step has no route for review verdict " .. latest_review.verdict)
+  end
   if not next_step_id then return failure("terminal_step", "current step has no next step") end
   local next_step = find_pipeline_step(pipeline, next_step_id)
   if not next_step then return failure("not_found", "next step not found: " .. next_step_id) end
-  local blockers = transition_blockers(state, run, pipeline, current_step)
+  local blockers = review_rework and {} or transition_blockers(state, run, pipeline, current_step)
   local ticket = find_by_id(state.tickets, run.ticket_id)
-  if next_step.allows_open_ticket_dependencies ~= true then
+  if not review_rework and next_step.allows_open_ticket_dependencies ~= true then
     for _, dependency in ipairs(unmet_ticket_dependencies(state, ticket)) do
       table.insert(blockers, { kind = "ticket_dependency", dependency = dependency })
     end
@@ -1890,6 +1861,7 @@ local function update_fields(record, arguments, fields)
 end
 
 local function add_project_target(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local project = find_by_id(state.projects, string_arg(arguments, "project_id"))
   local target_id = string_arg(arguments, "target_id")
@@ -1903,10 +1875,14 @@ local function add_project_target(arguments)
 end
 
 local function remove_project_target(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local removed
   for index, target in ipairs(state.project_targets) do
-    if target.project_id == string_arg(arguments, "project_id") and target.target_id == string_arg(arguments, "target_id") then
+    local matches_id = string_arg(arguments, "project_target_id") == target.id
+    local matches_pair = target.project_id == string_arg(arguments, "project_id")
+      and target.target_id == string_arg(arguments, "target_id")
+    if matches_id or matches_pair then
       removed = table.remove(state.project_targets, index)
       break
     end
@@ -1916,6 +1892,7 @@ local function remove_project_target(arguments)
 end
 
 local function update_project(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local project = find_by_id(state.projects, string_arg(arguments, "project_id"))
   if not project then return failure("not_found", "project not found") end
@@ -1924,6 +1901,7 @@ local function update_project(arguments)
 end
 
 local function delete_project(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local id = string_arg(arguments, "project_id")
   for _, ticket in ipairs(state.tickets) do
@@ -1938,6 +1916,7 @@ local function delete_project(arguments)
 end
 
 local function update_ticket(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local ticket = find_by_id(state.tickets, string_arg(arguments, "ticket_id"))
   if not ticket then return failure("not_found", "ticket not found") end
@@ -1946,11 +1925,16 @@ local function update_ticket(arguments)
 end
 
 local function get_ticket(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local ticket = find_by_id(state.tickets, string_arg(arguments, "ticket_id"))
   if not ticket then return failure("not_found", "ticket not found") end
-  local runs, dependencies, findings, questions = {}, {}, {}, {}
+  local runs, run_steps, session_requests, dependencies, findings, questions = {}, {}, {}, {}, {}, {}
   for _, run in ipairs(state.runs) do if run.ticket_id == ticket.id then table.insert(runs, run) end end
+  for _, run in ipairs(runs) do
+    for _, run_step in ipairs(state.run_steps) do if run_step.run_id == run.id then table.insert(run_steps, run_step) end end
+    for _, request in ipairs(state.session_requests) do if request.run_id == run.id then table.insert(session_requests, request) end end
+  end
   for _, dependency in ipairs(state.ticket_dependencies) do if dependency.ticket_id == ticket.id then table.insert(dependencies, dependency) end end
   for _, finding in ipairs(state.findings) do
     for _, run in ipairs(runs) do if finding.run_id == run.id then table.insert(findings, finding); break end end
@@ -1960,6 +1944,8 @@ local function get_ticket(arguments)
     ticket = ticket,
     project = find_by_id(state.projects, ticket.project_id),
     runs = runs,
+    run_steps = run_steps,
+    session_requests = session_requests,
     dependencies = dependencies,
     findings = findings,
     questions = questions,
@@ -1967,6 +1953,7 @@ local function get_ticket(arguments)
 end
 
 local function get_project(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local project = find_by_id(state.projects, string_arg(arguments, "project_id"))
   if not project then return failure("not_found", "project not found") end
@@ -1977,6 +1964,7 @@ local function get_project(arguments)
 end
 
 local function delete_ticket(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local id = string_arg(arguments, "ticket_id")
   for _, run in ipairs(state.runs) do
@@ -1992,6 +1980,7 @@ local function delete_ticket(arguments)
 end
 
 local function search_tickets(arguments)
+  arguments = arguments or {}
   local selected = {}
   local query = trim(arguments.query or "") or ""
   query = query:lower()
@@ -2007,6 +1996,7 @@ local function search_tickets(arguments)
 end
 
 local function list_ticket_dependencies(arguments)
+  arguments = arguments or {}
   local selected = {}
   for _, dependency in ipairs(load_state().ticket_dependencies) do
     if not arguments.ticket_id or dependency.ticket_id == arguments.ticket_id then table.insert(selected, dependency) end
@@ -2015,16 +2005,19 @@ local function list_ticket_dependencies(arguments)
 end
 
 local function create_pipeline(arguments)
+  arguments = arguments or {}
   arguments.pipeline_definition_id = arguments.id
   return define_pipeline(arguments)
 end
 
 local function get_pipeline(arguments)
+  arguments = arguments or {}
   arguments.pipeline_definition_id = arguments.pipeline_id
   return show_pipeline_definition(arguments)
 end
 
 local function list_pipelines(arguments)
+  arguments = arguments or {}
   local pipelines = {}
   for _, pipeline in ipairs(load_state().pipeline_definitions) do
     if arguments.include_archived == true or pipeline.archived_at == nil then table.insert(pipelines, pipeline) end
@@ -2033,6 +2026,7 @@ local function list_pipelines(arguments)
 end
 
 local function update_pipeline(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local pipeline = find_by_id(state.pipeline_definitions, string_arg(arguments, "pipeline_id"))
   if not pipeline then return failure("not_found", "pipeline not found") end
@@ -2041,6 +2035,7 @@ local function update_pipeline(arguments)
 end
 
 local function delete_pipeline(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local id = string_arg(arguments, "pipeline_id")
   for _, run in ipairs(state.runs) do if run.pipeline_definition_id == id then return failure("pipeline_has_runs", "pipeline has runs") end end
@@ -2050,6 +2045,7 @@ local function delete_pipeline(arguments)
 end
 
 local function create_step(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local pipeline = find_by_id(state.pipeline_definitions, string_arg(arguments, "pipeline_id"))
   if not pipeline then return failure("not_found", "pipeline not found") end
@@ -2070,6 +2066,7 @@ local function find_step_state(state, step_id)
 end
 
 local function update_step(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local _, step = find_step_state(state, string_arg(arguments, "step_id"))
   if not step then return failure("not_found", "step not found") end
@@ -2078,11 +2075,13 @@ local function update_step(arguments)
 end
 
 local function update_step_agent(arguments)
+  arguments = arguments or {}
   arguments.agent_name = arguments.agent_name or arguments.agent
   return update_step(arguments)
 end
 
 local function delete_step(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local pipeline, step = find_step_state(state, string_arg(arguments, "step_id"))
   if not step then return failure("not_found", "step not found") end
@@ -2091,6 +2090,7 @@ local function delete_step(arguments)
 end
 
 local function create_gate(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local _, step = find_step_state(state, string_arg(arguments, "step_id"))
   if not step then return failure("not_found", "step not found") end
@@ -2102,6 +2102,7 @@ local function create_gate(arguments)
 end
 
 local function update_gate(arguments)
+  arguments = arguments or {}
   local state = load_state()
   for _, pipeline in ipairs(state.pipeline_definitions) do for _, step in ipairs(array(pipeline.steps)) do
     local gate = find_by_id(array(step.gates), string_arg(arguments, "gate_id"))
@@ -2114,6 +2115,7 @@ local function update_gate(arguments)
 end
 
 local function delete_gate(arguments)
+  arguments = arguments or {}
   local state = load_state()
   for _, pipeline in ipairs(state.pipeline_definitions) do for _, step in ipairs(array(pipeline.steps)) do
     local gate = remove_by_id(array(step.gates), string_arg(arguments, "gate_id"))
@@ -2123,6 +2125,7 @@ local function delete_gate(arguments)
 end
 
 local function start_run(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local ticket = find_by_id(state.tickets, string_arg(arguments, "ticket_id"))
   local pipeline_id = string_arg(arguments, "pipeline_id") or string_arg(arguments, "pipeline_definition_id")
@@ -2162,14 +2165,66 @@ local function start_run(arguments)
 end
 
 local function create_child_run(arguments)
-  local parent = find_by_id(load_state().runs, string_arg(arguments, "parent_run_id"))
+  arguments = arguments or {}
+  local state = load_state()
+  local parent = find_by_id(state.runs, string_arg(arguments, "parent_run_id"))
   if not parent then return failure("not_found", "parent run not found") end
-  arguments.ticket_id = arguments.ticket_id or parent.ticket_id
-  arguments.pipeline_id = arguments.pipeline_id or parent.pipeline_definition_id
-  return start_run(arguments)
+  local parent_ticket = find_by_id(state.tickets, parent.ticket_id)
+  if not parent_ticket then return failure("not_found", "parent ticket not found") end
+  local title = trim(arguments.title)
+  if not title or title == "" then return failure("validation_failed", "title is required", { "title" }) end
+  local pipeline_id = string_arg(arguments, "pipeline_id") or parent.pipeline_definition_id
+  local pipeline = find_by_id(state.pipeline_definitions, pipeline_id)
+  if not pipeline then return failure("not_found", "pipeline not found: " .. tostring(pipeline_id)) end
+  local first_step = array(pipeline.steps)[1]
+  if not first_step then return failure("pipeline_empty", "pipeline has no steps") end
+
+  local ticket = {
+    id = string_arg(arguments, "ticket_id") or next_id(state, "ticket"),
+    project_id = parent_ticket.project_id,
+    workspace_id = string_arg(arguments, "workspace_id") or parent_ticket.workspace_id,
+    title = title,
+    description = string_arg(arguments, "description"),
+    status = "active",
+    target_id = string_arg(arguments, "target_id") or parent.target_id or parent_ticket.target_id,
+    dependency_ticket_ids = {},
+    parent_ticket_id = parent_ticket.id,
+  }
+  if find_by_id(state.tickets, ticket.id) then return failure("id_conflict", "ticket id already exists") end
+  local run = {
+    id = string_arg(arguments, "id") or next_id(state, "run"),
+    ticket_id = ticket.id,
+    pipeline_id = pipeline.id,
+    pipeline_definition_id = pipeline.id,
+    current_step_id = first_step.id,
+    status = "active",
+    target_id = ticket.target_id,
+    spawn_target_id = ticket.target_id,
+    workspace_name = string_arg(arguments, "workspace_name"),
+    parent_run_id = parent.id,
+    base_ref = string_arg(arguments, "base_ref"),
+    base_run_id = string_arg(arguments, "base_run_id") or parent.id,
+    base_ticket_id = string_arg(arguments, "base_ticket_id") or parent_ticket.id,
+    base_target_path = string_arg(arguments, "base_target_path"),
+  }
+  if find_by_id(state.runs, run.id) then return failure("id_conflict", "run id already exists") end
+  local run_step = {
+    id = next_id(state, "run_step"), run_id = run.id, step_id = first_step.id,
+    status = "active", sequence = 1,
+  }
+  run.current_run_step_id = run_step.id
+  table.insert(state.tickets, ticket)
+  table.insert(state.runs, run)
+  table.insert(state.run_steps, run_step)
+  push_event(state, "ticket_created", nil, ticket.id, { parent_ticket_id = parent_ticket.id })
+  push_event(state, "run_started", run.id, ticket.id, { parent_run_id = parent.id })
+  local err = save_state(state)
+  if err then return err end
+  return ok({ ticket = ticket, run = run, run_step = run_step })
 end
 
 local function finish_run(arguments, run_status, ticket_status)
+  arguments = arguments or {}
   local state = load_state()
   local run = find_by_id(state.runs, string_arg(arguments, "run_id"))
   if not run then return failure("not_found", "run not found") end
@@ -2188,6 +2243,7 @@ local function cancel_run(arguments) return finish_run(arguments, "cancelled", "
 local function request_merge(arguments) return finish_run(arguments, "merge_requested", "active") end
 
 local function close_ticket(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local ticket = find_by_id(state.tickets, string_arg(arguments, "ticket_id"))
   if not ticket then return failure("not_found", "ticket not found") end
@@ -2231,11 +2287,13 @@ local function handle_pr_merged(arguments)
 end
 
 local function retry_step_agent(arguments)
+  arguments = arguments or {}
   arguments.request_id = arguments.request_id or ("retry:" .. tostring(arguments.run_id) .. ":" .. tostring(arguments.step_id or "current"))
   return activate_step(arguments)
 end
 
 local function spawn_ticket_session(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local run = arguments.run_id and find_by_id(state.runs, arguments.run_id) or nil
   if not run then return failure("not_found", "run not found") end
@@ -2243,17 +2301,20 @@ local function spawn_ticket_session(arguments)
 end
 
 local function list_checklists(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local selected = {}
   for _, checklist in ipairs(state.checklists) do
     if (not arguments.run_id or checklist.run_id == arguments.run_id)
       and (not arguments.owner_id or checklist.owner_id == arguments.owner_id or checklist.run_id == arguments.owner_id)
+      and (not arguments.scope or checklist.scope == arguments.scope)
     then table.insert(selected, checklist) end
   end
   return ok({ checklists = selected })
 end
 
 local function get_checklist(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local checklist = find_by_id(state.checklists, string_arg(arguments, "checklist_id"))
   if not checklist then return failure("not_found", "checklist not found") end
@@ -2263,6 +2324,7 @@ local function get_checklist(arguments)
 end
 
 local function update_checklist(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local checklist = find_by_id(state.checklists, string_arg(arguments, "checklist_id"))
   if not checklist then return failure("not_found", "checklist not found") end
@@ -2271,6 +2333,7 @@ local function update_checklist(arguments)
 end
 
 local function update_checklist_item(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local item = find_by_id(state.checklist_items, string_arg(arguments, "item_id"))
   if not item then return failure("not_found", "checklist item not found") end
@@ -2281,6 +2344,7 @@ local function update_checklist_item(arguments)
 end
 
 local function create_vault_checklist(arguments)
+  arguments = arguments or {}
   arguments.source = "vault"
   arguments.name = arguments.name or "Vault workflow"
   arguments.items = arguments.items or {
@@ -2300,22 +2364,27 @@ local function checklist_instructions()
 end
 
 local function list_pr_links(arguments)
+  arguments = arguments or {}
   local selected = {}
   for _, link in ipairs(load_state().pr_links) do
     if (not arguments.ticket_id or link.ticket_id == arguments.ticket_id)
       and (not arguments.run_id or link.run_id == arguments.run_id)
+      and (not arguments.provider or link.provider == arguments.provider)
+      and (not arguments.repo or link.repo == arguments.repo)
     then table.insert(selected, link) end
   end
   return ok({ pr_links = selected })
 end
 
 local function get_pr_link(arguments)
+  arguments = arguments or {}
   local link = find_by_id(load_state().pr_links, string_arg(arguments, "pr_link_id"))
   if not link then return failure("not_found", "PR link not found") end
   return ok({ pr_link = link })
 end
 
 local function claim_question_orchestrator(arguments, context)
+  arguments = arguments or {}
   local state = load_state()
   local scope = string_arg(arguments, "project_id") and "project" or "global"
   local session_uuid = string_arg(arguments, "session_uuid") or string_arg(context or {}, "session_uuid") or "current-session"
@@ -2332,6 +2401,7 @@ local function claim_question_orchestrator(arguments, context)
 end
 
 local function release_question_orchestrator(arguments, context)
+  arguments = arguments or {}
   local state = load_state()
   local session_uuid = string_arg(arguments, "session_uuid") or string_arg(context or {}, "session_uuid")
   for index = #state.question_orchestrators, 1, -1 do
@@ -2349,6 +2419,7 @@ local function question_orchestrator_status()
 end
 
 local function ask_question(arguments, context, kind)
+  arguments = arguments or {}
   arguments.kind = kind
   arguments.asked_by = arguments.asked_by or string_arg(context or {}, "session_uuid")
   return record_question(arguments)
@@ -2358,6 +2429,7 @@ local function ask_human(arguments, context) return ask_question(arguments, cont
 local function ask_agent(arguments, context) return ask_question(arguments, context, "agent") end
 
 local function receive_question_answers(arguments, context)
+  arguments = arguments or {}
   local state = load_state()
   local session_uuid = string_arg(arguments, "session_uuid") or string_arg(context or {}, "session_uuid")
   local answers = {}
@@ -2366,12 +2438,15 @@ local function receive_question_answers(arguments, context)
     if question and (arguments.all == true or not session_uuid or question.asked_by == session_uuid)
       and (not arguments.question_id or question.id == arguments.question_id)
       and (not arguments.run_id or question.run_id == arguments.run_id)
+      and (not arguments.ticket_id or question.ticket_id == arguments.ticket_id)
+      and (not arguments.status or question.status == arguments.status)
     then table.insert(answers, { question = question, answer = answer }) end
   end
   return ok({ answers = answers })
 end
 
 local function escalate_question(arguments)
+  arguments = arguments or {}
   local state = load_state()
   local question = find_by_id(state.questions, string_arg(arguments, "question_id"))
   if not question then return failure("not_found", "question not found") end
@@ -3351,13 +3426,1752 @@ local function render_settings()
     })
 end
 
+local TOOL_CONTRACTS = {
+  ["add_artifact"] = {
+    ["description"] = "Attach a durable artifact to a run, such as a plan, patch summary, command result, or external URL.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["kind"] = {
+          ["type"] = "string",
+        },
+        ["payload"] = {
+          ["type"] = "object",
+        },
+        ["run_id"] = {
+          ["type"] = "string",
+        },
+        ["run_step_id"] = {
+          ["type"] = "string",
+        },
+        ["step_id"] = {
+          ["type"] = "string",
+        },
+        ["summary"] = {
+          ["type"] = "string",
+        },
+        ["uri"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "run_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["add_checklist_item"] = {
+    ["description"] = "Add a checkpoint to an existing checklist.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["checklist_id"] = {
+          ["type"] = "string",
+        },
+        ["evidence"] = {
+          ["type"] = "object",
+        },
+        ["position"] = {
+          ["type"] = "integer",
+        },
+        ["prompt"] = {
+          ["type"] = "string",
+        },
+        ["source_ref"] = {
+          ["type"] = "string",
+        },
+        ["status"] = {
+          ["enum"] = {
+            "pending",
+            "in_progress",
+            "blocked",
+            "skipped",
+            "done",
+          },
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "checklist_id",
+        "prompt",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["add_project_target"] = {
+    ["description"] = "Attach a spawn target to a project.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["project_id"] = {
+          ["type"] = "string",
+        },
+        ["target_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "project_id",
+        "target_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["add_ticket_dependency"] = {
+    ["description"] = "Add an ordering dependency. The ticket cannot start a pipeline run until the dependency ticket is closed.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["depends_on_ticket_id"] = {
+          ["type"] = "string",
+        },
+        ["ticket_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "ticket_id",
+        "depends_on_ticket_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["answer_question"] = {
+    ["description"] = "Answer a Project Pipelines question and notify the asking session to read the durable answer with project_pipelines_receive_question_answers.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["answer"] = {
+          ["type"] = "string",
+        },
+        ["question_id"] = {
+          ["type"] = "string",
+        },
+        ["status"] = {
+          ["enum"] = {
+            "answered",
+            "dismissed",
+          },
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "question_id",
+        "answer",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["ask_agent"] = {
+    ["description"] = "Ask a new or configured advisor agent a durable pipeline question.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["agent_name"] = {
+          ["type"] = "string",
+        },
+        ["blocking"] = {
+          ["type"] = "boolean",
+        },
+        ["question"] = {
+          ["type"] = "string",
+        },
+        ["run_id"] = {
+          ["type"] = "string",
+        },
+        ["ticket_id"] = {
+          ["type"] = "string",
+        },
+        ["workspace_name"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "question",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["ask_human"] = {
+    ["description"] = "Ask a durable pipeline question. It routes to the active project/global question orchestrator first and falls back to the human when none is active.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["blocking"] = {
+          ["type"] = "boolean",
+        },
+        ["question"] = {
+          ["type"] = "string",
+        },
+        ["run_id"] = {
+          ["type"] = "string",
+        },
+        ["ticket_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "question",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["cancel_run"] = {
+    ["description"] = "Cancel an active or blocked pipeline run without advancing steps or requesting a merge. This marks the current step cancelled and closes agents owned by the run.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["reason"] = {
+          ["type"] = "string",
+        },
+        ["run_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "run_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["checklist_instructions"] = {
+    ["description"] = "Return instructions for using Project Pipelines checklists with the vault as the source of truth for conventions.",
+    ["input_schema"] = {
+      ["properties"] = {},
+      ["type"] = "object",
+    },
+  },
+  ["claim_question_orchestrator"] = {
+    ["description"] = "Claim ownership of answering Project Pipelines questions from the calling agent session. Omit project_id to become the global fallback; provide it to own one project. This does not require the agent to belong to a ticket.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["project_id"] = {
+          ["type"] = "string",
+        },
+        ["replace"] = {
+          ["description"] = "Replace another active owner. Inactive owners are replaced automatically.",
+          ["type"] = "boolean",
+        },
+      },
+      ["type"] = "object",
+    },
+  },
+  ["close_ticket"] = {
+    ["description"] = "Close a ticket. Completed pipeline work requires merge_confirmed=true. PR-policy tickets close only after Project Pipelines has a linked merged PR, normally from a provider pr_merged event. When merge_confirmed is true, include merge_commit, pr_url, or merge_summary when available so the ticket keeps a merge artifact.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["base_branch"] = {
+          ["type"] = "string",
+        },
+        ["merge_commit"] = {
+          ["type"] = "string",
+        },
+        ["merge_confirmed"] = {
+          ["type"] = "boolean",
+        },
+        ["merge_summary"] = {
+          ["type"] = "string",
+        },
+        ["pr_url"] = {
+          ["type"] = "string",
+        },
+        ["ticket_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "ticket_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["create_checklist"] = {
+    ["description"] = "Create a durable checklist for a project, ticket, or run. Use prompts as workflow checkpoints; keep project conventions in the vault and attach evidence that they were read/applied.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["description"] = {
+          ["type"] = "string",
+        },
+        ["items"] = {
+          ["items"] = {
+            ["properties"] = {
+              ["evidence"] = {
+                ["type"] = "object",
+              },
+              ["id"] = {
+                ["type"] = "string",
+              },
+              ["position"] = {
+                ["type"] = "integer",
+              },
+              ["prompt"] = {
+                ["type"] = "string",
+              },
+              ["source_ref"] = {
+                ["type"] = "string",
+              },
+              ["status"] = {
+                ["enum"] = {
+                  "pending",
+                  "in_progress",
+                  "blocked",
+                  "skipped",
+                  "done",
+                },
+                ["type"] = "string",
+              },
+            },
+            ["required"] = {
+              "prompt",
+            },
+            ["type"] = "object",
+          },
+          ["type"] = "array",
+        },
+        ["name"] = {
+          ["type"] = "string",
+        },
+        ["owner_id"] = {
+          ["type"] = "string",
+        },
+        ["scope"] = {
+          ["enum"] = {
+            "project",
+            "ticket",
+            "run",
+          },
+          ["type"] = "string",
+        },
+        ["source"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "scope",
+        "owner_id",
+        "name",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["create_child_run"] = {
+    ["description"] = "Create a child ticket and pipeline run for a slice of a larger parent run.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["base_ref"] = {
+          ["type"] = "string",
+        },
+        ["base_run_id"] = {
+          ["type"] = "string",
+        },
+        ["base_target_path"] = {
+          ["type"] = "string",
+        },
+        ["base_ticket_id"] = {
+          ["type"] = "string",
+        },
+        ["description"] = {
+          ["type"] = "string",
+        },
+        ["parent_run_id"] = {
+          ["type"] = "string",
+        },
+        ["pipeline_id"] = {
+          ["type"] = "string",
+        },
+        ["target_id"] = {
+          ["type"] = "string",
+        },
+        ["title"] = {
+          ["type"] = "string",
+        },
+        ["workspace_id"] = {
+          ["type"] = "string",
+        },
+        ["workspace_name"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "parent_run_id",
+        "title",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["create_gate"] = {
+    ["description"] = "Create a gate under an existing pipeline step.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["command"] = {
+          ["type"] = "string",
+        },
+        ["id"] = {
+          ["type"] = "string",
+        },
+        ["kind"] = {
+          ["enum"] = {
+            "attestation",
+            "review_clear",
+            "command",
+          },
+          ["type"] = "string",
+        },
+        ["prompt"] = {
+          ["type"] = "string",
+        },
+        ["required_fields"] = {
+          ["items"] = {
+            ["type"] = "string",
+          },
+          ["type"] = "array",
+        },
+        ["step_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "step_id",
+        "prompt",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["create_pipeline"] = {
+    ["description"] = "Create a project pipeline definition. Agents use this to define reusable ticket pipelines explicitly; Botster does not seed default pipelines.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["description"] = {
+          ["type"] = "string",
+        },
+        ["id"] = {
+          ["type"] = "string",
+        },
+        ["merge_policy"] = {
+          ["enum"] = {
+            "direct",
+            "pr",
+          },
+          ["type"] = "string",
+        },
+        ["name"] = {
+          ["type"] = "string",
+        },
+        ["replacement_pipeline_id"] = {
+          ["type"] = "string",
+        },
+        ["steps"] = {
+          ["items"] = {
+            ["properties"] = {
+              ["agent_name"] = {
+                ["type"] = "string",
+              },
+              ["command"] = {
+                ["type"] = "string",
+              },
+              ["gates"] = {
+                ["items"] = {
+                  ["properties"] = {
+                    ["command"] = {
+                      ["type"] = "string",
+                    },
+                    ["id"] = {
+                      ["type"] = "string",
+                    },
+                    ["kind"] = {
+                      ["enum"] = {
+                        "attestation",
+                        "review_clear",
+                        "command",
+                      },
+                      ["type"] = "string",
+                    },
+                    ["prompt"] = {
+                      ["type"] = "string",
+                    },
+                    ["required_fields"] = {
+                      ["items"] = {
+                        ["type"] = "string",
+                      },
+                      ["type"] = "array",
+                    },
+                  },
+                  ["required"] = {
+                    "prompt",
+                  },
+                  ["type"] = "object",
+                },
+                ["type"] = "array",
+              },
+              ["id"] = {
+                ["type"] = "string",
+              },
+              ["kind"] = {
+                ["enum"] = {
+                  "agent",
+                  "command",
+                },
+                ["type"] = "string",
+              },
+              ["name"] = {
+                ["type"] = "string",
+              },
+              ["next_step_id"] = {
+                ["type"] = "string",
+              },
+              ["on_approved_step_id"] = {
+                ["type"] = "string",
+              },
+              ["on_blocked_step_id"] = {
+                ["type"] = "string",
+              },
+              ["on_changes_requested_step_id"] = {
+                ["type"] = "string",
+              },
+              ["position"] = {
+                ["type"] = "integer",
+              },
+              ["prompt"] = {
+                ["type"] = "string",
+              },
+            },
+            ["required"] = {
+              "name",
+            },
+            ["type"] = "object",
+          },
+          ["type"] = "array",
+        },
+        ["supersedes_pipeline_id"] = {
+          ["type"] = "string",
+        },
+        ["version_label"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "id",
+        "name",
+        "steps",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["create_project"] = {
+    ["description"] = "Create an optional project for multi-phase or coordinated work.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["description"] = {
+          ["type"] = "string",
+        },
+        ["name"] = {
+          ["type"] = "string",
+        },
+        ["target_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "name",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["create_step"] = {
+    ["description"] = "Create a step in an existing pipeline definition.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["agent_name"] = {
+          ["type"] = "string",
+        },
+        ["command"] = {
+          ["type"] = "string",
+        },
+        ["gates"] = {
+          ["items"] = {
+            ["properties"] = {
+              ["command"] = {
+                ["type"] = "string",
+              },
+              ["id"] = {
+                ["type"] = "string",
+              },
+              ["kind"] = {
+                ["enum"] = {
+                  "attestation",
+                  "review_clear",
+                  "command",
+                },
+                ["type"] = "string",
+              },
+              ["prompt"] = {
+                ["type"] = "string",
+              },
+              ["required_fields"] = {
+                ["items"] = {
+                  ["type"] = "string",
+                },
+                ["type"] = "array",
+              },
+            },
+            ["required"] = {
+              "prompt",
+            },
+            ["type"] = "object",
+          },
+          ["type"] = "array",
+        },
+        ["id"] = {
+          ["type"] = "string",
+        },
+        ["kind"] = {
+          ["enum"] = {
+            "agent",
+            "command",
+          },
+          ["type"] = "string",
+        },
+        ["name"] = {
+          ["type"] = "string",
+        },
+        ["next_step_id"] = {
+          ["type"] = "string",
+        },
+        ["on_approved_step_id"] = {
+          ["type"] = "string",
+        },
+        ["on_blocked_step_id"] = {
+          ["type"] = "string",
+        },
+        ["on_changes_requested_step_id"] = {
+          ["type"] = "string",
+        },
+        ["pipeline_id"] = {
+          ["type"] = "string",
+        },
+        ["position"] = {
+          ["type"] = "integer",
+        },
+        ["prompt"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "pipeline_id",
+        "name",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["create_ticket"] = {
+    ["description"] = "Create a project pipeline ticket. target_id identifies the spawn target; its filesystem path is resolved automatically and is never set by callers.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["description"] = {
+          ["type"] = "string",
+        },
+        ["project_id"] = {
+          ["type"] = "string",
+        },
+        ["target_id"] = {
+          ["type"] = "string",
+        },
+        ["title"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "title",
+        "target_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["create_vault_checklist"] = {
+    ["description"] = "Create the standard vault workflow checklist for a project, ticket, or run without copying vault conventions into the pipeline.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["description"] = {
+          ["type"] = "string",
+        },
+        ["name"] = {
+          ["type"] = "string",
+        },
+        ["owner_id"] = {
+          ["type"] = "string",
+        },
+        ["scope"] = {
+          ["enum"] = {
+            "project",
+            "ticket",
+            "run",
+          },
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "owner_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["current_context"] = {
+    ["description"] = "Return ticket, run, current step, gate prompts, reviews, findings, artifacts, dependencies, questions, and events for the current pipeline run. If run_id is omitted, infer it from the calling agent session.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["run_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["type"] = "object",
+    },
+  },
+  ["delete_gate"] = {
+    ["description"] = "Delete a pipeline gate that has no submitted gate results.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["gate_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "gate_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["delete_pipeline"] = {
+    ["description"] = "Delete a pipeline definition that has no run history. Steps and gates are deleted with it.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["pipeline_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "pipeline_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["delete_project"] = {
+    ["description"] = "Delete a project that has no tickets. Project spawn-target rows are deleted with it.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["project_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "project_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["delete_step"] = {
+    ["description"] = "Delete a pipeline step that has no run history. Gates under the step are deleted with it.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["step_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "step_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["delete_ticket"] = {
+    ["description"] = "Delete a ticket that has no run history.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["ticket_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "ticket_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["escalate_question"] = {
+    ["description"] = "Escalate an open question assigned to the calling orchestrator back to the human without answering it.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["question_id"] = {
+          ["type"] = "string",
+        },
+        ["reason"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "question_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["get_checklist"] = {
+    ["description"] = "Get one checklist with ordered checklist items and their evidence.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["checklist_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "checklist_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["get_pipeline"] = {
+    ["description"] = "Get one project pipeline definition with ordered steps and gates. Archived pipelines require include_archived=true.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["include_archived"] = {
+          ["type"] = "boolean",
+        },
+        ["pipeline_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "pipeline_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["get_pr_link"] = {
+    ["description"] = "Get a linked pull request by Project Pipelines PR link id.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["pr_link_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "pr_link_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["get_project"] = {
+    ["description"] = "Get one project with its tickets and spawn targets.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["project_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "project_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["get_ticket"] = {
+    ["description"] = "Get one ticket with its project, runs, current status, run steps, sessions, and open findings.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["ticket_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "ticket_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["link_pr"] = {
+    ["description"] = "Link a provider pull request to a ticket so provider-neutral pr_merged events can close the ticket after merge.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["base_branch"] = {
+          ["type"] = "string",
+        },
+        ["head_branch"] = {
+          ["type"] = "string",
+        },
+        ["pr_number"] = {
+          ["type"] = "integer",
+        },
+        ["pr_url"] = {
+          ["type"] = "string",
+        },
+        ["provider"] = {
+          ["default"] = "github",
+          ["type"] = "string",
+        },
+        ["repo"] = {
+          ["description"] = "Repository name such as owner/repo.",
+          ["type"] = "string",
+        },
+        ["run_id"] = {
+          ["type"] = "string",
+        },
+        ["status"] = {
+          ["enum"] = {
+            "open",
+            "closed",
+            "merged",
+          },
+          ["type"] = "string",
+        },
+        ["ticket_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "ticket_id",
+        "repo",
+        "pr_number",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["list_agent_choices"] = {
+    ["description"] = "List available Botster agent definitions for assigning pipeline steps. Pass target_id to include agents configured under that target's repo.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["target_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["type"] = "object",
+    },
+  },
+  ["list_checklists"] = {
+    ["description"] = "List checklists, optionally filtered by project, ticket, or run owner.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["owner_id"] = {
+          ["type"] = "string",
+        },
+        ["scope"] = {
+          ["enum"] = {
+            "project",
+            "ticket",
+            "run",
+          },
+          ["type"] = "string",
+        },
+      },
+      ["type"] = "object",
+    },
+  },
+  ["list_pipelines"] = {
+    ["description"] = "List available project pipelines with ordered steps and gate prompts. Archived pipelines are hidden unless include_archived is true.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["include_archived"] = {
+          ["type"] = "boolean",
+        },
+      },
+      ["type"] = "object",
+    },
+  },
+  ["list_pr_links"] = {
+    ["description"] = "List pull requests linked to pipeline tickets or runs.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["provider"] = {
+          ["type"] = "string",
+        },
+        ["repo"] = {
+          ["type"] = "string",
+        },
+        ["run_id"] = {
+          ["type"] = "string",
+        },
+        ["status"] = {
+          ["enum"] = {
+            "open",
+            "closed",
+            "merged",
+          },
+          ["type"] = "string",
+        },
+        ["ticket_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["type"] = "object",
+    },
+  },
+  ["list_projects"] = {
+    ["description"] = "List project pipeline projects.",
+    ["input_schema"] = {
+      ["properties"] = {},
+      ["type"] = "object",
+    },
+  },
+  ["list_ticket_dependencies"] = {
+    ["description"] = "List ordering dependencies for a ticket, including whether dependency tickets are still open.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["blocking_only"] = {
+          ["type"] = "boolean",
+        },
+        ["ticket_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "ticket_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["list_tickets"] = {
+    ["description"] = "List project pipeline tickets.",
+    ["input_schema"] = {
+      ["properties"] = {},
+      ["type"] = "object",
+    },
+  },
+  ["question_orchestrator_status"] = {
+    ["description"] = "List project and global question-orchestrator assignments and whether each assigned session is currently active.",
+    ["input_schema"] = {
+      ["properties"] = {},
+      ["type"] = "object",
+    },
+  },
+  ["receive_question_answers"] = {
+    ["description"] = "Return durable answers for Project Pipelines questions asked by the calling session, optionally filtered by ticket, run, question, or status.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["all"] = {
+          ["type"] = "boolean",
+        },
+        ["question_id"] = {
+          ["type"] = "string",
+        },
+        ["run_id"] = {
+          ["type"] = "string",
+        },
+        ["status"] = {
+          ["enum"] = {
+            "answered",
+            "dismissed",
+          },
+          ["type"] = "string",
+        },
+        ["ticket_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["type"] = "object",
+    },
+  },
+  ["release_question_orchestrator"] = {
+    ["description"] = "Release the calling session's project-specific or global question-orchestrator claim.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["project_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["type"] = "object",
+    },
+  },
+  ["remove_project_target"] = {
+    ["description"] = "Remove one spawn target row from a project.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["project_target_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "project_target_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["remove_ticket_dependency"] = {
+    ["description"] = "Remove a ticket ordering dependency.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["dependency_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "dependency_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["request_merge"] = {
+    ["description"] = "Spawn a merge agent for a ticket whose latest run is complete.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["agent_name"] = {
+          ["type"] = "string",
+        },
+        ["strategy"] = {
+          ["type"] = "string",
+        },
+        ["ticket_id"] = {
+          ["type"] = "string",
+        },
+        ["workspace_name"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "ticket_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["request_step_advance"] = {
+    ["description"] = "Ask the pipeline engine to move the current step forward. Returns unmet gate prompts when advancement is blocked. Pass next_step_id to route to a specific step; if gates are unmet, override_unmet_gates=true and override_reason are required.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["evidence"] = {
+          ["type"] = "object",
+        },
+        ["next_step_id"] = {
+          ["type"] = "string",
+        },
+        ["override_reason"] = {
+          ["type"] = "string",
+        },
+        ["override_unmet_gates"] = {
+          ["type"] = "boolean",
+        },
+        ["run_id"] = {
+          ["type"] = "string",
+        },
+        ["summary"] = {
+          ["type"] = "string",
+        },
+      },
+      ["type"] = "object",
+    },
+  },
+  ["resolve_finding"] = {
+    ["description"] = "Mark a review finding resolved or waived with a resolution note.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["finding_id"] = {
+          ["type"] = "string",
+        },
+        ["resolution"] = {
+          ["type"] = "string",
+        },
+        ["status"] = {
+          ["enum"] = {
+            "resolved",
+            "waived",
+          },
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "finding_id",
+        "resolution",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["retry_step_agent"] = {
+    ["description"] = "Retry the current blocked agent step after agent spawn or lifecycle failure. Clears stale session linkage on the current run step visit and requeues the pipeline-owned agent spawn. If run_id is omitted, the caller's active pipeline assignment is used.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["reason"] = {
+          ["type"] = "string",
+        },
+        ["run_id"] = {
+          ["type"] = "string",
+        },
+        ["run_step_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["type"] = "object",
+    },
+  },
+  ["search_tickets"] = {
+    ["description"] = "Search tickets by text, status, project, target, and whether closed tickets should be included.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["include_closed"] = {
+          ["type"] = "boolean",
+        },
+        ["limit"] = {
+          ["type"] = "integer",
+        },
+        ["project_id"] = {
+          ["type"] = "string",
+        },
+        ["query"] = {
+          ["type"] = "string",
+        },
+        ["status"] = {
+          ["enum"] = {
+            "open",
+            "active",
+            "blocked",
+            "closed",
+          },
+          ["type"] = "string",
+        },
+        ["target_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["type"] = "object",
+    },
+  },
+  ["spawn_ticket_session"] = {
+    ["description"] = "Spawn an agent or accessory in a ticket's worktree context. Reuses a live ticket worktree when available, otherwise opens the ticket branch.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["accessory_name"] = {
+          ["type"] = "string",
+        },
+        ["agent_name"] = {
+          ["type"] = "string",
+        },
+        ["prompt"] = {
+          ["type"] = "string",
+        },
+        ["session_type"] = {
+          ["default"] = "agent",
+          ["enum"] = {
+            "agent",
+            "accessory",
+          },
+          ["type"] = "string",
+        },
+        ["ticket_id"] = {
+          ["type"] = "string",
+        },
+        ["workspace_id"] = {
+          ["type"] = "string",
+        },
+        ["workspace_name"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "ticket_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["start_run"] = {
+    ["description"] = "Start a pipeline run for a ticket. The ticket's target_id supplies the spawn target; its filesystem path is resolved automatically for agent and command steps.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["base_ref"] = {
+          ["type"] = "string",
+        },
+        ["base_run_id"] = {
+          ["type"] = "string",
+        },
+        ["base_target_path"] = {
+          ["type"] = "string",
+        },
+        ["base_ticket_id"] = {
+          ["type"] = "string",
+        },
+        ["parent_run_id"] = {
+          ["type"] = "string",
+        },
+        ["pipeline_id"] = {
+          ["type"] = "string",
+        },
+        ["target_id"] = {
+          ["type"] = "string",
+        },
+        ["ticket_id"] = {
+          ["type"] = "string",
+        },
+        ["workspace_id"] = {
+          ["type"] = "string",
+        },
+        ["workspace_name"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "ticket_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["submit_gate"] = {
+    ["description"] = "Submit evidence for a pipeline gate. Agents should submit required gate evidence before requesting advancement.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["evidence"] = {
+          ["type"] = "object",
+        },
+        ["gate_id"] = {
+          ["type"] = "string",
+        },
+        ["run_id"] = {
+          ["type"] = "string",
+        },
+        ["run_step_id"] = {
+          ["type"] = "string",
+        },
+        ["status"] = {
+          ["enum"] = {
+            "passed",
+            "failed",
+            "waived",
+          },
+          ["type"] = "string",
+        },
+        ["step_id"] = {
+          ["type"] = "string",
+        },
+        ["summary"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "run_id",
+        "step_id",
+        "gate_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["submit_review"] = {
+    ["description"] = "Submit a structured review for a pipeline step, including findings that become visible to every agent in the run context. This records the review; it does not advance the run. The response includes next-tool guidance when the current step still needs explicit advancement.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["findings"] = {
+          ["items"] = {
+            ["properties"] = {
+              ["details"] = {
+                ["type"] = "string",
+              },
+              ["file"] = {
+                ["type"] = "string",
+              },
+              ["line"] = {
+                ["type"] = "integer",
+              },
+              ["severity"] = {
+                ["enum"] = {
+                  "blocker",
+                  "high",
+                  "medium",
+                  "low",
+                  "info",
+                },
+                ["type"] = "string",
+              },
+              ["suggested_fix"] = {
+                ["type"] = "string",
+              },
+              ["title"] = {
+                ["type"] = "string",
+              },
+            },
+            ["required"] = {
+              "title",
+            },
+            ["type"] = "object",
+          },
+          ["type"] = "array",
+        },
+        ["run_id"] = {
+          ["type"] = "string",
+        },
+        ["run_step_id"] = {
+          ["type"] = "string",
+        },
+        ["step_id"] = {
+          ["type"] = "string",
+        },
+        ["summary"] = {
+          ["type"] = "string",
+        },
+        ["verdict"] = {
+          ["enum"] = {
+            "approved",
+            "changes_required",
+            "blocked",
+          },
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "run_id",
+        "step_id",
+        "verdict",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["update_checklist"] = {
+    ["description"] = "Update checklist metadata.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["checklist_id"] = {
+          ["type"] = "string",
+        },
+        ["description"] = {
+          ["type"] = "string",
+        },
+        ["name"] = {
+          ["type"] = "string",
+        },
+        ["source"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "checklist_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["update_checklist_item"] = {
+    ["description"] = "Update one checklist item status and evidence. Use evidence to list vault notes read, convention conflicts, verification commands, or capture paths.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["evidence"] = {
+          ["type"] = "object",
+        },
+        ["item_id"] = {
+          ["type"] = "string",
+        },
+        ["position"] = {
+          ["type"] = "integer",
+        },
+        ["prompt"] = {
+          ["type"] = "string",
+        },
+        ["source_ref"] = {
+          ["type"] = "string",
+        },
+        ["status"] = {
+          ["enum"] = {
+            "pending",
+            "in_progress",
+            "blocked",
+            "skipped",
+            "done",
+          },
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "item_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["update_gate"] = {
+    ["description"] = "Update a pipeline gate definition.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["command"] = {
+          ["type"] = "string",
+        },
+        ["gate_id"] = {
+          ["type"] = "string",
+        },
+        ["kind"] = {
+          ["enum"] = {
+            "attestation",
+            "review_clear",
+            "command",
+          },
+          ["type"] = "string",
+        },
+        ["prompt"] = {
+          ["type"] = "string",
+        },
+        ["required_fields"] = {
+          ["items"] = {
+            ["type"] = "string",
+          },
+          ["type"] = "array",
+        },
+      },
+      ["required"] = {
+        "gate_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["update_pipeline"] = {
+    ["description"] = "Update a pipeline definition's metadata, archive state, replacement links, name, description, or merge policy.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["archived"] = {
+          ["type"] = "boolean",
+        },
+        ["description"] = {
+          ["type"] = "string",
+        },
+        ["merge_policy"] = {
+          ["enum"] = {
+            "direct",
+            "pr",
+          },
+          ["type"] = "string",
+        },
+        ["name"] = {
+          ["type"] = "string",
+        },
+        ["pipeline_id"] = {
+          ["type"] = "string",
+        },
+        ["replacement_pipeline_id"] = {
+          ["type"] = "string",
+        },
+        ["supersedes_pipeline_id"] = {
+          ["type"] = "string",
+        },
+        ["version_label"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "pipeline_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["update_project"] = {
+    ["description"] = "Update a project's name, description, or status.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["description"] = {
+          ["type"] = "string",
+        },
+        ["name"] = {
+          ["type"] = "string",
+        },
+        ["project_id"] = {
+          ["type"] = "string",
+        },
+        ["status"] = {
+          ["enum"] = {
+            "open",
+            "active",
+            "blocked",
+            "closed",
+          },
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "project_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["update_step"] = {
+    ["description"] = "Update a pipeline step definition.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["agent_name"] = {
+          ["type"] = "string",
+        },
+        ["command"] = {
+          ["type"] = "string",
+        },
+        ["kind"] = {
+          ["enum"] = {
+            "agent",
+            "command",
+          },
+          ["type"] = "string",
+        },
+        ["name"] = {
+          ["type"] = "string",
+        },
+        ["next_step_id"] = {
+          ["type"] = "string",
+        },
+        ["on_approved_step_id"] = {
+          ["type"] = "string",
+        },
+        ["on_blocked_step_id"] = {
+          ["type"] = "string",
+        },
+        ["on_changes_requested_step_id"] = {
+          ["type"] = "string",
+        },
+        ["position"] = {
+          ["type"] = "integer",
+        },
+        ["prompt"] = {
+          ["type"] = "string",
+        },
+        ["step_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "step_id",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["update_step_agent"] = {
+    ["description"] = "Set the Botster agent definition used by one pipeline step.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["agent_name"] = {
+          ["type"] = "string",
+        },
+        ["step_id"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "step_id",
+        "agent_name",
+      },
+      ["type"] = "object",
+    },
+  },
+  ["update_ticket"] = {
+    ["description"] = "Update a ticket's title, description, project, target, or status.",
+    ["input_schema"] = {
+      ["properties"] = {
+        ["description"] = {
+          ["type"] = "string",
+        },
+        ["project_id"] = {
+          ["type"] = "string",
+        },
+        ["status"] = {
+          ["enum"] = {
+            "open",
+            "active",
+            "blocked",
+            "closed",
+          },
+          ["type"] = "string",
+        },
+        ["target_id"] = {
+          ["type"] = "string",
+        },
+        ["ticket_id"] = {
+          ["type"] = "string",
+        },
+        ["title"] = {
+          ["type"] = "string",
+        },
+      },
+      ["required"] = {
+        "ticket_id",
+      },
+      ["type"] = "object",
+    },
+  },
+}
+
+local STRING_PROPERTY = { type = "string" }
+local OBJECT_PROPERTY = { type = "object" }
+local BOOLEAN_PROPERTY = { type = "boolean" }
+local INTEGER_PROPERTY = { type = "integer" }
+
+local function extend_contract(name, properties, required)
+  local contract = TOOL_CONTRACTS[name]
+  if not contract then error("missing Project Pipelines tool contract: " .. name) end
+  for key, property in pairs(properties or {}) do contract.input_schema.properties[key] = property end
+  if required then contract.input_schema.required = required end
+  contract.input_schema.additionalProperties = true
+end
+
+-- The legacy descriptors are the public reference vocabulary. These extensions
+-- describe package-owned fields needed by the cold-cut store and its importer.
+extend_contract("create_project", {
+  id = STRING_PROPERTY, repository = OBJECT_PROPERTY, repository_id = STRING_PROPERTY,
+  repository_name = STRING_PROPERTY, repository_remote = STRING_PROPERTY,
+  spawn_target_id = STRING_PROPERTY, workspace_id = STRING_PROPERTY,
+  status = { type = "string", enum = { "open", "active", "blocked", "closed" } },
+})
+extend_contract("create_ticket", {
+  id = STRING_PROPERTY, workspace_id = STRING_PROPERTY,
+  status = { type = "string", enum = { "open", "active", "blocked", "closed" } },
+  dependency_ticket_ids = { type = "array", items = STRING_PROPERTY },
+}, { "project_id", "title" })
+extend_contract("create_pipeline", { project_id = STRING_PROPERTY })
+extend_contract("start_run", {
+  id = STRING_PROPERTY, spawn_target_id = STRING_PROPERTY, branch = STRING_PROPERTY,
+  worktree = OBJECT_PROPERTY, worktree_id = STRING_PROPERTY,
+}, { "ticket_id", "pipeline_id" })
+extend_contract("spawn_ticket_session", {
+  run_id = STRING_PROPERTY, step_id = STRING_PROPERTY, request_id = STRING_PROPERTY,
+  session_template_id = STRING_PROPERTY, session_template_name = STRING_PROPERTY,
+  session_template_capability = STRING_PROPERTY,
+}, { "run_id" })
+TOOL_CONTRACTS.spawn_ticket_session.description = "Spawn the current pipeline step's configured agent session for a durable run, using a correlated request so retries cannot dispatch twice."
+extend_contract("request_merge", { run_id = STRING_PROPERTY }, { "run_id" })
+TOOL_CONTRACTS.request_merge.description = "Atomically mark a run merge-requested while keeping its owning ticket active for provider merge reconciliation."
+extend_contract("remove_ticket_dependency", {
+  ticket_id = STRING_PROPERTY, depends_on_ticket_id = STRING_PROPERTY,
+  dependency_ticket_id = STRING_PROPERTY,
+})
+TOOL_CONTRACTS.remove_ticket_dependency.input_schema.required = nil
+TOOL_CONTRACTS.remove_ticket_dependency.input_schema.anyOf = {
+  { required = { "dependency_id" } },
+  { required = { "ticket_id", "depends_on_ticket_id" } },
+  { required = { "ticket_id", "dependency_ticket_id" } },
+}
+extend_contract("add_checklist_item", { text = STRING_PROPERTY })
+extend_contract("request_step_advance", { request_id = STRING_PROPERTY }, { "run_id" })
+extend_contract("remove_project_target", {
+  project_id = STRING_PROPERTY, target_id = STRING_PROPERTY,
+})
+TOOL_CONTRACTS.remove_project_target.input_schema.required = nil
+TOOL_CONTRACTS.remove_project_target.input_schema.anyOf = {
+  { required = { "project_target_id" } },
+  { required = { "project_id", "target_id" } },
+}
+extend_contract("create_child_run", {
+  id = STRING_PROPERTY, ticket_id = STRING_PROPERTY,
+}, { "parent_run_id", "title" })
+extend_contract("create_checklist", {
+  id = STRING_PROPERTY, run_id = STRING_PROPERTY, step_id = STRING_PROPERTY,
+}, { "name" })
+TOOL_CONTRACTS.create_checklist.input_schema.anyOf = {
+  { required = { "owner_id" } },
+  { required = { "run_id" } },
+}
+extend_contract("list_checklists", { run_id = STRING_PROPERTY })
+extend_contract("list_pr_links", { ticket_id = STRING_PROPERTY, run_id = STRING_PROPERTY })
+extend_contract("retry_step_agent", { request_id = STRING_PROPERTY }, { "run_id" })
+TOOL_CONTRACTS.retry_step_agent.description = "Retry the current blocked agent step for the specified run after agent spawn or lifecycle failure. Clears stale session linkage on the current run step visit and reuses the durable correlated spawn request."
+
+extend_contract("list_projects", { status = STRING_PROPERTY })
+extend_contract("list_tickets", { project_id = STRING_PROPERTY, status = STRING_PROPERTY })
+extend_contract("checklist_instructions", { scope = { type = "string", enum = { "project", "ticket", "run" } } })
+extend_contract("question_orchestrator_status", { project_id = STRING_PROPERTY })
+
+TOOL_CONTRACTS.resolve_repository_playbook = {
+  description = "Resolve one repository or Project Pipelines package path to exactly one supported ownership charter; ambiguous and unknown inputs require a routing question.",
+  input_schema = object_schema({
+    repository = STRING_PROPERTY, repository_name = STRING_PROPERTY,
+    name = STRING_PROPERTY, path = STRING_PROPERTY,
+  }),
+}
+TOOL_CONTRACTS.entities = {
+  description = "Inspect committed Project Pipelines records as request-facing entity frames; Hub reconnect hydration uses the package's explicit entity providers.",
+  input_schema = object_schema({ run_id = STRING_PROPERTY }),
+}
+
+
 local function authoritative_tools()
   local tools = {}
-  local function add(name, call, description)
+  local function add(name, call)
+    local contract = TOOL_CONTRACTS[name]
+    if not contract then error("missing Project Pipelines tool contract: " .. name) end
     table.insert(tools, {
       name = "project_pipelines." .. name,
-      description = description or (name:gsub("_", " ") .. "."),
-      input_schema = object_schema({}),
+      description = contract.description,
+      input_schema = contract.input_schema,
       handler = name,
       call = call,
     })
@@ -3365,11 +5179,13 @@ local function authoritative_tools()
 
   add("add_artifact", record_artifact)
   add("add_checklist_item", function(arguments)
+    arguments = arguments or {}
     arguments.text = arguments.text or arguments.prompt
     return add_checklist_item(arguments)
   end)
   add("add_project_target", add_project_target)
   add("add_ticket_dependency", function(arguments)
+    arguments = arguments or {}
     arguments.dependency_ticket_id = arguments.dependency_ticket_id or arguments.depends_on_ticket_id
     return add_ticket_dependency(arguments)
   end)
@@ -3413,6 +5229,7 @@ local function authoritative_tools()
   add("release_question_orchestrator", release_question_orchestrator)
   add("remove_project_target", remove_project_target)
   add("remove_ticket_dependency", function(arguments)
+    arguments = arguments or {}
     arguments.dependency_ticket_id = arguments.dependency_ticket_id or arguments.depends_on_ticket_id
     return remove_ticket_dependency(arguments)
   end)
@@ -3435,8 +5252,8 @@ local function authoritative_tools()
   add("update_ticket", update_ticket)
 
   -- Package-owned additions retained outside the 61-name legacy public contract.
-  add("resolve_repository_playbook", resolve_repository_playbook, "Resolve exactly one supported repository ownership charter.")
-  add("entities", entities, "Return committed Project Pipelines entity frames.")
+  add("resolve_repository_playbook", resolve_repository_playbook)
+  add("entities", entities)
   return tools
 end
 

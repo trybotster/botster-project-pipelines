@@ -5,6 +5,7 @@ require "json"
 require "fileutils"
 require "open3"
 require "socket"
+require "timeout"
 
 MAX_CUTOVER_KEYS = 896
 SOURCED_PACKAGE_KEYS = 3
@@ -22,8 +23,14 @@ def sqlite_json(database, sql)
 end
 
 def export_backlog(database)
-  active_runs = sqlite_json(database, "SELECT id, ticket_id, status FROM runs WHERE status = 'active' ORDER BY id")
-  abort!("cutover requires zero active legacy runs; found #{active_runs.length}") unless active_runs.empty?
+  nonterminal_runs = sqlite_json(database, <<~SQL)
+    SELECT id, ticket_id, status FROM runs
+    WHERE status NOT IN ('closed', 'done', 'cancelled') ORDER BY id
+  SQL
+  unless nonterminal_runs.empty?
+    summary = nonterminal_runs.map { |run| "#{run.fetch("id")}=#{run.fetch("status")}" }.join(", ")
+    abort!("cutover requires every legacy run to be terminal; found #{summary}")
+  end
 
   tickets = sqlite_json(database, <<~SQL)
     SELECT id, project_id, target_id, title, description, status, created_at, updated_at
@@ -72,7 +79,7 @@ def export_backlog(database)
     "tickets" => tickets,
     "ticket_dependencies" => carried,
     "satisfied_dependency_edges" => satisfied,
-    "active_runs" => active_runs,
+    "active_runs" => nonterminal_runs,
     "history_imported" => false,
   }
 end
@@ -122,9 +129,12 @@ class PublicMcp
 
   def call(name, arguments)
     @socket.puts(JSON.generate(type: "plugin_mcp_call_tool", name: name, arguments: arguments))
-    response = JSON.parse(@socket.gets || raise("ambiguous timeout calling #{name}"))
-    raise(response["error"]) if response["error"]
+    line = Timeout.timeout(10) { @socket.gets }
+    response = JSON.parse(line || raise("ambiguous timeout calling #{name}"))
+    raise "#{name} failed: #{response["error"].inspect}" if response["error"]
     response.fetch("plugin_tool_result")
+  rescue Timeout::Error
+    raise "ambiguous timeout calling #{name}"
   end
 end
 
@@ -132,20 +142,27 @@ def exact_subset?(actual, expected)
   expected.all? { |key, value| actual[key] == value }
 end
 
-def adopt_or_create(client, create_name, list_name, collection, record)
+def adopt_or_create(client, create_name, list_name, collection, record, expected: record, list_arguments: {})
   begin
     response = client.call(create_name, record)
     return response if response["ok"]
   rescue StandardError
     # A public MCP create may have committed before its response timed out.
   end
-  listed = client.call(list_name, {})
+  listed = client.call(list_name, list_arguments)
   existing = Array(listed[collection]).find { |candidate| candidate["id"] == record["id"] }
-  abort!("#{create_name} same-id/different-content conflict for #{record["id"]}") if existing && !exact_subset?(existing, record)
+  abort!("#{create_name} same-id/different-content conflict for #{record["id"]}") if existing && !exact_subset?(existing, expected)
   return { "ok" => true, "adopted" => true, collection.sub(/s\z/, "") => existing } if existing
   response = client.call(create_name, record)
   abort!("#{create_name} failed for #{record["id"]}: #{response.inspect}") unless response["ok"]
   response
+end
+
+def persisted_fields(record, fields)
+  fields.each_with_object({}) do |field, persisted|
+    value = record[field]
+    persisted[field] = value unless value.nil? || value == ""
+  end
 end
 
 def import_backlog(socket_path, bundle)
@@ -153,22 +170,27 @@ def import_backlog(socket_path, bundle)
   client = PublicMcp.new(socket_path)
 
   Array(bundle["projects"]).each do |project|
-    create = {
-      "id" => project["id"], "name" => project["name"], "description" => project["description"],
-      "status" => project["status"], "target_id" => "unassigned"
-    }
+    create = persisted_fields(project, %w[id name description status]).merge("spawn_target_id" => "unassigned")
     adopt_or_create(client, "project_pipelines.create_project", "project_pipelines.list_projects", "projects", create)
   end
   Array(bundle["project_targets"]).each do |target|
-    response = client.call("project_pipelines.add_project_target", target)
-    abort!("project target import failed: #{response.inspect}") unless response["ok"]
+    create = persisted_fields(target, %w[id project_id target_id])
+    adopt_or_create(client, "project_pipelines.add_project_target", "project_pipelines.current_context", "project_targets", create)
   end
   Array(bundle["tickets"]).each do |ticket|
-    adopt_or_create(client, "project_pipelines.create_ticket", "project_pipelines.list_tickets", "tickets", ticket)
+    create = persisted_fields(ticket, %w[id project_id target_id title description status])
+    adopt_or_create(client, "project_pipelines.create_ticket", "project_pipelines.list_tickets", "tickets", create)
   end
   Array(bundle["ticket_dependencies"]).each do |dependency|
-    response = client.call("project_pipelines.add_ticket_dependency", dependency)
-    abort!("dependency import failed: #{response.inspect}") unless response["ok"]
+    create = persisted_fields(dependency, %w[id ticket_id depends_on_ticket_id])
+    adopt_or_create(
+      client,
+      "project_pipelines.add_ticket_dependency",
+      "project_pipelines.list_ticket_dependencies",
+      "dependencies",
+      create,
+      list_arguments: { "ticket_id" => create.fetch("ticket_id") }
+    )
   end
 
   context = client.call("project_pipelines.current_context", {})

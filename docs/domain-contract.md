@@ -177,11 +177,14 @@ Plugin-owned durable records use the Hub's scoped plugin database capability and
 versioned, prefix-addressable keys (`v3/<family>/<id>`). Mutable runtime records
 never live under the plugin source tree. The package does not read the retired
 all-domain blob or any catalog/runtime compatibility source. Payload validators
-reject malformed family records. Every mutation is an ordered Hub
-`plugin_db.batch` with expected revisions; failure commits no counter, ticket,
-run, run-step, event, correlation, or entity-visible state. Starting, advancing,
-cancelling, merge-requesting, and closing therefore publish only committed
-ticket/run/run-step projections. Explicit package-owned `entity_provider`
+reject malformed family records. Each state transition is one ordered Hub
+`plugin_db.batch` with expected revisions. Spawn and advance correlation records
+commit before their external effect or transition by design; the later
+transition batch may fail without losing that retry identity. Starting,
+advancing, cancelling, merge-requesting, and closing publish only committed
+ticket/run/run-step projections. A retry refuses to redispatch a spawn whose
+outcome is unknown and reconciles a durable pending advance before returning its
+stored result. Explicit package-owned `entity_provider`
 handlers expose fresh authoritative whole-family snapshots from that committed
 state for initial subscription and reconnect; MCP tool naming is not used as an
 implicit provider contract. The package preflights new keys against the Hub's 1,024-key

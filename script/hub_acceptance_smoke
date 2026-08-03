@@ -402,11 +402,16 @@ review_block = call_tool(socket, "project_pipelines.request_step_advance", {
   run_id: run_id,
   request_id: "live-review-block"
 })
-assert(review_block["ok"] == false, "changes-required review must block public advance")
+assert(review_block["ok"] == true && review_block["step_id"] == "botster_stack_plan", "changes-required review must route back to Plan")
 call_tool(socket, "project_pipelines.resolve_finding", {
   finding_id: "finding_live_review",
   resolution: "corrected in live flow"
 })
+plan_rework_advance = call_tool(socket, "project_pipelines.request_step_advance", {
+  run_id: run_id,
+  request_id: "live-plan-rework-advance"
+})
+assert(plan_rework_advance["ok"] == true && plan_rework_advance["step_id"] == "botster_stack_plan_review", "reworked Plan did not return to Plan Review")
 call_tool(socket, "project_pipelines.submit_review", {
   run_id: run_id,
   step_id: "botster_stack_plan_review",
