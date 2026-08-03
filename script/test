@@ -47,7 +47,7 @@ scan_paths = [
 ]
 pii_pattern = re.compile(
     r"/" + r"Users/|/" + r"home/|jason" + r"conigliari|"
-    r"[A-Za-z0-9._%+-]+@(?![A-Za-z0-9.-]+\.(?:invalid|example|test|localhost)\b)"
+    r"[A-Za-z0-9._%+-]+@(?![A-Za-z0-9.-]+\.(?:invalid|example|test|localhost)(?![A-Za-z0-9.-]))"
     r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
     re.I,
 )
@@ -56,6 +56,8 @@ for known_positive in [
     "/" + "home/example/known-positive",
     "jason" + "conigliari",
     "agent" + "@" + "example" + "." + "com",
+    "real" + "@" + "company" + ".example" + ".com",
+    "real" + "@" + "mail" + ".test" + ".co.uk",
 ]:
     assert pii_pattern.search(known_positive), f"PII guard arm did not match {known_positive}"
 for reserved_fixture_address in [
