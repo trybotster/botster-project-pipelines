@@ -46,16 +46,25 @@ scan_paths = [
     "fixtures/project_pipelines/domain_contract.json",
 ]
 pii_pattern = re.compile(
-    r"/" + r"Users/|/" + r"home/|jason" + r"conigliari|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+    r"/" + r"Users/|/" + r"home/|jason" + r"conigliari|"
+    r"[A-Za-z0-9._%+-]+@(?![A-Za-z0-9.-]+\.(?:invalid|example|test|localhost)\b)"
+    r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
     re.I,
 )
 for known_positive in [
     "/" + "Users/example/known-positive",
     "/" + "home/example/known-positive",
     "jason" + "conigliari",
-    "agent" + "@" + "example" + "." + "invalid",
+    "agent" + "@" + "example" + "." + "com",
 ]:
     assert pii_pattern.search(known_positive), f"PII guard arm did not match {known_positive}"
+for reserved_fixture_address in [
+    "agent@example.invalid",
+    "agent@example.example",
+    "agent@example.test",
+    "agent@example.localhost",
+]:
+    assert not pii_pattern.search(reserved_fixture_address), f"reserved fixture address matched {reserved_fixture_address}"
 for path in scan_paths:
     match = pii_pattern.search(Path(path).read_text())
     assert not match, f"PII or operator path in {path}: {match.group(0)}"
