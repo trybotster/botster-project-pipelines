@@ -1,9 +1,9 @@
 {
-  "contract_version": 2,
+  "contract_version": 3,
   "fixture_role": {
     "authority": "schema_example_only",
     "production_source": "plugin.lua",
-    "source_revision": "botster-stack-delivery/2026-07-28.6"
+    "source_revision": "botster-stack-delivery/2026-08-03.1"
   },
   "manifest_anchors": {
     "package_name": "project-pipelines",
@@ -38,7 +38,9 @@
   },
   "domain_objects": [
     "project",
+    "project_target",
     "ticket",
+    "ticket_dependency",
     "pipeline_definition",
     "step",
     "gate",
@@ -50,6 +52,7 @@
     "question",
     "answer",
     "run",
+    "run_step",
     "session_request",
     "pr_link",
     "provider_lifecycle_boundary",
@@ -58,11 +61,14 @@
   "persistence_boundaries": {
     "plugin_owned": [
       "projects",
+      "project_targets",
       "tickets",
+      "ticket_dependencies",
       "pipeline_definitions",
       "steps",
       "gates",
       "runs",
+      "run_steps",
       "session_requests",
       "artifacts",
       "checklists",
@@ -86,10 +92,12 @@
       "workspace_repository_grouping",
       "workspace_session_grouping"
     ],
-    "runtime_storage_namespace": "v2/<family>/<id>",
+    "runtime_storage_namespace": "v3/<family>/<id>",
     "write_contract": {
       "payload_validation": "family_required_fields",
       "optimistic_concurrency": "expected_revision",
+      "atomic_mutation": "hub_plugin_db_batch",
+      "all_or_nothing_families": ["tickets", "runs", "run_steps", "events", "counters"],
       "correlation_before_effect": ["session_requests", "advance_requests"],
       "event_retention": 256,
       "namespace_key_limit": 1024,

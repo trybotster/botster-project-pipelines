@@ -34,7 +34,7 @@ socket.puts(JSON.generate({
   compatibility: {
     protocol: "botster-hub-daemon-v1",
     minimum_protocol_version: 1,
-    required_features: %w[plugin_surface_render plugin_surface_action],
+    required_features: %w[plugin_surface_render plugin_surface_action plugin_entity_subscriptions],
     minimum_conformance_fixture_revision: 1,
     client_name: "botster-project-pipelines-acceptance-smoke"
   }
@@ -58,6 +58,87 @@ def call_tool(socket, name, arguments)
   })
   assert(response["kind"] == "plugin_mcp_tool_result", "#{name} returned #{response["kind"]}")
   response.fetch("plugin_tool_result")
+end
+
+expected_project_pipeline_tools = %w[
+  add_artifact add_checklist_item add_project_target add_ticket_dependency
+  answer_question ask_agent ask_human cancel_run checklist_instructions
+  claim_question_orchestrator close_ticket create_checklist create_child_run
+  create_gate create_pipeline create_project create_step create_ticket
+  create_vault_checklist current_context delete_gate delete_pipeline delete_project
+  delete_step delete_ticket entities escalate_question get_checklist get_pipeline
+  get_pr_link get_project get_ticket link_pr list_agent_choices list_checklists
+  list_pipelines list_pr_links list_projects list_ticket_dependencies list_tickets
+  question_orchestrator_status receive_question_answers release_question_orchestrator
+  remove_project_target remove_ticket_dependency request_merge request_step_advance
+  resolve_finding resolve_repository_playbook retry_step_agent search_tickets
+  spawn_ticket_session start_run submit_gate submit_review update_checklist
+  update_checklist_item update_gate update_pipeline update_project update_step
+  update_step_agent update_ticket
+].map { |name| "project_pipelines.#{name}" }.sort.freeze
+
+published_tools_response = request(socket, { type: "plugin_mcp_list_tools" })
+assert(published_tools_response["kind"] == "plugin_mcp_tools", "daemon did not publish plugin MCP descriptors")
+published_tools = published_tools_response.fetch("plugin_tools").select do |tool|
+  tool.fetch("name").start_with?("project_pipelines.")
+end
+assert(published_tools.map { |tool| tool.fetch("name") }.sort == expected_project_pipeline_tools, "published Project Pipelines tool set mismatch")
+
+validate_schema = lambda do |node, path|
+  next unless node.is_a?(Hash)
+  if node.key?("properties")
+    assert(node["properties"].is_a?(Hash) && !node["properties"].empty?, "#{path}.properties must be a nonempty object")
+  end
+  if node.key?("required")
+    assert(node["required"].is_a?(Array) && !node["required"].empty?, "#{path}.required must be a nonempty array")
+  end
+  node.each { |key, value| validate_schema.call(value, "#{path}.#{key}") }
+end
+
+published_tools.each do |tool|
+  description = tool.fetch("description")
+  generated_description = tool.fetch("name").delete_prefix("project_pipelines.").tr("_", " ") + "."
+  assert(!description.empty? && description != generated_description, "#{tool.fetch("name")} description was not authored")
+  validate_schema.call(tool.fetch("inputSchema"), tool.fetch("name"))
+end
+
+published_submit_review = published_tools.find { |tool| tool.fetch("name") == "project_pipelines.submit_review" }.fetch("inputSchema")
+assert(published_submit_review.fetch("required").sort == %w[run_id step_id verdict], "submit_review required fields changed in Hub serialization")
+assert(published_submit_review.dig("properties", "verdict", "enum") == %w[approved changes_required blocked], "submit_review verdict enum changed in Hub serialization")
+assert(
+  published_submit_review.dig("properties", "findings", "items", "properties", "severity", "enum") == %w[blocker high medium low info],
+  "submit_review finding severity enum changed in Hub serialization"
+)
+
+def subscribe_entity_snapshot(socket_path, entity_type, subscription_id)
+  subscription = UNIXSocket.new(socket_path)
+  subscription.puts(JSON.generate({
+    protocol: "botster-hub-daemon-v1",
+    compatibility: {
+      protocol: "botster-hub-daemon-v1",
+      minimum_protocol_version: 1,
+      required_features: ["plugin_entity_subscriptions"],
+      minimum_conformance_fixture_revision: 1,
+      client_name: "botster-project-pipelines-entity-acceptance"
+    }
+  }))
+  JSON.parse(subscription.gets || raise("daemon closed before entity hello"))
+  subscription.puts(JSON.generate({
+    type: "subscribe_entities",
+    entity_type: entity_type,
+    subscription_id: subscription_id
+  }))
+  accepted = JSON.parse(subscription.gets || raise("daemon closed before entity subscription response"))
+  assert(accepted["kind"] == "entity_subscribed", "#{entity_type} subscription was not admitted: #{accepted.inspect}")
+  frame = Timeout.timeout(5) do
+    JSON.parse(subscription.gets || raise("daemon closed before #{entity_type} snapshot"))
+  end
+  assert(frame["type"] == "entity_snapshot", "#{entity_type} did not return an authoritative snapshot")
+  assert(frame["subscription_id"] == subscription_id, "#{entity_type} subscription identity mismatch")
+  assert(frame["entity_type"] == entity_type, "#{entity_type} snapshot family mismatch")
+  frame
+ensure
+  subscription&.close
 end
 
 def render_surface(socket)
@@ -157,6 +238,8 @@ if restart_verification
   assert(initial_context.fetch("checklists").any?, "checklist did not survive Hub restart")
   assert(initial_context.fetch("pr_links").any?, "PR link did not survive Hub restart")
   render_surface(socket)
+  restart_snapshot = subscribe_entity_snapshot(socket_path, "project-pipelines.run", "project-pipelines-run-after-restart")
+  assert(restart_snapshot.fetch("items") == initial_context.fetch("runs"), "reconnect snapshot disagrees with authoritative restarted context")
   puts "script/hub_acceptance_smoke: restart persistence verified"
   exit 0
 end
@@ -187,6 +270,15 @@ assert(create_form, "rendered surface missing create ticket form")
 assert(create_button && record_button && activate_button, "rendered surface missing dialog toolbar buttons")
 assert(filter_button, "rendered surface missing filter button")
 assert(project_table, "rendered surface missing project table")
+bound_families = []
+each_node(surface) do |node|
+  bound_families << node["source"].delete_prefix("/") if node["$kind"] == "bind_list"
+end
+%w[project ticket run session_request].each do |family|
+  assert(bound_families.include?("project-pipelines.#{family}"), "surface missing admitted #{family} entity binding")
+end
+project_snapshot = subscribe_entity_snapshot(socket_path, "project-pipelines.project", "project-pipelines-project-initial")
+assert(project_snapshot.fetch("items") == call_tool(socket, "project_pipelines.current_context", {}).fetch("projects"), "project snapshot disagrees with committed context")
 
 create_action_id = create_form.dig("props", "action", "id")
 filter_action_id = filter_button.dig("props", "action", "id")
@@ -288,10 +380,10 @@ assert(selected && selected.dig("predicate", "value") == workspace_id, "selected
 assert(selected.dig("node", "props", "text") == "Workspace Live contract project selected", "selected workspace copy must derive from product data")
 
 run_id = "run_live_authority"
-run = call_tool(socket, "project_pipelines.record_run", {
+run = call_tool(socket, "project_pipelines.start_run", {
   id: run_id,
   ticket_id: ticket_id,
-  pipeline_definition_id: "botster_stack_delivery",
+  pipeline_id: "botster_stack_delivery",
   spawn_target_id: "tgt_71266a8d976d4535902ffed09c18a7ba",
   branch: "project-pipelines/live-authority",
   base_ref: "main",
@@ -305,7 +397,7 @@ blocked_plan = call_tool(socket, "project_pipelines.request_step_advance", {
 })
 assert(blocked_plan["ok"] == false && blocked_plan.dig("error", "code") == "transition_blocked", "missing Plan evidence must block")
 
-plan_activation = call_tool(socket, "project_pipelines.activate_step", {
+plan_activation = call_tool(socket, "project_pipelines.spawn_ticket_session", {
   run_id: run_id,
   step_id: "botster_stack_plan",
   request_id: "session_request_live_downstream_plan",
@@ -360,10 +452,29 @@ review_block = call_tool(socket, "project_pipelines.request_step_advance", {
   run_id: run_id,
   request_id: "live-review-block"
 })
-assert(review_block["ok"] == false, "changes-required review must block public advance")
+assert(review_block["ok"] == true && review_block["step_id"] == "botster_stack_plan", "changes-required review must route back to Plan")
 call_tool(socket, "project_pipelines.resolve_finding", {
   finding_id: "finding_live_review",
   resolution: "corrected in live flow"
+})
+call_tool(socket, "project_pipelines.submit_gate", {
+  run_id: run_id,
+  step_id: "botster_stack_plan",
+  gate_id: "plan_artifact",
+  status: "passed",
+  evidence: { rework: true }
+})
+plan_rework_advance = call_tool(socket, "project_pipelines.request_step_advance", {
+  run_id: run_id,
+  request_id: "live-plan-rework-advance"
+})
+assert(plan_rework_advance["ok"] == true && plan_rework_advance["step_id"] == "botster_stack_plan_review", "reworked Plan did not return to Plan Review")
+call_tool(socket, "project_pipelines.submit_gate", {
+  run_id: run_id,
+  step_id: "botster_stack_plan_review",
+  gate_id: "plan_review",
+  status: "passed",
+  evidence: { rework: true }
 })
 call_tool(socket, "project_pipelines.submit_review", {
   run_id: run_id,
@@ -376,7 +487,7 @@ review_advance = call_tool(socket, "project_pipelines.request_step_advance", {
 })
 assert(review_advance["ok"] == true && review_advance["step_id"] == "botster_stack_implement", "approved review did not advance")
 
-call_tool(socket, "project_pipelines.record_artifact", {
+call_tool(socket, "project_pipelines.add_artifact", {
   id: "artifact_live_report",
   run_id: run_id,
   step_id: "botster_stack_implement",
@@ -396,7 +507,7 @@ call_tool(socket, "project_pipelines.add_checklist_item", {
   text: "Repository charter and targeted notes constrained the work",
   status: "completed"
 })
-question = call_tool(socket, "project_pipelines.record_question", {
+question = call_tool(socket, "project_pipelines.ask_human", {
   id: "question_live_authority",
   run_id: run_id,
   ticket_id: ticket_id,
@@ -433,11 +544,18 @@ assert(implement_advance["ok"] == true && implement_advance["step_id"] == "botst
 
 final_context = call_tool(socket, "project_pipelines.current_context", {})
 assert(final_context.fetch("runs").any? { |record| record["id"] == run_id }, "current context missing live run")
-assert(final_context.fetch("gate_results").count { |record| record["run_id"] == run_id } == 3, "run gate results missing")
-assert(final_context.fetch("reviews").count { |record| record["run_id"] == run_id } == 2, "run reviews missing")
+run_gate_results = final_context.fetch("gate_results").select { |record| record["run_id"] == run_id }
+assert(run_gate_results.length == 5 && run_gate_results.all? { |record| record["run_step_id"].to_s != "" }, "visit-scoped run gate results missing")
+run_reviews = final_context.fetch("reviews").select { |record| record["run_id"] == run_id }
+assert(run_reviews.length == 2 && run_reviews.map { |record| record["run_step_id"] }.uniq.length == 2, "visit-scoped run reviews missing")
 assert(final_context.fetch("findings").any? { |record| record["run_id"] == run_id && record["status"] == "resolved" }, "resolved finding missing")
 assert(final_context.fetch("questions").any? { |record| record["run_id"] == run_id && record["status"] == "answered" }, "answered question missing")
 assert(final_context.fetch("pr_links").count { |record| record["run_id"] == run_id } == 1, "PR link missing")
 assert(final_context.fetch("questions").none? { |record| record["question"].to_s.downcase.include?("routing") }, "downstream Plan asked a repository routing question")
+initial_run_snapshot = subscribe_entity_snapshot(socket_path, "project-pipelines.run", "project-pipelines-run-initial")
+reconnect_run_snapshot = subscribe_entity_snapshot(socket_path, "project-pipelines.run", "project-pipelines-run-reconnect")
+assert(initial_run_snapshot.fetch("items") == final_context.fetch("runs"), "initial run snapshot disagrees with committed context")
+assert(reconnect_run_snapshot.fetch("items") == final_context.fetch("runs"), "reconnect run snapshot disagrees with committed context")
+assert(reconnect_run_snapshot.fetch("snapshot_seq") == initial_run_snapshot.fetch("snapshot_seq") + 1, "reconnect must invoke a fresh run provider snapshot")
 
 puts "script/hub_acceptance_smoke: ok project_id=#{project_id} ticket_id=#{ticket_id} client_authored_kind=submit"

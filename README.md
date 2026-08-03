@@ -27,24 +27,60 @@ persistence ownership.
 
 The executable contract fixture is
 [`fixtures/project_pipelines/domain_contract.json`](fixtures/project_pipelines/domain_contract.json).
-`script/test` validates the fixture relationships, standalone mode, optional
-workspace-linked mode, session-template request shape, template selector
-resolution, blocked provider diagnostics, provider capability boundaries,
-manifest anchors, and PII/raw-path absence. It also loads the
-production `plugin.lua` entrypoint with Botster capability stubs, creates
-persisted records, activates PTY and non-PTY steps, reloads the entrypoint, and
-proves the app workbench and settings surfaces expose persisted
-project/ticket/run/session state. The settings surface also renders
+`script/test` validates fixture and manifest anchors, the closed MCP descriptor
+contract, repository routing (including negative and ambiguous cases),
+PII/operator-path absence, atomic lifecycle failure, dependency and gate
+blocking and explicit overrides, run-step-visit-scoped review routing, correlated spawn replay, malformed
+record rejection, v2 namespace removal, entity snapshots, and source reload.
+It rejects descriptor properties that have no handler-side reference.
+It also proves the app workbench and settings surfaces expose committed state.
+The settings surface renders
 `project-pipelines-provider-dependency-status`, a stable provider/dependency
 status section derived from persisted session request diagnostics.
 
-The harness also exercises the public ticket-dependency lifecycle through the
-registered production tools: it adds a dependency after a run starts, proves an
-open prerequisite blocks Implement without changing the current step or
-creating a session request, closes/removes the prerequisite, explicitly retries,
-and proves each run spawns only once. Missing referenced tickets fail safe and
-planning steps remain available only when they explicitly set
-`allows_open_ticket_dependencies=true`.
+## Public MCP Contract
+
+The production surface is closed: 61 `project_pipelines_*` tools cover project,
+target, ticket/dependency, pipeline/step/gate, run/session, review/finding,
+artifact/checklist, question/orchestrator, PR, context, and lifecycle behavior.
+`script/test` asserts that exact set. Ten superseded package names are absent:
+`activate_step`, `define_pipeline`, `list_pipeline_definitions`,
+`show_pipeline_definition`, `record_run`, `record_artifact`, `record_question`,
+`update_ticket_status`, `show_project`, and `show_ticket`. Two package-owned
+additions remain explicit outside the 61-name legacy contract:
+`resolve_repository_playbook` enforces the repository routing allowlist, and
+`entities` is a request-facing inspection tool returning committed entity
+frames. Reconnect hydration is served only by the explicitly declared
+`project-pipelines.*` entity providers. There are no aliases or fallback
+registrations.
+
+## Drain-first Cold Cut
+
+The real device cut is a post-merge operator action after every legacy run is
+terminal. `script/cutover export LEGACY_DB ARCHIVE_JSON IMPORT_JSON` rejects
+every run outside the terminal `closed`, `done`, and `cancelled` allowlist,
+exports only owning projects/targets plus open or blocked tickets,
+omits already-satisfied edges to closed tickets from the live import while
+keeping them in the immutable archive, rejects dangling carried edges, and
+aborts above the 896-key cutover budget. `script/cutover import HUB_SOCKET
+IMPORT_JSON` imports through the public package MCP and reconciles authoritative
+collections after an ambiguous create response before retrying.
+
+Run `script/cutover plan` for the one-authority sequence. Snapshot first;
+disable/remove the legacy device plugin before enabling package execution;
+install/show/enable through the running daemon owner; import and verify package
+provenance, sourced definitions, CRUD, Running Pipelines/entities, and a fresh
+E2E run. Rollback is non-destructive only before the first post-verification
+write: disable/remove the package before restoring the single legacy snapshot.
+After package writes, forward repair is the default; destructive rollback
+requires export plus explicit loss confirmation.
+
+The harness also proves that an open ticket dependency prevents run creation,
+closing the prerequisite permits an explicit retry, and atomic failure still
+leaves the ticket open with no run or run-step. A separate correlated-spawn case
+proves `retry_step_agent` reuses the durable result without a second dispatch.
+Missing referenced tickets fail safe and planning steps remain available only
+when they explicitly set `allows_open_ticket_dependencies=true`.
 
 `plugin.lua` is the single production entrypoint consumed by the current Hub
 worker sandbox. It contains the versioned prefix-addressable record repository,
@@ -74,15 +110,21 @@ On an empty plugin database, package initialization reconciles exactly one
 disable/enable, and Hub restart reuse those stable IDs. Checked-in source owns
 metadata, prompts, transitions, gates, routing text, and `source_revision`; an
 existing step's operator-selected `agent_name` remains device policy. Runtime
-records live under `v2/<family>/<id>` plugin-db keys; the retired all-domain
+records live under `v3/<family>/<id>` plugin-db keys; the retired all-domain
 state blob is neither read nor written. Record payloads are validated on load
-and before writes, and each write uses the revision observed during load as its
-optimistic-concurrency precondition. Correlation records become durable before
-managed spawn or step-advance effects. A retry either reuses the spawn result or
-reconciles the recorded advance; it never dispatches the same logical request
-twice. Diagnostic events retain the newest 256 records, deleting older event
-keys, and mutations fail with `store_capacity_exhausted` before any write when
-the Hub's 1,024-key namespace reaches the package's 64-key safety reserve.
+and before writes. Each state transition uses one capability-gated
+`plugin_db.batch` with the revisions observed during load. Starting a run
+atomically activates its ticket and creates the run/current run-step; advance,
+cancel, merge request, and close atomically reconcile ticket/run/run-step state
+before entity or surface projection. This requires Hub commit
+`11d73d27e01732981e803041ea702aa09db57112`, which contains both the atomic
+plugin database ABI and generic package-owned `entity_provider` admission. The
+package never simulates atomicity with sequential writes. Each package entity
+family has an explicit provider returning a fresh authoritative whole-family
+snapshot from committed state for initial subscription and reconnect hydration.
+Diagnostic events retain the newest 256 records, and mutations fail with
+`store_capacity_exhausted` before any write when the Hub's 1,024-key namespace
+reaches the package's 64-key safety reserve.
 
 Every delivery role uses the same exact routing source:
 
@@ -99,10 +141,10 @@ Every delivery role uses the same exact routing source:
 Zero or multiple matches return `routing_question_required`; there is no
 generic fallback or load-all behavior.
 
-Ticket dependencies use `ticket.dependency_ticket_ids` as their sole canonical
-representation. `project_pipelines.add_ticket_dependency`,
+Ticket dependencies are durable `ticket_dependencies` records mirrored onto
+ticket projections. `project_pipelines.add_ticket_dependency`,
 `project_pipelines.remove_ticket_dependency`, and
-`project_pipelines.update_ticket_status` mutate that lifecycle without
+`project_pipelines.update_ticket` mutate that lifecycle without
 auto-advancing a run. Every step is dependency-gated unless it explicitly sets
 `allows_open_ticket_dependencies=true`; standard Plan/Plan Review definitions
 should set that exemption, while legacy unclassified delivery steps fail safe.
@@ -161,7 +203,7 @@ operator sees the attempted step and blocking prerequisite ticket.
 Workbench controls are structured UiNodes only. Tables declare single-row
 selection and row-action metadata; toolbar and form buttons route to
 plugin-owned action ids such as `project_pipelines.create_ticket`,
-`project_pipelines.record_run`, and `project_pipelines.activate_step`. Raw HTML
+`project_pipelines.start_run`, and `project_pipelines.spawn_ticket_session`. Raw HTML
 and iframes are intentionally out of scope for CRUD/workbench controls. Future
 graph or report surfaces may use an iframe only when they need a custom
 full-screen visual app with an explicit plugin asset bridge.
@@ -174,8 +216,8 @@ rejected without workflow mutation or presentation/replacement effects. Form
 handlers read domain input only from `values`; filter and row selection read
 metadata only from `payload`. Flat legacy arguments are not accepted.
 
-Every Form declares an explicit `submit_label`. Create-ticket, record-run, and
-activate-step dialogs use `presentation="auto"` and are wrapped in scoped
+Every Form declares an explicit `submit_label`. Create-ticket, start-run, and
+spawn-step dialogs use `presentation="auto"` and are wrapped in scoped
 `presentation_if` presence predicates; selected workspace content uses an
 equality predicate. Dialogs never use `props.open`. Modal visibility remains
 client-local presentation state, while tickets and runs remain plugin-owned
@@ -265,7 +307,7 @@ proof.
 
 ```sh
 git clone https://github.com/trybotster/botster-hub.git /private/tmp/botster-hub-ui-contract
-git -C /private/tmp/botster-hub-ui-contract checkout 35e92f46a98c445765b6ba7755e029f5dde702f8
+git -C /private/tmp/botster-hub-ui-contract checkout 11d73d27e01732981e803041ea702aa09db57112
 cargo build --locked --manifest-path /private/tmp/botster-hub-ui-contract/Cargo.toml
 cargo build --locked --manifest-path /private/tmp/botster-hub-ui-contract/Cargo.toml -p botster-core --bin botster-session-worker
 BOTSTER_HUB_SOURCE=/private/tmp/botster-hub-ui-contract \
@@ -289,8 +331,10 @@ test Plan template, activates the production sourced Plan through
 `ensure_worktree_and_spawn`, and waits for that spawned Plan process to inspect
 its managed prompt, resolve `[[botster-workspaces-playbook]]`, and submit the Plan
 artifact, gate, and step advance through the public plugin MCP socket without a
-routing question. The harness then restarts Hub and rechecks the same durable
-workflow identity.
+routing question. Through the running daemon's public tool-list request it also
+proves the exact 63 published names, authored descriptions, nonempty serialized
+schema objects/arrays, and the nested review verdict/finding enums. The harness
+then restarts Hub and rechecks the same durable workflow identity.
 
 `EXPECTED_HUB_COMMIT` in `script/test-hub-flow` records the Hub revision against
 which this plugin contract was proven. Advance that pin deliberately only when
