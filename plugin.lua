@@ -1171,6 +1171,8 @@ local function define_pipeline(arguments)
     name = name,
     description = string_arg(arguments, "description"),
     merge_policy = string_arg(arguments, "merge_policy") or "pr",
+    version_label = string_arg(arguments, "version_label"),
+    supersedes_pipeline_id = string_arg(arguments, "supersedes_pipeline_id"),
     steps = steps,
   }
   table.insert(state.pipeline_definitions, pipeline)
@@ -1271,6 +1273,18 @@ local function activate_step(arguments)
       kind = "id",
       template_id = string_arg(arguments, "session_template_id"),
       value = string_arg(arguments, "session_template_id"),
+    }
+  elseif string_arg(arguments, "session_template_name") then
+    selector = {
+      kind = "name",
+      template_name = string_arg(arguments, "session_template_name"),
+      value = string_arg(arguments, "session_template_name"),
+    }
+  elseif string_arg(arguments, "session_template_capability") then
+    selector = {
+      kind = "capability",
+      capability = string_arg(arguments, "session_template_capability"),
+      value = string_arg(arguments, "session_template_capability"),
     }
   end
   local resolved = resolve_session_template(selector, step, botster and botster.capabilities or {}, request.target_id)
@@ -1441,6 +1455,11 @@ local function submit_gate(arguments)
   local state = load_state()
   local run = find_by_id(state.runs, run_id)
   if not run then return failure("not_found", "run not found: " .. run_id) end
+  local run_step_id = string_arg(arguments, "run_step_id") or run.current_run_step_id
+  local run_step = find_by_id(state.run_steps, run_step_id)
+  if not run_step or run_step.run_id ~= run.id or run_step.step_id ~= step_id then
+    return failure("validation_failed", "run_step_id must identify this run and step", { "run_step_id" })
+  end
   local pipeline = find_by_id(state.pipeline_definitions, run.pipeline_definition_id)
   local step = find_pipeline_step(pipeline, step_id)
   if not step then return failure("not_found", "step not found: " .. step_id) end
@@ -1451,7 +1470,7 @@ local function submit_gate(arguments)
   if not gate then return failure("not_found", "gate not found: " .. gate_id) end
   local result
   for _, candidate in ipairs(state.gate_results) do
-    if candidate.run_id == run_id and candidate.step_id == step_id and candidate.gate_id == gate_id then
+    if candidate.run_id == run_id and candidate.run_step_id == run_step_id and candidate.gate_id == gate_id then
       result = candidate
     end
   end
@@ -1459,6 +1478,7 @@ local function submit_gate(arguments)
     result = {
       id = string_arg(arguments, "id") or next_id(state, "gate_result"),
       run_id = run_id,
+      run_step_id = run_step_id,
       step_id = step_id,
       gate_id = gate_id,
     }
@@ -1488,10 +1508,17 @@ local function submit_review(arguments)
     return failure("validation_failed", "verdict must be approved, changes_required, or blocked", { "verdict" })
   end
   local state = load_state()
-  if not find_by_id(state.runs, run_id) then return failure("not_found", "run not found: " .. run_id) end
+  local run = find_by_id(state.runs, run_id)
+  if not run then return failure("not_found", "run not found: " .. run_id) end
+  local run_step_id = string_arg(arguments, "run_step_id") or run.current_run_step_id
+  local run_step = find_by_id(state.run_steps, run_step_id)
+  if not run_step or run_step.run_id ~= run.id or run_step.step_id ~= step_id then
+    return failure("validation_failed", "run_step_id must identify this run and step", { "run_step_id" })
+  end
   local review = {
     id = string_arg(arguments, "id") or next_id(state, "review"),
     run_id = run_id,
+    run_step_id = run_step_id,
     step_id = step_id,
     verdict = verdict,
     summary = string_arg(arguments, "summary"),
@@ -1628,6 +1655,8 @@ local function link_pr(arguments)
     pr_number = arguments.pr_number,
     provider = string_arg(arguments, "provider") or "github",
     status = string_arg(arguments, "status") or "open",
+    base_branch = string_arg(arguments, "base_branch"),
+    head_branch = string_arg(arguments, "head_branch"),
   }
   table.insert(state.pr_links, link)
   push_event(state, "pr_linked", run_id, link.id)
@@ -1636,11 +1665,25 @@ local function link_pr(arguments)
   return ok({ pr_link = link })
 end
 
-local function gate_result_for(state, run_id, step_id, gate_id)
+local function gate_result_for(state, run_id, run_step_id, step_id, gate_id)
   local selected
   for _, result in ipairs(state.gate_results) do
-    if result.run_id == run_id and result.step_id == step_id and result.gate_id == gate_id then
+    if result.run_id == run_id and result.run_step_id == run_step_id
+      and result.step_id == step_id and result.gate_id == gate_id
+    then
       selected = result
+    end
+  end
+  return selected
+end
+
+local function review_for_current_visit(state, run, step)
+  local selected
+  for _, review in ipairs(state.reviews) do
+    if review.run_id == run.id and review.run_step_id == run.current_run_step_id
+      and review.step_id == step.id
+    then
+      selected = review
     end
   end
   return selected
@@ -1649,14 +1692,16 @@ end
 local function transition_blockers(state, run, pipeline, step)
   local blockers = {}
   for _, gate in ipairs(array(step.gates)) do
-    local result = gate_result_for(state, run.id, step.id, gate.id)
+    local result = gate_result_for(state, run.id, run.current_run_step_id, step.id, gate.id)
     if gate.required ~= false and (not result or result.status ~= "passed") then
       table.insert(blockers, { kind = "gate", gate_id = gate.id })
     end
   end
-  local latest_review
-  for _, review in ipairs(state.reviews) do
-    if review.run_id == run.id and review.step_id == step.id then latest_review = review end
+  local latest_review = review_for_current_visit(state, run, step)
+  if (step.on_changes_requested_step_id or step.on_blocked_step_id)
+    and not latest_review
+  then
+    table.insert(blockers, { kind = "review_missing", run_step_id = run.current_run_step_id })
   end
   if latest_review and latest_review.verdict ~= "approved" then
     table.insert(blockers, { kind = "review", review_id = latest_review.id, verdict = latest_review.verdict })
@@ -1671,7 +1716,7 @@ local function transition_blockers(state, run, pipeline, step)
     end
   end
   if step.id == "botster_stack_implement" then
-    local result = gate_result_for(state, run.id, step.id, "implementation")
+    local result = gate_result_for(state, run.id, run.current_run_step_id, step.id, "implementation")
     local evidence = result and result.evidence or {}
     if type(evidence.commit_sha) ~= "string" or evidence.commit_sha == "" then
       table.insert(blockers, { kind = "implementation_commit" })
@@ -1688,7 +1733,7 @@ local function transition_blockers(state, run, pipeline, step)
     end
   end
   if step.id == "botster_stack_verify" then
-    local result = gate_result_for(state, run.id, step.id, "verification")
+    local result = gate_result_for(state, run.id, run.current_run_step_id, step.id, "verification")
     local verified = result and result.evidence and result.evidence.resolved_finding_ids or {}
     for _, finding in ipairs(state.findings) do
       if finding.run_id == run.id
@@ -1751,10 +1796,7 @@ local function request_step_advance(arguments)
   if not pipeline then return failure("not_found", "pipeline definition not found: " .. run.pipeline_definition_id) end
   local current_step = find_pipeline_step(pipeline, run.current_step_id)
   if not current_step then return failure("not_found", "current step not found: " .. tostring(run.current_step_id)) end
-  local latest_review
-  for _, review in ipairs(state.reviews) do
-    if review.run_id == run.id and review.step_id == current_step.id then latest_review = review end
-  end
+  local latest_review = review_for_current_visit(state, run, current_step)
   local review_rework = latest_review
     and (latest_review.verdict == "changes_required" or latest_review.verdict == "blocked")
   local next_step_id
@@ -1778,6 +1820,29 @@ local function request_step_advance(arguments)
   if not review_rework and next_step.allows_open_ticket_dependencies ~= true then
     for _, dependency in ipairs(unmet_ticket_dependencies(state, ticket)) do
       table.insert(blockers, { kind = "ticket_dependency", dependency = dependency })
+    end
+  end
+  if arguments.override_unmet_gates == true then
+    local override_reason = trim(arguments.override_reason)
+    if not override_reason or override_reason == "" then
+      return failure("validation_failed", "override_reason is required when override_unmet_gates is true", { "override_reason" })
+    end
+    local remaining = {}
+    local overridden_gate_ids = {}
+    for _, blocker in ipairs(blockers) do
+      if blocker.kind == "gate" then
+        table.insert(overridden_gate_ids, blocker.gate_id)
+      else
+        table.insert(remaining, blocker)
+      end
+    end
+    blockers = remaining
+    if #overridden_gate_ids > 0 then
+      push_event(state, "gates_overridden", run.id, current_step.id, {
+        run_step_id = run.current_run_step_id,
+        gate_ids = overridden_gate_ids,
+        reason = override_reason,
+      })
     end
   end
   if #blockers > 0 then
@@ -1998,8 +2063,18 @@ end
 local function list_ticket_dependencies(arguments)
   arguments = arguments or {}
   local selected = {}
-  for _, dependency in ipairs(load_state().ticket_dependencies) do
-    if not arguments.ticket_id or dependency.ticket_id == arguments.ticket_id then table.insert(selected, dependency) end
+  local state = load_state()
+  for _, dependency in ipairs(state.ticket_dependencies) do
+    local dependency_ticket = find_by_id(state.tickets, dependency.depends_on_ticket_id)
+    local blocking = not dependency_ticket or dependency_ticket.status ~= "closed"
+    if (not arguments.ticket_id or dependency.ticket_id == arguments.ticket_id)
+      and (arguments.blocking_only ~= true or blocking)
+    then
+      local result = copy(dependency)
+      result.blocking = blocking
+      result.depends_on_status = dependency_ticket and dependency_ticket.status or "missing"
+      table.insert(selected, result)
+    end
   end
   return ok({ dependencies = selected })
 end
@@ -2030,6 +2105,12 @@ local function update_pipeline(arguments)
   local state = load_state()
   local pipeline = find_by_id(state.pipeline_definitions, string_arg(arguments, "pipeline_id"))
   if not pipeline then return failure("not_found", "pipeline not found") end
+  if arguments.archived ~= nil then
+    pipeline.archived_at = arguments.archived == true and "archived" or nil
+  end
+  if arguments.supersedes_pipeline_id ~= nil then
+    pipeline.replacement_pipeline_id = copy(arguments.supersedes_pipeline_id)
+  end
   update_fields(pipeline, arguments, { "name", "description", "merge_policy", "version_label", "archived_at", "replacement_pipeline_id" })
   return persist_response(state, "pipeline", pipeline)
 end
@@ -2053,6 +2134,7 @@ local function create_step(arguments)
   step.id = string_arg(arguments, "id") or (pipeline.id .. "_step_" .. tostring(#array(pipeline.steps) + 1))
   step.position = arguments.position or #array(pipeline.steps) + 1
   step.kind = string_arg(arguments, "kind") or "agent"
+  step.gates = array(arguments.gates)
   pipeline.steps = array(pipeline.steps)
   table.insert(pipeline.steps, step)
   return persist_response(state, "step", step)
@@ -2233,7 +2315,9 @@ local function finish_run(arguments, run_status, ticket_status)
   if ticket then ticket.status = ticket_status end
   local run_step = find_by_id(state.run_steps, run.current_run_step_id)
   if run_step then run_step.status = run_status end
-  push_event(state, "run_" .. run_status, run.id, ticket and ticket.id)
+  push_event(state, "run_" .. run_status, run.id, ticket and ticket.id, {
+    reason = string_arg(arguments, "reason"),
+  })
   local err = save_state(state)
   if err then return err end
   return ok({ run = run, run_step = run_step, ticket = ticket })
@@ -2247,7 +2331,26 @@ local function close_ticket(arguments)
   local state = load_state()
   local ticket = find_by_id(state.tickets, string_arg(arguments, "ticket_id"))
   if not ticket then return failure("not_found", "ticket not found") end
+  local requires_merge_confirmation = false
+  local has_merged_link = false
+  for _, run in ipairs(state.runs) do
+    if run.ticket_id == ticket.id then
+      local pipeline = find_by_id(state.pipeline_definitions, run.pipeline_definition_id)
+      if pipeline and pipeline.merge_policy == "pr" then requires_merge_confirmation = true end
+      for _, link in ipairs(state.pr_links) do
+        if link.run_id == run.id and link.status == "merged" then has_merged_link = true end
+      end
+    end
+  end
+  if requires_merge_confirmation and not has_merged_link and arguments.merge_confirmed ~= true then
+    return failure("merge_confirmation_required", "PR-policy ticket requires a merged link or merge_confirmed=true", { "merge_confirmed" })
+  end
   ticket.status = "closed"
+  ticket.merge_confirmed = arguments.merge_confirmed == true or has_merged_link
+  ticket.merge_commit = string_arg(arguments, "merge_commit")
+  ticket.pr_url = string_arg(arguments, "pr_url")
+  ticket.merge_summary = string_arg(arguments, "merge_summary")
+  ticket.base_branch = string_arg(arguments, "base_branch")
   for _, run in ipairs(state.runs) do
     if run.ticket_id == ticket.id and run.status ~= "closed" and run.status ~= "cancelled" then
       run.status = "closed"
@@ -2452,6 +2555,7 @@ local function escalate_question(arguments)
   if not question then return failure("not_found", "question not found") end
   question.kind = "human"
   question.status = "open"
+  question.escalation_reason = string_arg(arguments, "reason")
   return persist_response(state, "question", question)
 end
 
@@ -2960,14 +3064,6 @@ local bound_list
 local function run_status_label(run)
   if type(run.blocked_transition) == "table" then return "blocked" end
   return run.status or "unknown"
-end
-
-local function run_status_tone(status)
-  if status == "failed" then return "danger" end
-  if status == "blocked" then return "warning" end
-  if status == "ready_for_review" or status == "review" or status == "ready" then return "success" end
-  if status == "active" then return "accent" end
-  return "muted"
 end
 
 local function project_rows(context)
@@ -5107,8 +5203,12 @@ extend_contract("spawn_ticket_session", {
   session_template_id = STRING_PROPERTY, session_template_name = STRING_PROPERTY,
   session_template_capability = STRING_PROPERTY,
 }, { "run_id" })
+TOOL_CONTRACTS.spawn_ticket_session.input_schema.properties.accessory_name = nil
+TOOL_CONTRACTS.spawn_ticket_session.input_schema.properties.session_type = nil
+TOOL_CONTRACTS.spawn_ticket_session.input_schema.properties.ticket_id = nil
 TOOL_CONTRACTS.spawn_ticket_session.description = "Spawn the current pipeline step's configured agent session for a durable run, using a correlated request so retries cannot dispatch twice."
 extend_contract("request_merge", { run_id = STRING_PROPERTY }, { "run_id" })
+TOOL_CONTRACTS.request_merge.input_schema.properties = { run_id = STRING_PROPERTY }
 TOOL_CONTRACTS.request_merge.description = "Atomically mark a run merge-requested while keeping its owning ticket active for provider merge reconciliation."
 extend_contract("remove_ticket_dependency", {
   ticket_id = STRING_PROPERTY, depends_on_ticket_id = STRING_PROPERTY,
@@ -5143,6 +5243,7 @@ TOOL_CONTRACTS.create_checklist.input_schema.anyOf = {
 extend_contract("list_checklists", { run_id = STRING_PROPERTY })
 extend_contract("list_pr_links", { ticket_id = STRING_PROPERTY, run_id = STRING_PROPERTY })
 extend_contract("retry_step_agent", { request_id = STRING_PROPERTY }, { "run_id" })
+TOOL_CONTRACTS.retry_step_agent.input_schema.properties.reason = nil
 TOOL_CONTRACTS.retry_step_agent.description = "Retry the current blocked agent step for the specified run after agent spawn or lifecycle failure. Clears stale session linkage on the current run step visit and reuses the durable correlated spawn request."
 
 extend_contract("list_projects", { status = STRING_PROPERTY })

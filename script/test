@@ -36,7 +36,7 @@ for phrase in ["Public MCP Contract", "Drain-first Cold Cut", "plugin_db.batch",
     assert phrase in readme
 for phrase in ["Persistence Boundaries", "entity_provider", "provider-specific merge execution"]:
     assert phrase in domain_contract
-for dead_name in ["empty_schema", "repository_from", "show_project", "show_ticket", "update_ticket_status", "list_pipeline_definitions", "record_run"]:
+for dead_name in ["empty_schema", "repository_from", "show_project", "show_ticket", "update_ticket_status", "list_pipeline_definitions", "record_run", "run_status_tone"]:
     assert f"local function {dead_name}" not in source
 
 scan_paths = [
@@ -45,8 +45,17 @@ scan_paths = [
     "script/hub_acceptance_smoke", "docs/domain-contract.md",
     "fixtures/project_pipelines/domain_contract.json",
 ]
-pii_pattern = re.compile(r"/" + r"Users/|/" + r"home/|jason" + r"conigliari|[A-Za-z0-9._%+-]+@(gmail|icloud|me)\\.com", re.I)
-assert pii_pattern.search("/" + "Users/example/known-positive")
+pii_pattern = re.compile(
+    r"/" + r"Users/|/" + r"home/|jason" + r"conigliari|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+    re.I,
+)
+for known_positive in [
+    "/" + "Users/example/known-positive",
+    "/" + "home/example/known-positive",
+    "jason" + "conigliari",
+    "agent" + "@" + "example" + "." + "invalid",
+]:
+    assert pii_pattern.search(known_positive), f"PII guard arm did not match {known_positive}"
 for path in scan_paths:
     match = pii_pattern.search(Path(path).read_text())
     assert not match, f"PII or operator path in {path}: {match.group(0)}"
@@ -162,6 +171,22 @@ for _, descriptor in ipairs(plugin.tools) do
   end
 end
 
+local source_file = assert(io.open("plugin.lua", "r"))
+local plugin_source = source_file:read("*a")
+source_file:close()
+local handler_source = assert(plugin_source:match("^(.-)\nlocal TOOL_CONTRACTS ="))
+local unhandled_contract_properties = {}
+for _, descriptor in ipairs(plugin.tools) do
+  for property in pairs(descriptor.input_schema.properties) do
+    local dot_reference = "arguments." .. property
+    local quoted_reference = '"' .. property .. '"'
+    if not handler_source:find(dot_reference, 1, true) and not handler_source:find(quoted_reference, 1, true) then
+      table.insert(unhandled_contract_properties, descriptor.name .. ":" .. property)
+    end
+  end
+end
+assert(#unhandled_contract_properties == 0, "advertised properties without handler references: " .. table.concat(unhandled_contract_properties, ", "))
+
 local required = {
   "add_artifact", "add_checklist_item", "add_project_target", "add_ticket_dependency",
   "answer_question", "ask_agent", "ask_human", "cancel_run",
@@ -260,8 +285,16 @@ assert(tools["project_pipelines.create_project"]({ id = "project-disposable", na
 assert(tools["project_pipelines.update_project"]({ project_id = "project-disposable", description = "Updated" }).project.description == "Updated")
 assert(tools["project_pipelines.list_projects"]({ status = "active" }).ok)
 assert(tools["project_pipelines.delete_project"]({ project_id = "project-disposable" }).ok)
-assert(tools["project_pipelines.create_pipeline"]({ id = "pipeline-disposable", name = "Disposable" }).ok)
-assert(tools["project_pipelines.update_pipeline"]({ pipeline_id = "pipeline-disposable", description = "Updated" }).pipeline.description == "Updated")
+local disposable_pipeline = tools["project_pipelines.create_pipeline"]({
+  id = "pipeline-disposable", name = "Disposable", version_label = "v1", supersedes_pipeline_id = "pipeline-old",
+})
+assert(disposable_pipeline.ok and disposable_pipeline.pipeline.version_label == "v1")
+assert(disposable_pipeline.pipeline.supersedes_pipeline_id == "pipeline-old")
+local updated_disposable = tools["project_pipelines.update_pipeline"]({
+  pipeline_id = "pipeline-disposable", description = "Updated", archived = true, supersedes_pipeline_id = "pipeline-new",
+})
+assert(updated_disposable.pipeline.description == "Updated" and updated_disposable.pipeline.archived_at == "archived")
+assert(updated_disposable.pipeline.replacement_pipeline_id == "pipeline-new")
 local disposable_step = tools["project_pipelines.create_step"]({
   pipeline_id = "pipeline-disposable", id = "step-disposable", name = "Disposable step",
 })
@@ -289,6 +322,7 @@ local blocked = tools["project_pipelines.start_run"]({
 assert(not blocked.ok and blocked.error.code == "ticket_dependencies_unmet")
 local dependency_rows = tools["project_pipelines.list_ticket_dependencies"]({ ticket_id = "ticket-blocked" }).dependencies
 assert(#dependency_rows == 1)
+assert(#tools["project_pipelines.list_ticket_dependencies"]({ ticket_id = "ticket-blocked", blocking_only = true }).dependencies == 1)
 assert(tools["project_pipelines.remove_ticket_dependency"]({ dependency_id = dependency_rows[1].id }).ok)
 assert(#tools["project_pipelines.list_ticket_dependencies"]({ ticket_id = "ticket-blocked" }).dependencies == 0)
 assert(tools["project_pipelines.add_ticket_dependency"]({
@@ -353,7 +387,7 @@ assert(#tools["project_pipelines.receive_question_answers"]({ all = true, ticket
 assert(tools["project_pipelines.release_question_orchestrator"]({ project_id = "project-one" }, { session_uuid = "orchestrator-one" }).ok)
 assert(#tools["project_pipelines.question_orchestrator_status"]({}).orchestrators == 0)
 local review = tools["project_pipelines.submit_review"]({
-  run_id = "run-atomic", step_id = "step-one", verdict = "approved",
+  run_id = "run-atomic", run_step_id = started.run_step.id, step_id = "step-one", verdict = "approved",
   findings = { { id = "finding-one", title = "Carry forward", severity = "medium" } },
 })
 assert(review.ok)
@@ -363,7 +397,7 @@ local gate_blocked = tools["project_pipelines.request_step_advance"]({
 })
 assert(not gate_blocked.ok and gate_blocked.error.code == "transition_blocked", "missing gate must block transition")
 assert(tools["project_pipelines.submit_gate"]({
-  run_id = "run-atomic", step_id = "step-one", gate_id = "gate-one", status = "passed",
+  run_id = "run-atomic", run_step_id = started.run_step.id, step_id = "step-one", gate_id = "gate-one", status = "passed",
   evidence = { command = "script/test" },
 }).ok)
 local advanced = tools["project_pipelines.request_step_advance"]({
@@ -375,11 +409,31 @@ assert(#advanced_context.run_steps == 2)
 assert(advanced_context.runs[1].current_step_id == "step-two")
 assert(tools["project_pipelines.cancel_run"]({ run_id = "run-atomic" }).ticket.status == "open")
 
+assert(tools["project_pipelines.create_ticket"]({
+  id = "ticket-override", project_id = "project-one", title = "Override",
+}).ok)
+local override_started = tools["project_pipelines.start_run"]({
+  id = "run-override", ticket_id = "ticket-override", pipeline_id = "pipeline-two-step",
+})
+assert(override_started.ok)
+local missing_override_reason = tools["project_pipelines.request_step_advance"]({
+  run_id = "run-override", override_unmet_gates = true,
+})
+assert(not missing_override_reason.ok and missing_override_reason.error.code == "validation_failed")
+local overridden = tools["project_pipelines.request_step_advance"]({
+  run_id = "run-override", override_unmet_gates = true, override_reason = "Acceptance override",
+})
+assert(overridden.ok and overridden.step_id == "step-two")
+
 local restarted = tools["project_pipelines.start_run"]({
   id = "run-close", ticket_id = "ticket-blocked", pipeline_id = "pipeline-two-step",
 })
 assert(restarted.ok)
-local closed = tools["project_pipelines.close_ticket"]({ ticket_id = "ticket-blocked" })
+local close_without_confirmation = tools["project_pipelines.close_ticket"]({ ticket_id = "ticket-blocked" })
+assert(not close_without_confirmation.ok and close_without_confirmation.error.code == "merge_confirmation_required")
+local closed = tools["project_pipelines.close_ticket"]({
+  ticket_id = "ticket-blocked", merge_confirmed = true, merge_summary = "Local acceptance",
+})
 assert(closed.ok and closed.ticket.status == "closed")
 local closed_context = tools["project_pipelines.current_context"]({ run_id = "run-close" })
 assert(closed_context.runs[1].status == "closed")
@@ -397,9 +451,11 @@ assert(merge_failure.runs[1].status == "active")
 fail_batch_key_prefix = nil
 assert(tools["project_pipelines.link_pr"]({
   run_id = "run-merge", pr_url = "https://example.invalid/pr/1", repo = "example/repo", pr_number = 1,
+  base_branch = "main", head_branch = "ticket-merge",
 }).ok)
 local pr_links = tools["project_pipelines.list_pr_links"]({ run_id = "run-merge", repo = "example/repo" }).pr_links
 assert(#pr_links == 1 and tools["project_pipelines.get_pr_link"]({ pr_link_id = pr_links[1].id }).pr_link.id == pr_links[1].id)
+assert(pr_links[1].base_branch == "main" and pr_links[1].head_branch == "ticket-merge")
 assert(tools["project_pipelines.request_merge"]({ run_id = "run-merge" }).ok)
 
 assert(tools["project_pipelines.create_pipeline"]({
@@ -444,6 +500,9 @@ local returned = tools["project_pipelines.request_step_advance"]({ run_id = "run
 assert(returned.ok and returned.step_id == "implement", "changes_required must route back to Implement")
 assert(tools["project_pipelines.resolve_finding"]({ finding_id = "finding-rework", resolution = "fixed" }).ok)
 assert(tools["project_pipelines.request_step_advance"]({ run_id = "run-review-routing" }).step_id == "review")
+local stale_review = tools["project_pipelines.request_step_advance"]({ run_id = "run-review-routing" })
+assert(not stale_review.ok and stale_review.error.code == "transition_blocked")
+assert(stale_review.error.blockers[1].kind == "review_missing", "serviced review verdict must not control a later visit")
 assert(tools["project_pipelines.submit_review"]({
   run_id = "run-review-routing", step_id = "review", verdict = "approved",
 }).ok)

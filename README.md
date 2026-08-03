@@ -30,8 +30,9 @@ The executable contract fixture is
 `script/test` validates fixture and manifest anchors, the closed MCP descriptor
 contract, repository routing (including negative and ambiguous cases),
 PII/operator-path absence, atomic lifecycle failure, dependency and gate
-blocking, verdict-based review routing, correlated spawn replay, malformed
+blocking and explicit overrides, run-step-visit-scoped review routing, correlated spawn replay, malformed
 record rejection, v2 namespace removal, entity snapshots, and source reload.
+It rejects descriptor properties that have no handler-side reference.
 It also proves the app workbench and settings surfaces expose committed state.
 The settings surface renders
 `project-pipelines-provider-dependency-status`, a stable provider/dependency
@@ -330,8 +331,10 @@ test Plan template, activates the production sourced Plan through
 `ensure_worktree_and_spawn`, and waits for that spawned Plan process to inspect
 its managed prompt, resolve `[[botster-workspaces-playbook]]`, and submit the Plan
 artifact, gate, and step advance through the public plugin MCP socket without a
-routing question. The harness then restarts Hub and rechecks the same durable
-workflow identity.
+routing question. Through the running daemon's public tool-list request it also
+proves the exact 63 published names, authored descriptions, nonempty serialized
+schema objects/arrays, and the nested review verdict/finding enums. The harness
+then restarts Hub and rechecks the same durable workflow identity.
 
 `EXPECTED_HUB_COMMIT` in `script/test-hub-flow` records the Hub revision against
 which this plugin contract was proven. Advance that pin deliberately only when

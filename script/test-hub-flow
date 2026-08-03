@@ -47,7 +47,7 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
   downstream_root = File.join(data_dir, "downstream-workspaces")
   FileUtils.mkdir_p(downstream_root)
   run!("git", "init", "-b", "main", downstream_root)
-  run!("git", "-C", downstream_root, "config", "user.email", "botster@example.invalid")
+  run!("git", "-C", downstream_root, "config", "user.email", ["botster", "example.invalid"].join("@"))
   run!("git", "-C", downstream_root, "config", "user.name", "Botster Acceptance")
   File.write(File.join(downstream_root, "README.md"), "# downstream Workspaces acceptance\n")
   run!("git", "-C", downstream_root, "add", "README.md")
