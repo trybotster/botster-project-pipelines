@@ -109,6 +109,11 @@ assert(
   published_submit_review.dig("properties", "findings", "items", "properties", "severity", "enum") == %w[blocker high medium low info],
   "submit_review finding severity enum changed in Hub serialization"
 )
+published_create_ticket_tool = published_tools.find { |tool| tool.fetch("name") == "project_pipelines.create_ticket" }
+published_create_ticket = published_create_ticket_tool.fetch("inputSchema")
+assert(published_create_ticket.dig("properties", "dependency_ticket_ids", "type") == "array", "create_ticket dependency IDs must publish as an array")
+assert(published_create_ticket.dig("properties", "dependency_ticket_ids", "items", "type") == "string", "create_ticket dependency array item shape changed")
+assert(published_create_ticket_tool.fetch("description").include?("atomically registered as normalized blocking dependency rows"), "create_ticket normalization semantics are not discoverable")
 
 def subscribe_entity_snapshot(socket_path, entity_type, subscription_id)
   subscription = UNIXSocket.new(socket_path)
@@ -237,6 +242,38 @@ if restart_verification
   assert(initial_context.fetch("questions").any? { |question| question["status"] == "answered" }, "question answer did not survive Hub restart")
   assert(initial_context.fetch("checklists").any?, "checklist did not survive Hub restart")
   assert(initial_context.fetch("pr_links").any?, "PR link did not survive Hub restart")
+  waiting_run = initial_context.fetch("runs").find { |run| run["id"] == "run_live_dependency_waiting" }
+  assert(waiting_run, "dependency-waiting run did not survive Hub restart")
+  assert(waiting_run["current_step_id"] == "live_waiting_plan_review", "restart changed the preserved source step")
+  assert(waiting_run.dig("waiting_transition", "target_step_id") == "live_waiting_implement", "restart lost the waiting target")
+  waiting_steps = initial_context.fetch("run_steps").select { |step| step["run_id"] == waiting_run["id"] }
+  assert(waiting_steps.length == 1, "waiting run created an Implement visit before restart")
+  assert(initial_context.fetch("session_requests").none? { |request_row| request_row["run_id"] == waiting_run["id"] }, "waiting run spawned before restart")
+  call_tool(socket, "project_pipelines.update_ticket", {
+    ticket_id: "ticket_live_dependency_blocker",
+    status: "closed"
+  })
+  woken_context = call_tool(socket, "project_pipelines.current_context", { run_id: waiting_run["id"] })
+  assert(woken_context.dig("run", "current_step_id") == "live_waiting_implement", "final clearance did not wake Implement")
+  assert(!woken_context.dig("run", "waiting_transition"), "final clearance did not consume waiting state")
+  assert(woken_context.fetch("run_steps").length == 2, "final clearance did not create exactly one Implement visit")
+  call_tool(socket, "project_pipelines.update_ticket", {
+    ticket_id: "ticket_live_dependency_blocker",
+    status: "closed"
+  })
+  assert(call_tool(socket, "project_pipelines.current_context", { run_id: waiting_run["id"] }).fetch("run_steps").length == 2, "duplicate clearance created another Implement visit")
+  live_waiting_spawn = call_tool(socket, "project_pipelines.spawn_ticket_session", {
+    run_id: waiting_run["id"],
+    request_id: "session_request_live_dependency_waiting"
+  })
+  assert(live_waiting_spawn["ok"] == true, "woken Implement did not reach the real Hub spawn path")
+  call_tool(socket, "project_pipelines.spawn_ticket_session", {
+    run_id: waiting_run["id"],
+    request_id: "session_request_live_dependency_waiting"
+  })
+  spawned_context = call_tool(socket, "project_pipelines.current_context", { run_id: waiting_run["id"] })
+  assert(spawned_context.fetch("session_requests").count { |request_row| request_row["run_id"] == waiting_run["id"] } == 1, "woken Implement dispatched more than one request")
+  initial_context = call_tool(socket, "project_pipelines.current_context", {})
   render_surface(socket)
   restart_snapshot = subscribe_entity_snapshot(socket_path, "project-pipelines.run", "project-pipelines-run-after-restart")
   assert(restart_snapshot.fetch("items") == initial_context.fetch("runs"), "reconnect snapshot disagrees with authoritative restarted context")
@@ -541,6 +578,66 @@ implement_advance = call_tool(socket, "project_pipelines.request_step_advance", 
   request_id: "live-implement-advance"
 })
 assert(implement_advance["ok"] == true && implement_advance["step_id"] == "botster_stack_review", "committed PR-backed implementation did not advance")
+
+source_plan_step = stack_definitions.first.fetch("steps").find { |step| step.fetch("id") == "botster_stack_plan" }
+call_tool(socket, "project_pipelines.create_pipeline", {
+  id: "pipeline_live_dependency_waiting",
+  name: "Live dependency waiting",
+  steps: [
+    {
+      id: "live_waiting_plan_review",
+      name: "Plan Review",
+      allows_open_ticket_dependencies: true,
+      on_approved_step_id: "live_waiting_implement"
+    },
+    {
+      id: "live_waiting_implement",
+      name: "Implement",
+      kind: "pty",
+      session_template_id: "downstream-plan.fixture/plan",
+      prompt: source_plan_step.fetch("prompt")
+    }
+  ]
+})
+call_tool(socket, "project_pipelines.create_ticket", {
+  id: "ticket_live_dependency_waiting",
+  project_id: project_id,
+  target_id: "tgt_71266a8d976d4535902ffed09c18a7ba",
+  title: "Live dependency waiting"
+})
+live_waiting_started = call_tool(socket, "project_pipelines.start_run", {
+  id: "run_live_dependency_waiting",
+  ticket_id: "ticket_live_dependency_waiting",
+  pipeline_id: "pipeline_live_dependency_waiting",
+  spawn_target_id: "tgt_71266a8d976d4535902ffed09c18a7ba",
+  branch: "project-pipelines/live-dependency-waiting",
+  base_ref: "main"
+})
+call_tool(socket, "project_pipelines.create_ticket", {
+  id: "ticket_live_dependency_blocker",
+  project_id: project_id,
+  title: "Live dependency blocker"
+})
+call_tool(socket, "project_pipelines.add_ticket_dependency", {
+  id: "dependency_live_waiting",
+  ticket_id: "ticket_live_dependency_waiting",
+  dependency_ticket_id: "ticket_live_dependency_blocker"
+})
+call_tool(socket, "project_pipelines.submit_review", {
+  run_id: "run_live_dependency_waiting",
+  run_step_id: live_waiting_started.dig("run_step", "id"),
+  step_id: "live_waiting_plan_review",
+  verdict: "approved"
+})
+live_waiting_advance = call_tool(socket, "project_pipelines.request_step_advance", {
+  run_id: "run_live_dependency_waiting",
+  request_id: "advance_live_dependency_waiting"
+})
+assert(live_waiting_advance["ok"] == false && live_waiting_advance.dig("error", "code") == "ticket_dependencies_unmet", "approved live review did not wait for dependency")
+live_waiting_context = call_tool(socket, "project_pipelines.current_context", { run_id: "run_live_dependency_waiting" })
+assert(live_waiting_context.dig("run", "current_step_id") == "live_waiting_plan_review", "waiting changed the source step")
+assert(live_waiting_context.fetch("run_steps").length == 1, "waiting created Implement before clearance")
+assert(live_waiting_context.fetch("session_requests").none? { |request_row| request_row["run_id"] == "run_live_dependency_waiting" }, "waiting created a downstream request")
 
 final_context = call_tool(socket, "project_pipelines.current_context", {})
 assert(final_context.fetch("runs").any? { |record| record["id"] == run_id }, "current context missing live run")

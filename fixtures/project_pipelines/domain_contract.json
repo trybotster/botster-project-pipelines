@@ -160,16 +160,21 @@
       "project_id": "proj_standalone_contract",
       "workspace_id": null,
       "title": "Define Project Pipelines domain contract",
-      "status": "open",
-      "dependency_ticket_ids": []
+      "status": "open"
     },
     {
       "id": "ticket_contract_workspace_link",
       "project_id": "proj_workspace_contract",
       "workspace_id": "workspace_contract_alpha",
       "title": "Exercise optional workspace linkage",
-      "status": "open",
-      "dependency_ticket_ids": ["ticket_contract_define_domain"]
+      "status": "open"
+    }
+  ],
+  "ticket_dependencies": [
+    {
+      "id": "dependency_contract_workspace_domain",
+      "ticket_id": "ticket_contract_workspace_link",
+      "depends_on_ticket_id": "ticket_contract_define_domain"
     }
   ],
   "pipeline_definitions": [
@@ -260,6 +265,7 @@
       "ticket_id": "ticket_contract_define_domain",
       "pipeline_definition_id": "pipeline_botster_delivery",
       "current_step_id": "step_implement",
+      "current_run_step_id": "run_step_contract_standalone_implement",
       "status": "active",
       "workspace_session_group_id": null,
       "workspace_id": null,
@@ -282,6 +288,7 @@
       "ticket_id": "ticket_contract_workspace_link",
       "pipeline_definition_id": "pipeline_botster_delivery",
       "current_step_id": "step_plan",
+      "current_run_step_id": "run_step_contract_workspace_plan",
       "status": "active",
       "workspace_session_group_id": "workspace_session_group_alpha",
       "workspace_id": "workspace_contract_alpha",
@@ -298,19 +305,37 @@
         "kind": "provider_owned_reference",
         "id": "worktree_contract_workspace"
       },
-      "blocked_transition": {
-        "status": "blocked",
+      "waiting_transition": {
+        "status": "waiting",
         "code": "ticket_dependencies_unmet",
-        "message": "ticket has open blocking dependencies",
-        "ticket_id": "ticket_contract_workspace_link",
-        "step_id": "step_implement",
+        "source_step_id": "step_plan",
+        "source_run_step_id": "run_step_contract_workspace_plan",
+        "target_step_id": "step_implement",
+        "request_id": "advance_contract_workspace",
         "unmet_dependencies": [
           {
+            "dependency_id": "dependency_contract_workspace_domain",
             "dependency_ticket_id": "ticket_contract_define_domain",
             "status": "open"
           }
         ]
       }
+    }
+  ],
+  "run_steps": [
+    {
+      "id": "run_step_contract_standalone_implement",
+      "run_id": "run_contract_standalone",
+      "step_id": "step_implement",
+      "status": "active",
+      "sequence": 2
+    },
+    {
+      "id": "run_step_contract_workspace_plan",
+      "run_id": "run_contract_workspace",
+      "step_id": "step_plan",
+      "status": "active",
+      "sequence": 1
     }
   ],
   "session_requests": [
@@ -620,17 +645,17 @@
       "subject_id": "session_request_contract_provider_blocked"
     },
     {
-      "id": "event_contract_ticket_dependency_blocked",
+      "id": "event_contract_ticket_dependency_waiting",
       "run_id": "run_contract_workspace",
-      "kind": "ticket_dependencies_blocked",
+      "kind": "ticket_dependencies_waiting",
       "subject_id": "step_implement",
       "payload": {
-        "status": "blocked",
-        "code": "ticket_dependencies_unmet",
-        "ticket_id": "ticket_contract_workspace_link",
-        "step_id": "step_implement",
+        "source_step_id": "step_plan",
+        "source_run_step_id": "run_step_contract_workspace_plan",
+        "request_id": "advance_contract_workspace",
         "unmet_dependencies": [
           {
+            "dependency_id": "dependency_contract_workspace_domain",
             "dependency_ticket_id": "ticket_contract_define_domain",
             "status": "open"
           }

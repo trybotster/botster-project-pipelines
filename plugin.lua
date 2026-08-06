@@ -372,6 +372,9 @@ local function load_state()
       state._originals[family][record.id] = copy(record)
     end
   end
+  -- Normalized rows are the sole dependency shape. Remove non-authoritative
+  -- ticket fields from projections and from the next atomic write.
+  for _, ticket in ipairs(state.tickets) do ticket.dependency_ticket_ids = nil end
   return state
 end
 
@@ -1009,23 +1012,68 @@ local function create_ticket(arguments)
   if not title or title == "" then return failure("validation_failed", "title is required", { "title" }) end
   local state = load_state()
   if not find_by_id(state.projects, project_id) then return failure("not_found", "project not found: " .. project_id) end
+  if arguments.dependency_ticket_ids ~= nil and type(arguments.dependency_ticket_ids) ~= "table" then
+    return failure("validation_failed", "dependency_ticket_ids must be an array", { "dependency_ticket_ids" })
+  end
   local requested_id = string_arg(arguments, "id")
   local existing = requested_id and find_by_id(state.tickets, requested_id) or nil
+  local ticket_id = requested_id or next_id(state, "ticket")
+  local dependency_ticket_ids = {}
+  local seen_dependency_ids = {}
+  for _, dependency_ticket_id in ipairs(array(arguments.dependency_ticket_ids)) do
+    if type(dependency_ticket_id) ~= "string" or dependency_ticket_id == "" then
+      return failure("validation_failed", "dependency_ticket_ids must contain ticket ids", { "dependency_ticket_ids" })
+    end
+    if dependency_ticket_id == ticket_id then
+      return failure("validation_failed", "ticket cannot depend on itself", { "dependency_ticket_ids" })
+    end
+    if not find_by_id(state.tickets, dependency_ticket_id) then
+      return failure("not_found", "dependency ticket not found: " .. dependency_ticket_id)
+    end
+    if not seen_dependency_ids[dependency_ticket_id] then
+      seen_dependency_ids[dependency_ticket_id] = true
+      table.insert(dependency_ticket_ids, dependency_ticket_id)
+    end
+  end
   if existing then
     if existing.project_id ~= project_id or existing.title ~= title then return failure("id_conflict", "ticket id belongs to different content") end
+    if arguments.dependency_ticket_ids ~= nil then
+      local existing_dependency_ids = {}
+      local existing_dependency_count = 0
+      for _, dependency in ipairs(state.ticket_dependencies) do
+        if dependency.ticket_id == existing.id then
+          existing_dependency_ids[dependency.depends_on_ticket_id] = true
+          existing_dependency_count = existing_dependency_count + 1
+        end
+      end
+      if existing_dependency_count ~= #dependency_ticket_ids then
+        return failure("id_conflict", "ticket id belongs to different dependency content")
+      end
+      for _, dependency_ticket_id in ipairs(dependency_ticket_ids) do
+        if not existing_dependency_ids[dependency_ticket_id] then
+          return failure("id_conflict", "ticket id belongs to different dependency content")
+        end
+      end
+    end
     return ok({ ticket = existing, adopted = true })
   end
   local ticket = {
-    id = requested_id or next_id(state, "ticket"),
+    id = ticket_id,
     project_id = project_id,
     workspace_id = string_arg(arguments, "workspace_id"),
     title = title,
     description = string_arg(arguments, "description"),
     status = string_arg(arguments, "status") or "open",
     target_id = string_arg(arguments, "target_id"),
-    dependency_ticket_ids = array(arguments.dependency_ticket_ids),
   }
   table.insert(state.tickets, ticket)
+  for _, dependency_ticket_id in ipairs(dependency_ticket_ids) do
+    table.insert(state.ticket_dependencies, {
+      id = next_id(state, "ticket_dependency"),
+      ticket_id = ticket.id,
+      depends_on_ticket_id = dependency_ticket_id,
+    })
+  end
   push_event(state, "ticket_created", nil, ticket.id)
   local err = save_state(state)
   if err then return err end
@@ -1045,6 +1093,8 @@ local function list_tickets(arguments)
   return ok({ tickets = tickets })
 end
 
+local reconcile_waiting_transitions
+
 local function add_ticket_dependency(arguments)
   arguments = arguments or {}
   local ticket_id = string_arg(arguments, "ticket_id")
@@ -1060,11 +1110,11 @@ local function add_ticket_dependency(arguments)
   if not find_by_id(state.tickets, dependency_ticket_id) then
     return failure("not_found", "dependency ticket not found: " .. dependency_ticket_id)
   end
-  ticket.dependency_ticket_ids = array(ticket.dependency_ticket_ids)
-  if table_contains(ticket.dependency_ticket_ids, dependency_ticket_id) then
-    return ok({ ticket = ticket })
+  for _, existing in ipairs(state.ticket_dependencies) do
+    if existing.ticket_id == ticket.id and existing.depends_on_ticket_id == dependency_ticket_id then
+      return ok({ ticket = ticket, dependency = existing })
+    end
   end
-  table.insert(ticket.dependency_ticket_ids, dependency_ticket_id)
   local dependency = {
     id = string_arg(arguments, "id") or next_id(state, "ticket_dependency"),
     ticket_id = ticket.id,
@@ -1072,9 +1122,10 @@ local function add_ticket_dependency(arguments)
   }
   table.insert(state.ticket_dependencies, dependency)
   push_event(state, "ticket_dependency_added", nil, ticket.id, { dependency_ticket_id = dependency_ticket_id })
+  reconcile_waiting_transitions(state)
   local err = save_state(state)
   if err then return err end
-  return ok({ ticket = ticket })
+  return ok({ ticket = ticket, dependency = dependency })
 end
 
 local function remove_ticket_dependency(arguments)
@@ -1093,24 +1144,16 @@ local function remove_ticket_dependency(arguments)
   if not dependency_ticket_id then return failure("validation_failed", "dependency_ticket_id is required", { "dependency_ticket_id" }) end
   local ticket = find_by_id(state.tickets, ticket_id)
   if not ticket then return failure("not_found", "ticket not found: " .. ticket_id) end
-  local dependencies = {}
-  local removed = false
-  for _, id in ipairs(array(ticket.dependency_ticket_ids)) do
-    if id == dependency_ticket_id then
-      removed = true
-    else
-      table.insert(dependencies, id)
-    end
-  end
-  if not removed then return ok({ ticket = ticket }) end
-  ticket.dependency_ticket_ids = dependencies
+  local removed
   for index = #state.ticket_dependencies, 1, -1 do
     local dependency = state.ticket_dependencies[index]
     if dependency.ticket_id == ticket.id and dependency.depends_on_ticket_id == dependency_ticket_id then
-      table.remove(state.ticket_dependencies, index)
+      removed = table.remove(state.ticket_dependencies, index)
     end
   end
+  if not removed then return ok({ ticket = ticket }) end
   push_event(state, "ticket_dependency_removed", nil, ticket.id, { dependency_ticket_id = dependency_ticket_id })
+  reconcile_waiting_transitions(state)
   local err = save_state(state)
   if err then return err end
   return ok({ ticket = ticket })
@@ -1118,13 +1161,17 @@ end
 
 local function unmet_ticket_dependencies(state, ticket)
   local unmet = {}
-  for _, dependency_ticket_id in ipairs(array(ticket and ticket.dependency_ticket_ids)) do
-    local dependency_ticket = find_by_id(state.tickets, dependency_ticket_id)
-    if not dependency_ticket or dependency_ticket.status ~= "closed" then
-      table.insert(unmet, {
-        dependency_ticket_id = dependency_ticket_id,
-        status = dependency_ticket and (dependency_ticket.status or "open") or "missing",
-      })
+  if not ticket then return unmet end
+  for _, dependency in ipairs(state.ticket_dependencies) do
+    if dependency.ticket_id == ticket.id then
+      local dependency_ticket = find_by_id(state.tickets, dependency.depends_on_ticket_id)
+      if not dependency_ticket or dependency_ticket.status ~= "closed" then
+        table.insert(unmet, {
+          dependency_id = dependency.id,
+          dependency_ticket_id = dependency.depends_on_ticket_id,
+          status = dependency_ticket and (dependency_ticket.status or "open") or "missing",
+        })
+      end
     end
   end
   return unmet
@@ -1748,6 +1795,78 @@ local function transition_blockers(state, run, pipeline, step)
   return blockers
 end
 
+local function dependency_blockers_for_step(state, ticket, step)
+  if step.allows_open_ticket_dependencies == true then return {} end
+  return unmet_ticket_dependencies(state, ticket)
+end
+
+local function transition_response(run, source_step_id, target_step_id)
+  local response_run = copy(run)
+  response_run.current_step_id = target_step_id
+  response_run.status = "active"
+  response_run.waiting_transition = nil
+  return ok({ run = response_run, previous_step_id = source_step_id, step_id = target_step_id })
+end
+
+local function apply_step_transition(state, run, transition, recovered)
+  if run.current_step_id ~= transition.source_step_id
+    or run.current_run_step_id ~= transition.source_run_step_id
+  then
+    return failure("transition_source_changed", "waiting transition no longer matches the current run-step visit")
+  end
+  local previous_run_step = find_by_id(state.run_steps, transition.source_run_step_id)
+  if not previous_run_step then
+    return failure("transition_source_missing", "waiting transition source run-step is missing")
+  end
+  previous_run_step.status = "done"
+  run.current_step_id = transition.target_step_id
+  run.status = "active"
+  local run_step = {
+    id = next_id(state, "run_step"), run_id = run.id, step_id = transition.target_step_id,
+    status = "active", sequence = (previous_run_step.sequence or 0) + 1,
+  }
+  table.insert(state.run_steps, run_step)
+  run.current_run_step_id = run_step.id
+  run.waiting_transition = nil
+  push_event(state, "step_advanced", run.id, transition.target_step_id, {
+    from_step_id = transition.source_step_id,
+    request_id = transition.request_id,
+    recovered = recovered == true,
+  })
+  if transition.advance_request_id then
+    local request = find_by_id(state.advance_requests, transition.advance_request_id)
+    if request then request.status = "applied" end
+  end
+  return transition.result or transition_response(run, transition.source_step_id, transition.target_step_id)
+end
+
+local function wait_for_ticket_dependencies(state, run, transition, dependencies)
+  local waiting = run.waiting_transition
+  local first_wait = type(waiting) ~= "table"
+    or waiting.source_run_step_id ~= transition.source_run_step_id
+    or waiting.target_step_id ~= transition.target_step_id
+  transition.status = "waiting"
+  transition.code = "ticket_dependencies_unmet"
+  transition.unmet_dependencies = copy(dependencies)
+  run.waiting_transition = copy(transition)
+  if first_wait then
+    push_event(state, "ticket_dependencies_waiting", run.id, transition.target_step_id, {
+      source_step_id = transition.source_step_id,
+      source_run_step_id = transition.source_run_step_id,
+      request_id = transition.request_id,
+      unmet_dependencies = copy(dependencies),
+    })
+  end
+  return diagnostic_failure("ticket_dependencies_unmet", "ticket has open blocking dependencies", {
+    status = "waiting",
+    run_id = run.id,
+    step_id = transition.source_step_id,
+    next_step_id = transition.target_step_id,
+    waiting_transition = copy(run.waiting_transition),
+    unmet_dependencies = copy(dependencies),
+  })
+end
+
 local function request_step_advance(arguments)
   arguments = arguments or {}
   local run_id = string_arg(arguments, "run_id")
@@ -1755,6 +1874,10 @@ local function request_step_advance(arguments)
   local state = load_state()
   local run = find_by_id(state.runs, run_id)
   if not run then return failure("not_found", "run not found: " .. run_id) end
+  local pipeline = find_by_id(state.pipeline_definitions, run.pipeline_definition_id)
+  if not pipeline then return failure("not_found", "pipeline definition not found: " .. run.pipeline_definition_id) end
+  local ticket = find_by_id(state.tickets, run.ticket_id)
+  if not ticket then return failure("not_found", "ticket not found: " .. tostring(run.ticket_id)) end
   local request_id = string_arg(arguments, "request_id")
   if request_id then
     for _, request in ipairs(state.advance_requests) do
@@ -1763,22 +1886,25 @@ local function request_step_advance(arguments)
           return failure("request_id_conflict", "advance request_id belongs to another run")
         end
         if run.current_step_id == request.previous_step_id then
-          local previous_run_step = find_by_id(state.run_steps, run.current_run_step_id)
-          if previous_run_step then previous_run_step.status = "done" end
-          run.current_step_id = request.step_id
-          run.status = "active"
-          local recovered_run_step = {
-            id = next_id(state, "run_step"), run_id = run.id, step_id = request.step_id,
-            status = "active", sequence = previous_run_step and (previous_run_step.sequence or 0) + 1 or 1,
-          }
-          table.insert(state.run_steps, recovered_run_step)
-          run.current_run_step_id = recovered_run_step.id
-          push_event(state, "step_advanced", run.id, request.step_id, {
-            from_step_id = request.previous_step_id,
+          local target_step = find_pipeline_step(pipeline, request.step_id)
+          if not target_step then return failure("not_found", "step not found: " .. tostring(request.step_id)) end
+          local transition = {
+            source_step_id = request.previous_step_id,
+            source_run_step_id = run.current_run_step_id,
+            target_step_id = request.step_id,
             request_id = request.request_id,
-            recovered = true,
-          })
-          request.status = "applied"
+            advance_request_id = request.id,
+            result = copy(request.result),
+          }
+          local dependencies = dependency_blockers_for_step(state, ticket, target_step)
+          if #dependencies > 0 then
+            local blocked = wait_for_ticket_dependencies(state, run, transition, dependencies)
+            local waiting_error = save_state(state)
+            if waiting_error then return waiting_error end
+            return blocked
+          end
+          local applied = apply_step_transition(state, run, transition, true)
+          if applied.ok == false then return applied end
           local recovered_error = save_state(state)
           if recovered_error then return recovered_error end
         elseif run.current_step_id ~= request.step_id then
@@ -1792,8 +1918,6 @@ local function request_step_advance(arguments)
       end
     end
   end
-  local pipeline = find_by_id(state.pipeline_definitions, run.pipeline_definition_id)
-  if not pipeline then return failure("not_found", "pipeline definition not found: " .. run.pipeline_definition_id) end
   local current_step = find_pipeline_step(pipeline, run.current_step_id)
   if not current_step then return failure("not_found", "current step not found: " .. tostring(run.current_step_id)) end
   local latest_review = review_for_current_visit(state, run, current_step)
@@ -1816,12 +1940,6 @@ local function request_step_advance(arguments)
   local next_step = find_pipeline_step(pipeline, next_step_id)
   if not next_step then return failure("not_found", "next step not found: " .. next_step_id) end
   local blockers = review_rework and {} or transition_blockers(state, run, pipeline, current_step)
-  local ticket = find_by_id(state.tickets, run.ticket_id)
-  if not review_rework and next_step.allows_open_ticket_dependencies ~= true then
-    for _, dependency in ipairs(unmet_ticket_dependencies(state, ticket)) do
-      table.insert(blockers, { kind = "ticket_dependency", dependency = dependency })
-    end
-  end
   if arguments.override_unmet_gates == true then
     local override_reason = trim(arguments.override_reason)
     if not override_reason or override_reason == "" then
@@ -1854,10 +1972,7 @@ local function request_step_advance(arguments)
       blockers = blockers,
     })
   end
-  local response_run = copy(run)
-  response_run.current_step_id = next_step_id
-  response_run.status = "active"
-  local response = ok({ run = response_run, previous_step_id = current_step.id, step_id = next_step_id })
+  local response = transition_response(run, current_step.id, next_step_id)
   local advance_request
   if request_id then
     advance_request = {
@@ -1870,30 +1985,68 @@ local function request_step_advance(arguments)
       result = copy(response),
     }
     table.insert(state.advance_requests, advance_request)
+  end
+  local transition = {
+    source_step_id = current_step.id,
+    source_run_step_id = run.current_run_step_id,
+    target_step_id = next_step_id,
+    request_id = request_id,
+    advance_request_id = advance_request and advance_request.id,
+    result = copy(response),
+  }
+  local dependencies = dependency_blockers_for_step(state, ticket, next_step)
+  if #dependencies > 0 then
+    local blocked = wait_for_ticket_dependencies(state, run, transition, dependencies)
+    local waiting_error = save_state(state)
+    if waiting_error then return waiting_error end
+    return blocked
+  end
+  if advance_request then
     local correlation_error = save_state(state)
     if correlation_error then return correlation_error end
     state = load_state()
     run = find_by_id(state.runs, run_id)
+    ticket = find_by_id(state.tickets, run.ticket_id)
     advance_request = find_by_id(state.advance_requests, advance_request.id)
+    transition.advance_request_id = advance_request.id
+    dependencies = dependency_blockers_for_step(state, ticket, next_step)
+    if #dependencies > 0 then
+      local blocked = wait_for_ticket_dependencies(state, run, transition, dependencies)
+      local waiting_error = save_state(state)
+      if waiting_error then return waiting_error end
+      return blocked
+    end
   end
-  run.current_step_id = next_step_id
-  run.status = "active"
-  local previous_run_step = find_by_id(state.run_steps, run.current_run_step_id)
-  if previous_run_step then previous_run_step.status = "done" end
-  local run_step = {
-    id = next_id(state, "run_step"), run_id = run.id, step_id = next_step_id,
-    status = "active", sequence = previous_run_step and (previous_run_step.sequence or 0) + 1 or 1,
-  }
-  table.insert(state.run_steps, run_step)
-  run.current_run_step_id = run_step.id
-  push_event(state, "step_advanced", run.id, next_step_id, {
-    from_step_id = current_step.id,
-    request_id = request_id,
-  })
-  if advance_request then advance_request.status = "applied" end
+  local applied = apply_step_transition(state, run, transition, false)
+  if applied.ok == false then return applied end
   local err = save_state(state)
   if err then return err end
   return response
+end
+
+reconcile_waiting_transitions = function(state)
+  local applied = {}
+  for _, run in ipairs(state.runs) do
+    local waiting = run.waiting_transition
+    if type(waiting) == "table" then
+      local ticket = find_by_id(state.tickets, run.ticket_id)
+      local pipeline = find_by_id(state.pipeline_definitions, run.pipeline_definition_id)
+      local target_step = pipeline and find_pipeline_step(pipeline, waiting.target_step_id) or nil
+      if ticket and target_step
+        and run.current_step_id == waiting.source_step_id
+        and run.current_run_step_id == waiting.source_run_step_id
+      then
+        local dependencies = dependency_blockers_for_step(state, ticket, target_step)
+        if #dependencies > 0 then
+          waiting.unmet_dependencies = copy(dependencies)
+        else
+          local result = apply_step_transition(state, run, waiting, true)
+          if result.ok ~= false then table.insert(applied, run.id) end
+        end
+      end
+    end
+  end
+  return applied
 end
 
 local function records_for_run(records, run_id)
@@ -1986,6 +2139,7 @@ local function update_ticket(arguments)
   local ticket = find_by_id(state.tickets, string_arg(arguments, "ticket_id"))
   if not ticket then return failure("not_found", "ticket not found") end
   update_fields(ticket, arguments, { "title", "description", "project_id", "target_id", "status" })
+  reconcile_waiting_transitions(state)
   return persist_response(state, "ticket", ticket)
 end
 
@@ -2041,6 +2195,7 @@ local function delete_ticket(arguments)
     local dependency = state.ticket_dependencies[index]
     if dependency.ticket_id == id or dependency.depends_on_ticket_id == id then table.remove(state.ticket_dependencies, index) end
   end
+  reconcile_waiting_transitions(state)
   return persist_response(state, "ticket", ticket)
 end
 
@@ -2269,7 +2424,6 @@ local function create_child_run(arguments)
     description = string_arg(arguments, "description"),
     status = "active",
     target_id = string_arg(arguments, "target_id") or parent.target_id or parent_ticket.target_id,
-    dependency_ticket_ids = {},
     parent_ticket_id = parent_ticket.id,
   }
   if find_by_id(state.tickets, ticket.id) then return failure("id_conflict", "ticket id already exists") end
@@ -2359,6 +2513,7 @@ local function close_ticket(arguments)
     end
   end
   push_event(state, "ticket_closed", nil, ticket.id)
+  reconcile_waiting_transitions(state)
   return persist_response(state, "ticket", ticket)
 end
 
@@ -2384,6 +2539,7 @@ local function handle_pr_merged(arguments)
     matched_link.merge_commit = string_arg(arguments, "merge_commit")
   end
   push_event(state, "provider_pr_merged", run.id, matched_link and matched_link.id, { merge_commit = arguments.merge_commit })
+  reconcile_waiting_transitions(state)
   local err = save_state(state)
   if err then return err end
   return ok({ run = run, run_step = run_step, ticket = ticket, pr_link = matched_link })
@@ -2884,7 +3040,7 @@ local function status_summary(context)
     end
   end
   for _, run in ipairs(context.runs) do
-    if type(run.blocked_transition) == "table" then
+    if type(run.blocked_transition) == "table" or type(run.waiting_transition) == "table" then
       summary.blocked_transitions = summary.blocked_transitions + 1
     end
     if run.status == "active" then
@@ -2982,7 +3138,7 @@ end
 local function attention_items(context)
   local items = {}
   for _, run in ipairs(context.runs) do
-    local blocked = run.blocked_transition
+    local blocked = run.waiting_transition or run.blocked_transition
     if type(blocked) == "table" and blocked.code == "ticket_dependencies_unmet" then
       local ticket = ticket_for_run(context, run)
       local names = {}
@@ -2993,8 +3149,8 @@ local function attention_items(context)
       table.insert(items, list_item(
         "project-pipelines-attention-dependencies-" .. run.id,
         ticket and ticket.title or run.ticket_id,
-        "Blocked before " .. tostring(blocked.step_id) .. " by " .. table.concat(names, ", "),
-        "blocked"
+        "Waiting before " .. tostring(blocked.target_step_id or blocked.step_id) .. " for " .. table.concat(names, ", "),
+        run.waiting_transition and "waiting" or "blocked"
       ))
     end
   end
@@ -3030,13 +3186,13 @@ local function running_items(context)
     if run.status == "active" then
       local ticket = ticket_for_run(context, run)
       local pipeline = pipeline_for_run(context, run)
-      local blocked = run.blocked_transition
-      local step_id = type(blocked) == "table" and blocked.step_id or run.current_step_id
+      local blocked = run.waiting_transition or run.blocked_transition
+      local step_id = type(blocked) == "table" and (blocked.target_step_id or blocked.step_id) or run.current_step_id
       table.insert(items, list_item(
         "project-pipelines-running-" .. run.id,
         ticket and ticket.title or run.id,
         (pipeline and pipeline.name or run.pipeline_definition_id) .. " / " .. tostring(step_id),
-        type(blocked) == "table" and "blocked" or run.status
+        run.waiting_transition and "waiting" or (type(blocked) == "table" and "blocked" or run.status)
       ))
     end
   end
@@ -3062,6 +3218,7 @@ end
 local bound_list
 
 local function run_status_label(run)
+  if type(run.waiting_transition) == "table" then return "waiting" end
   if type(run.blocked_transition) == "table" then return "blocked" end
   return run.status or "unknown"
 end
@@ -3109,7 +3266,7 @@ local function run_rows(context)
   for _, run in ipairs(context.runs) do
     local ticket = ticket_for_run(context, run)
     local pipeline = pipeline_for_run(context, run)
-    local blocked = run.blocked_transition
+    local blocked = run.waiting_transition or run.blocked_transition
     local blockers = {}
     for _, dependency in ipairs(type(blocked) == "table" and array(blocked.unmet_dependencies) or {}) do
       local dependency_ticket = find_by_id(context.tickets, dependency.dependency_ticket_id)
@@ -3120,7 +3277,7 @@ local function run_rows(context)
       cells = {
         ticket = ticket and ticket.title or run.ticket_id,
         pipeline = pipeline and pipeline.name or run.pipeline_definition_id,
-        step = type(blocked) == "table" and blocked.step_id or run.current_step_id or "",
+        step = type(blocked) == "table" and (blocked.target_step_id or blocked.step_id) or run.current_step_id or "",
         blocker = table.concat(blockers, ", "),
         status = run_status_label(run),
       },
@@ -5193,6 +5350,7 @@ extend_contract("create_ticket", {
   status = { type = "string", enum = { "open", "active", "blocked", "closed" } },
   dependency_ticket_ids = { type = "array", items = STRING_PROPERTY },
 }, { "project_id", "title" })
+TOOL_CONTRACTS.create_ticket.description = "Create a project ticket. dependency_ticket_ids is an optional array of ticket IDs that is validated and atomically registered as normalized blocking dependency rows; it is never persisted on the ticket payload."
 extend_contract("create_pipeline", { project_id = STRING_PROPERTY })
 extend_contract("start_run", {
   id = STRING_PROPERTY, spawn_target_id = STRING_PROPERTY, branch = STRING_PROPERTY,

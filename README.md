@@ -141,19 +141,23 @@ Every delivery role uses the same exact routing source:
 Zero or multiple matches return `routing_question_required`; there is no
 generic fallback or load-all behavior.
 
-Ticket dependencies are durable `ticket_dependencies` records mirrored onto
-ticket projections. `project_pipelines.add_ticket_dependency`,
+Ticket dependencies are durable normalized `ticket_dependencies` records and
+are never mirrored onto ticket payloads. `create_ticket` translates its public
+`dependency_ticket_ids` convenience input into those rows atomically.
+`project_pipelines.add_ticket_dependency`,
 `project_pipelines.remove_ticket_dependency`, and
-`project_pipelines.update_ticket` mutate that lifecycle without
-auto-advancing a run. Every step is dependency-gated unless it explicitly sets
+`project_pipelines.update_ticket` mutate that lifecycle. Every step is dependency-gated unless it explicitly sets
 `allows_open_ticket_dependencies=true`; standard Plan/Plan Review definitions
 should set that exemption, while legacy unclassified delivery steps fail safe.
 An open or missing prerequisite returns `ok=false` with
-`error.code="ticket_dependencies_unmet"`, persists the attempted step and unmet
-ticket IDs in `run.blocked_transition`, and performs no step transition,
-session-request creation, provider/template resolution, or spawn. Closing or
-removing the blocker permits a later explicit retry, and repeated activation of
-an already spawned run/step reuses the existing request.
+`error.code="ticket_dependencies_unmet"`. An authorized advancement persists
+the source visit, requested target, correlation/result, and unmet ticket IDs in
+`run.waiting_transition`; direct activation diagnostics remain in
+`run.blocked_transition`. Neither path creates a target run-step, session
+request, provider/template resolution, worktree, PTY, or spawn. Closing,
+updating, removing, or deleting the final blocker atomically creates one target
+run-step and clears the waiting state; duplicate clearance and recovery are
+idempotent.
 
 Transition findings are run-scoped: unresolved `blocker` and `high` findings
 stop advancement until resolved or waived. `medium`, `low`, and `info` findings

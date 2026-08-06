@@ -292,6 +292,295 @@ assert(tools["project_pipelines.create_pipeline"]({
   },
 }).ok)
 
+assert(tools["project_pipelines.create_pipeline"]({
+  id = "pipeline-durable-dependency", name = "Durable dependency",
+  steps = {
+    {
+      id = "plan-review", name = "Plan Review", allows_open_ticket_dependencies = true,
+      on_approved_step_id = "implement",
+    },
+    { id = "implement", name = "Implement" },
+  },
+}).ok)
+assert(tools["project_pipelines.create_ticket"]({
+  id = "durable-dependency-open", project_id = "project-one", title = "Durable dependency",
+}).ok)
+assert(tools["project_pipelines.create_ticket"]({
+  id = "durable-dependent", project_id = "project-one", title = "Durable dependent",
+}).ok)
+local durable_dependency_run = tools["project_pipelines.start_run"]({
+  id = "run-durable-dependency", ticket_id = "durable-dependent", pipeline_id = "pipeline-durable-dependency",
+})
+assert(durable_dependency_run.ok)
+
+-- Reproduce the observed production/import shape. The normalized dependency row
+-- is durable and the ticket payload has no embedded dependency mirror.
+durable_store["v3/tickets/durable-dependent"].payload.dependency_ticket_ids = nil
+durable_store["v3/ticket_dependencies/durable-dependency-row"] = {
+  key = "v3/ticket_dependencies/durable-dependency-row",
+  schema_version = 3,
+  revision = 1,
+  payload = {
+    id = "durable-dependency-row",
+    ticket_id = "durable-dependent",
+    depends_on_ticket_id = "durable-dependency-open",
+  },
+}
+local durable_dependency_plugin = dofile("plugin.lua")
+local durable_dependency_tools = {}
+for _, descriptor in ipairs(durable_dependency_plugin.tools) do
+  durable_dependency_tools[descriptor.name] = descriptor.call
+end
+assert(durable_dependency_tools["project_pipelines.submit_review"]({
+  run_id = "run-durable-dependency",
+  run_step_id = durable_dependency_run.run_step.id,
+  step_id = "plan-review",
+  verdict = "approved",
+}).ok)
+local durable_dependency_advance = durable_dependency_tools["project_pipelines.request_step_advance"]({
+  run_id = "run-durable-dependency",
+  request_id = "advance-durable-dependency",
+})
+assert(not durable_dependency_advance.ok and durable_dependency_advance.error.code == "ticket_dependencies_unmet",
+  "normalized durable dependency must block approved Plan Review advancement")
+local durable_waiting_context = durable_dependency_tools["project_pipelines.current_context"]({ run_id = "run-durable-dependency" })
+assert(durable_waiting_context.run.current_step_id == "plan-review")
+assert(durable_waiting_context.run.current_run_step_id == durable_dependency_run.run_step.id)
+assert(durable_waiting_context.run.waiting_transition.source_run_step_id == durable_dependency_run.run_step.id)
+assert(durable_waiting_context.run.waiting_transition.target_step_id == "implement")
+assert(#durable_waiting_context.run_steps == 1, "waiting must not create the target run-step")
+
+local create_descriptor = descriptors["project_pipelines.create_ticket"]
+assert(create_descriptor.input_schema.properties.dependency_ticket_ids.type == "array")
+assert(create_descriptor.input_schema.properties.dependency_ticket_ids.items.type == "string")
+assert(create_descriptor.description:find("atomically registered as normalized blocking dependency rows", 1, true))
+local authored_dependency_ticket = tools["project_pipelines.create_ticket"]({
+  id = "authored-dependencies", project_id = "project-one", title = "Authored dependencies",
+  dependency_ticket_ids = { "durable-dependency-open", "durable-dependency-open" },
+})
+assert(authored_dependency_ticket.ok and authored_dependency_ticket.ticket.dependency_ticket_ids == nil)
+local authored_rows = tools["project_pipelines.list_ticket_dependencies"]({ ticket_id = "authored-dependencies" }).dependencies
+assert(#authored_rows == 1 and authored_rows[1].depends_on_ticket_id == "durable-dependency-open")
+durable_store["v3/tickets/authored-dependencies"].payload.dependency_ticket_ids = { "non-authoritative-mirror" }
+assert(tools["project_pipelines.get_ticket"]({ ticket_id = "authored-dependencies" }).ticket.dependency_ticket_ids == nil)
+assert(tools["project_pipelines.update_ticket"]({ ticket_id = "authored-dependencies", description = "Mirror removed" }).ok)
+assert(durable_store["v3/tickets/authored-dependencies"].payload.dependency_ticket_ids == nil,
+  "next atomic write must remove a non-authoritative ticket mirror")
+local tickets_before_invalid_create = #tools["project_pipelines.list_tickets"]({}).tickets
+local invalid_authored_dependency = tools["project_pipelines.create_ticket"]({
+  id = "invalid-authored-dependencies", project_id = "project-one", title = "Invalid authored dependencies",
+  dependency_ticket_ids = { "durable-dependency-open", "missing-authored-dependency" },
+})
+assert(not invalid_authored_dependency.ok and invalid_authored_dependency.error.code == "not_found")
+assert(#tools["project_pipelines.list_tickets"]({}).tickets == tickets_before_invalid_create,
+  "invalid authored dependencies must create neither ticket nor normalized rows")
+assert(#tools["project_pipelines.list_ticket_dependencies"]({ ticket_id = "invalid-authored-dependencies" }).dependencies == 0)
+fail_batch_key_prefix = "v3/tickets/atomic-authored-dependencies"
+local failed_authored_dependency = tools["project_pipelines.create_ticket"]({
+  id = "atomic-authored-dependencies", project_id = "project-one", title = "Atomic authored dependencies",
+  dependency_ticket_ids = { "durable-dependency-open" },
+})
+assert(not failed_authored_dependency.ok and failed_authored_dependency.error.code == "persist_failed")
+fail_batch_key_prefix = nil
+assert(#tools["project_pipelines.list_ticket_dependencies"]({ ticket_id = "atomic-authored-dependencies" }).dependencies == 0)
+for _, existing_ticket in ipairs(tools["project_pipelines.list_tickets"]({}).tickets) do
+  assert(existing_ticket.id ~= "atomic-authored-dependencies", "failed create must not persist the ticket")
+end
+
+assert(tools["project_pipelines.create_pipeline"]({
+  id = "pipeline-waiting-wakeup", name = "Waiting wakeup",
+  steps = {
+    {
+      id = "waiting-plan-review", name = "Plan Review", allows_open_ticket_dependencies = true,
+      on_approved_step_id = "waiting-implement",
+    },
+    {
+      id = "waiting-implement", name = "Implement", kind = "pty",
+      session_template_id = "template_codex",
+    },
+  },
+}).ok)
+
+local function context_for(run_id)
+  return tools["project_pipelines.current_context"]({ run_id = run_id })
+end
+
+local function create_waiting_scenario(prefix, blocker_count)
+  assert(tools["project_pipelines.create_ticket"]({
+    id = prefix .. "-ticket", project_id = "project-one", target_id = "target-one", title = prefix .. " ticket",
+  }).ok)
+  local started_waiting = tools["project_pipelines.start_run"]({
+    id = prefix .. "-run", ticket_id = prefix .. "-ticket", pipeline_id = "pipeline-waiting-wakeup",
+  })
+  assert(started_waiting.ok)
+  local dependency_ids = {}
+  for index = 1, blocker_count do
+    local dependency_id = prefix .. "-dependency-" .. tostring(index)
+    table.insert(dependency_ids, dependency_id)
+    assert(tools["project_pipelines.create_ticket"]({
+      id = dependency_id, project_id = "project-one", title = dependency_id,
+    }).ok)
+    assert(tools["project_pipelines.add_ticket_dependency"]({
+      id = prefix .. "-row-" .. tostring(index),
+      ticket_id = prefix .. "-ticket", dependency_ticket_id = dependency_id,
+    }).ok)
+  end
+  assert(tools["project_pipelines.submit_review"]({
+    run_id = prefix .. "-run", run_step_id = started_waiting.run_step.id,
+    step_id = "waiting-plan-review", verdict = "approved",
+  }).ok)
+  local spawned_before = #spawned
+  local waiting = tools["project_pipelines.request_step_advance"]({
+    run_id = prefix .. "-run", request_id = prefix .. "-advance",
+  })
+  assert(not waiting.ok and waiting.error.code == "ticket_dependencies_unmet")
+  local waiting_context = context_for(prefix .. "-run")
+  assert(waiting_context.run.current_step_id == "waiting-plan-review")
+  assert(waiting_context.run.current_run_step_id == started_waiting.run_step.id)
+  assert(waiting_context.run.waiting_transition.source_run_step_id == started_waiting.run_step.id)
+  assert(#waiting_context.run.waiting_transition.unmet_dependencies == blocker_count)
+  assert(#waiting_context.run_steps == 1 and #spawned == spawned_before)
+  return {
+    run_id = prefix .. "-run",
+    ticket_id = prefix .. "-ticket",
+    run_step_id = started_waiting.run_step.id,
+    dependency_ids = dependency_ids,
+    spawned_before = spawned_before,
+  }
+end
+
+local function assert_woken_once(scenario)
+  local context = context_for(scenario.run_id)
+  assert(context.run.current_step_id == "waiting-implement")
+  assert(context.run.waiting_transition == nil)
+  assert(#context.run_steps == 2, "final clearance must create exactly one target run-step")
+  local source_visits, target_visits = 0, 0
+  for _, run_step in ipairs(context.run_steps) do
+    if run_step.id == scenario.run_step_id then
+      source_visits = source_visits + 1
+      assert(run_step.status == "done")
+    elseif run_step.step_id == "waiting-implement" then
+      target_visits = target_visits + 1
+      assert(run_step.status == "active")
+    end
+  end
+  assert(source_visits == 1 and target_visits == 1)
+end
+
+assert(tools["project_pipelines.create_ticket"]({
+  id = "waiting-recovery-ticket", project_id = "project-one", title = "Waiting recovery ticket",
+}).ok)
+local recovery_started = tools["project_pipelines.start_run"]({
+  id = "waiting-recovery-run", ticket_id = "waiting-recovery-ticket", pipeline_id = "pipeline-waiting-wakeup",
+})
+assert(recovery_started.ok)
+assert(tools["project_pipelines.submit_review"]({
+  run_id = "waiting-recovery-run", run_step_id = recovery_started.run_step.id,
+  step_id = "waiting-plan-review", verdict = "approved",
+}).ok)
+fail_batch_key_prefix = "v3/run_steps/"
+local interrupted_advance = tools["project_pipelines.request_step_advance"]({
+  run_id = "waiting-recovery-run", request_id = "waiting-recovery-advance",
+})
+assert(not interrupted_advance.ok and interrupted_advance.error.code == "persist_failed")
+fail_batch_key_prefix = nil
+assert(tools["project_pipelines.create_ticket"]({
+  id = "waiting-recovery-dependency", project_id = "project-one", title = "Waiting recovery dependency",
+}).ok)
+assert(tools["project_pipelines.add_ticket_dependency"]({
+  id = "waiting-recovery-row", ticket_id = "waiting-recovery-ticket",
+  dependency_ticket_id = "waiting-recovery-dependency",
+}).ok)
+local recovered_wait = tools["project_pipelines.request_step_advance"]({
+  run_id = "waiting-recovery-run", request_id = "waiting-recovery-advance",
+})
+assert(not recovered_wait.ok and recovered_wait.error.code == "ticket_dependencies_unmet",
+  "pending correlated recovery must rerun dependency preflight")
+local recovery_context = context_for("waiting-recovery-run")
+assert(recovery_context.run.current_step_id == "waiting-plan-review" and #recovery_context.run_steps == 1)
+local recovery_scenario = {
+  run_id = "waiting-recovery-run",
+  run_step_id = recovery_started.run_step.id,
+}
+assert(tools["project_pipelines.update_ticket"]({ ticket_id = "waiting-recovery-dependency", status = "closed" }).ok)
+assert_woken_once(recovery_scenario)
+local duplicate_recovery = tools["project_pipelines.request_step_advance"]({
+  run_id = "waiting-recovery-run", request_id = "waiting-recovery-advance",
+})
+assert(duplicate_recovery.ok and duplicate_recovery.step_id == "waiting-implement")
+assert_woken_once(recovery_scenario)
+
+local multi = create_waiting_scenario("waiting-multi", 2)
+local override_wait = tools["project_pipelines.request_step_advance"]({
+  run_id = multi.run_id, request_id = "waiting-multi-override",
+  override_unmet_gates = true, override_reason = "gates only",
+})
+assert(not override_wait.ok and override_wait.error.code == "ticket_dependencies_unmet",
+  "gate override must never waive ticket dependencies")
+local direct_spawn = tools["project_pipelines.spawn_ticket_session"]({
+  run_id = multi.run_id, step_id = "waiting-implement", request_id = "waiting-multi-direct-spawn",
+})
+assert(not direct_spawn.ok and direct_spawn.error.code == "ticket_dependencies_unmet")
+local direct_retry = tools["project_pipelines.retry_step_agent"]({
+  run_id = multi.run_id, step_id = "waiting-implement", request_id = "waiting-multi-direct-retry",
+})
+assert(not direct_retry.ok and direct_retry.error.code == "ticket_dependencies_unmet")
+assert(#spawned == multi.spawned_before)
+local exempt_retry = tools["project_pipelines.retry_step_agent"]({
+  run_id = multi.run_id, step_id = "waiting-plan-review", request_id = "waiting-multi-plan-review-retry",
+})
+assert(exempt_retry.ok and context_for(multi.run_id).run.waiting_transition ~= nil,
+  "exempt Plan Review retry must not erase authorized waiting state")
+assert(tools["project_pipelines.update_ticket"]({ ticket_id = multi.dependency_ids[1], status = "closed" }).ok)
+local partial = context_for(multi.run_id)
+assert(partial.run.current_step_id == "waiting-plan-review" and #partial.run_steps == 1)
+assert(#partial.run.waiting_transition.unmet_dependencies == 1)
+assert(tools["project_pipelines.update_ticket"]({ ticket_id = multi.dependency_ids[2], status = "closed" }).ok)
+assert_woken_once(multi)
+assert(tools["project_pipelines.update_ticket"]({ ticket_id = multi.dependency_ids[2], status = "closed" }).ok)
+assert_woken_once(multi)
+local close_scenario = create_waiting_scenario("waiting-close", 1)
+assert(tools["project_pipelines.close_ticket"]({ ticket_id = close_scenario.dependency_ids[1] }).ok)
+assert_woken_once(close_scenario)
+assert(tools["project_pipelines.close_ticket"]({ ticket_id = close_scenario.dependency_ids[1] }).ok)
+assert_woken_once(close_scenario)
+
+local remove_scenario = create_waiting_scenario("waiting-remove", 1)
+assert(tools["project_pipelines.remove_ticket_dependency"]({ dependency_id = "waiting-remove-row-1" }).ok)
+assert_woken_once(remove_scenario)
+local duplicate_remove = tools["project_pipelines.remove_ticket_dependency"]({
+  ticket_id = remove_scenario.ticket_id, dependency_ticket_id = remove_scenario.dependency_ids[1],
+})
+assert(duplicate_remove.ok)
+assert_woken_once(remove_scenario)
+
+local delete_scenario = create_waiting_scenario("waiting-delete", 1)
+assert(tools["project_pipelines.delete_ticket"]({ ticket_id = delete_scenario.dependency_ids[1] }).ok)
+assert_woken_once(delete_scenario)
+
+local restart_scenario = create_waiting_scenario("waiting-restart", 1)
+local restarted_waiting_plugin = dofile("plugin.lua")
+local restarted_waiting_tools = {}
+for _, descriptor in ipairs(restarted_waiting_plugin.tools) do restarted_waiting_tools[descriptor.name] = descriptor.call end
+local restarted_context = restarted_waiting_tools["project_pipelines.current_context"]({ run_id = restart_scenario.run_id })
+assert(restarted_context.run.waiting_transition.source_run_step_id == restart_scenario.run_step_id)
+assert(restarted_waiting_tools["project_pipelines.update_ticket"]({
+  ticket_id = restart_scenario.dependency_ids[1], status = "closed",
+}).ok)
+assert_woken_once(restart_scenario)
+
+local missing_scenario = create_waiting_scenario("waiting-missing", 1)
+durable_store["v3/tickets/" .. missing_scenario.dependency_ids[1]] = nil
+local missing_plugin = dofile("plugin.lua")
+local missing_tools = {}
+for _, descriptor in ipairs(missing_plugin.tools) do missing_tools[descriptor.name] = descriptor.call end
+local missing_retry = missing_tools["project_pipelines.request_step_advance"]({
+  run_id = missing_scenario.run_id, request_id = "waiting-missing-retry",
+})
+assert(not missing_retry.ok and missing_retry.error.code == "ticket_dependencies_unmet")
+assert(missing_retry.error.unmet_dependencies[1].status == "missing")
+assert(#missing_tools["project_pipelines.current_context"]({ run_id = missing_scenario.run_id }).run_steps == 1)
+
 assert(tools["project_pipelines.create_project"]({ id = "project-disposable", name = "Disposable" }).ok)
 assert(tools["project_pipelines.update_project"]({ project_id = "project-disposable", description = "Updated" }).project.description == "Updated")
 assert(tools["project_pipelines.list_projects"]({ status = "active" }).ok)

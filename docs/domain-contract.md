@@ -59,10 +59,13 @@ structured activation error. Manual, human, command, and other non-PTY steps do
 not attempt a session-template spawn.
 
 Ticket dependencies gate step activation independently of provider
-prerequisites. `ticket.dependency_ticket_ids` is the canonical link set and can
-be changed after a run starts with `project_pipelines.add_ticket_dependency`
-and `project_pipelines.remove_ticket_dependency`; the referenced ticket's
-state is changed with `project_pipelines.update_ticket`.
+prerequisites. Durable `ticket_dependencies` rows are the sole link authority;
+tickets never persist an embedded dependency mirror. `create_ticket` accepts
+`dependency_ticket_ids` only as a convenience input and atomically translates
+the validated, deduplicated IDs into normalized rows. Dependencies can be
+changed after a run starts with `project_pipelines.add_ticket_dependency` and
+`project_pipelines.remove_ticket_dependency`; the referenced ticket's state is
+changed with `project_pipelines.update_ticket`.
 Every target step is gated by default. Planning steps that must remain usable
 while prerequisites are open declare
 `allows_open_ticket_dependencies: true`; a missing field remains gated so
@@ -70,18 +73,25 @@ persisted legacy delivery definitions fail safe.
 
 Before changing `run.current_step_id`, emitting `step_started`, creating a
 session request, resolving a provider/template, or spawning a session,
-`project_pipelines.spawn_ticket_session` resolves every referenced ticket. Any ticket
-that is not `closed`, including a missing referenced ticket, persists
-`run.blocked_transition` plus a `ticket_dependencies_blocked` event and returns
-`ok: false` with `error.status: "blocked"`,
+every advancement, recovery, activation, spawn, and retry path resolves every
+normalized dependency row. Any referenced ticket that is not `closed`,
+including a missing referenced ticket, fails before transition or session side
+effects. Direct activation persists `run.blocked_transition`; an otherwise
+authorized advancement persists `run.waiting_transition`, retaining the exact
+source run-step, target step, request correlation/result, and current blockers.
+The call returns `ok: false` with
+`error.status: "waiting"` for advancement or `"blocked"` for activation,
 `error.code: "ticket_dependencies_unmet"`, the dependent `ticket_id`, attempted
 `step_id`, and structured `unmet_dependencies` entries containing
-`dependency_ticket_id` and status.
+`dependency_id`, `dependency_ticket_id`, and status.
 
-Closing or removing a dependency never advances a run automatically. A caller
-must explicitly retry activation. The successful retry clears
-`blocked_transition`; repeating activation for the same already
-`spawn_requested` run/step returns the existing request without another spawn.
+Closing a dependency, updating it to `closed`, removing its normalized row, or
+deleting it and cleaning up the row reconciles waiting runs in the same atomic
+save. Partial clearance refreshes the waiting blocker snapshot. Final clearance
+consumes the waiting state, completes the preserved source visit, and creates
+exactly one target run-step. Hub-owned agent orchestration remains downstream
+of that committed active visit. Repeated clearance or recovery creates no
+duplicate transition or spawn request.
 
 Unresolved findings are run-scoped transition inputs. `blocker` and `high`
 findings block advancement; `medium`, `low`, and `info` findings are durable
