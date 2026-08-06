@@ -3,16 +3,16 @@
 This repository is the sole source and runtime authority for the Project
 Pipelines plugin and sourced Botster Stack Delivery workflow. Pipeline workflow
 state is plugin-owned, while PTY execution is
-delegated to hub-owned session templates. The runtime package is declared by
+delegated to hub-owned session types. The runtime package is declared by
 `botster-package.json` and wired through the `plugin.lua` entrypoint.
 
 `botster-package.json` is the source of truth for package descriptors:
 
 - package name: `project-pipelines`
 - capabilities: `surfaces`, `mcp`, `plugin_db`, and narrowly scoped
-  `session_actions/session_template_managed_git_spawn`
+  `session_actions/session_type_managed_git_spawn`
 - Lua entrypoint: `plugin.lua`
-- configuration schema: default spawn target, default session template selector,
+- configuration schema: default spawn target, exact default session type id,
   default pipeline mode, and optional workspace id
 - app surface: `project-pipelines.home`
 - settings surface: `project-pipelines.settings`
@@ -23,7 +23,7 @@ delegated to hub-owned session templates. The runtime package is declared by
 ## Runtime Disposition
 
 The production path is the checked-in workflow engine plus PTY-backed step
-activation through hub session templates. `plugin.lua` is self-contained because
+activation through hub session types. `plugin.lua` is self-contained because
 the installed Lua package runtime does not expose the standard module loader. It
 registers MCP-style tools for project, ticket, pipeline definition, run, step
 activation, artifact, question, context, and entity-frame operations, and
@@ -37,26 +37,29 @@ navigation intent (`pipelines` -> `project-pipelines.home`) and leaves route
 ids, paths, disabled state, blocked diagnostics, and shell placement to
 hub-admitted route descriptors and clients.
 
-Project Pipelines does not create an agent runtime. For a PTY-backed step with a
-`session_template_id`, `session_template_name`/`template_name`, or
-`session_template_capability`/`session_capability`,
-`project_pipelines.spawn_ticket_session` resolves the Hub template selector and builds a
-managed-worktree payload. The request carries only semantic caller inputs:
-`template_id`, `target_id`, `branch`, optional environment, and `context`
+Project Pipelines does not create an agent runtime. For a PTY-backed step,
+`project_pipelines.spawn_ticket_session` resolves one exact Hub
+`session_type_id` using explicit tool input, then the step field, then the
+device-local `default_session_type_id` package configuration. It builds a
+managed-worktree payload carrying only semantic caller inputs:
+`session_type_id`, `target_id`, `branch`, optional environment, and `context`
 containing `prompt`, `ticket_id`, optional `workspace_id`, and metadata.
 Session ID, worktree/repository paths, base ref, and resolved branch facts are
-trusted Hub outputs and are never caller-supplied. Existing ID selection is
-direct. Name and capability selectors use the
-hub `session_templates.resolve` capability when available, then
-`session_templates.list` as a deterministic registry fallback. If neither
-resolution path is available, Project Pipelines persists a blocked diagnostic
-instead of falling back silently. PTY-backed activation sends one resolved
-request table to the Hub `session_templates.ensure_worktree_and_spawn`
+trusted Hub outputs and are never caller-supplied. A missing exact ID persists
+a `session_type_id_required` blocked diagnostic instead of falling back or
+inferring from labels, names, roles, commands, or capabilities. That diagnostic
+names the configuration field an operator must set, because it is also the
+upgrade path: package configuration is Hub-owned, the Hub exposes only fields the
+installed manifest declares, and this release renamed the configuration key, so an
+upgraded install carries no effective default until an operator sets the new field
+and reloads. Package configuration is likewise snapshotted when the plugin worker
+loads, so changing the default requires a package reload. PTY-backed activation sends one resolved
+request table to the Hub `session_types.ensure_worktree_and_spawn`
 capability and
 persists the request summary and returned session/context references. Hub spawn
 rejections are normalized into a failed session request before returning a
 structured activation error. Manual, human, command, and other non-PTY steps do
-not attempt a session-template spawn.
+not attempt a session-type spawn.
 
 Ticket dependencies gate step activation independently of provider
 prerequisites. Durable `ticket_dependencies` rows are the sole link authority;
@@ -72,7 +75,7 @@ while prerequisites are open declare
 persisted legacy delivery definitions fail safe.
 
 Before changing `run.current_step_id`, emitting `step_started`, creating a
-session request, resolving a provider/template, or spawning a session,
+session request, resolving a provider/session type, or spawning a session,
 every advancement, recovery, activation, spawn, and retry path resolves every
 normalized dependency row. Any referenced ticket that is not `closed`,
 including a missing referenced ticket, fails before transition or session side
@@ -140,7 +143,7 @@ Declared provider prerequisites are pre-spawn blockers. A step may declare
 `required_provider_capabilities`. If a declared dependency such as
 `github_auth` is unavailable, activation persists a session request with
 `status: "blocked"`, a structured `diagnostic`, and a
-`session_template_spawn_blocked` event. Project Pipelines does not import GitHub
+`session_type_spawn_blocked` event. Project Pipelines does not import GitHub
 or any provider client to satisfy that dependency; it records the dependency
 diagnostic and leaves provider auth to the provider boundary.
 
@@ -188,10 +191,10 @@ instead of copied into plugin source files.
 | Project | Plugin-owned | Product or repository grouping for tickets. Stores standalone repo and spawn-target config, and may store optional workspace IDs. |
 | Ticket | Plugin-owned | Unit of delivery within a project. Stores title, description, status, dependency links, and optional workspace ID. |
 | Pipeline definition | Plugin-owned | Ordered step template selected for a ticket run. Defines steps, gate prompts, and default routing. |
-| Step | Plugin-owned | Named execution phase such as Plan, Review, Implement, Verify, or Merge. PTY-backed steps may reference a hub `session_template_id`, `session_template_name`, or `session_template_capability`. Planning steps may explicitly set `allows_open_ticket_dependencies: true`; absent/false is gated. |
+| Step | Plugin-owned | Named execution phase such as Plan, Review, Implement, Verify, or Merge. PTY-backed steps may reference one exact hub `session_type_id`; otherwise the device-local package default is used. Planning steps may explicitly set `allows_open_ticket_dependencies: true`; absent/false is gated. |
 | Gate | Plugin-owned | Required evidence prompt or command attached to a step. Gate results are persisted on runs. |
 | Run | Plugin-owned | One execution of a pipeline definition for a ticket, with current step, status, assignments, and event history. |
-| Session request | Plugin-owned summary of hub-owned lifecycle | Correlation record for a requested hub session template spawn. Stores request/session IDs, template selector, resolved template ID when available, status (`spawn_requested`, `failed`, or `blocked`), bounded prompt/context summary, returned context/session references, and structured diagnostics. |
+| Session request | Plugin-owned summary of hub-owned lifecycle | Correlation record for a requested hub session type spawn. Stores request/session IDs, exact session type ID when available, status (`spawn_requested`, `failed`, or `blocked`), bounded prompt/context summary, returned context/session references, and structured diagnostics. |
 | Artifact | Plugin-owned | Durable plan, report, command output, patch summary, or external URL attached to a run step. |
 | Finding | Plugin-owned | Review or verification issue linked to a run step, with severity, status, and suggested fix. |
 | Question | Plugin-owned | Durable human or agent question linked to a run, ticket, or step. |
@@ -222,7 +225,9 @@ instead of copied into plugin source files.
 ## Persistence Boundaries
 
 Plugin-owned durable records use the Hub's scoped plugin database capability and
-versioned, prefix-addressable keys (`v3/<family>/<id>`). Mutable runtime records
+versioned, prefix-addressable keys (`v4/<family>/<id>`). Package load migrates
+v3 records to v4 in one atomic batch before normal reads. Exact legacy IDs are
+rewritten; name/capability-only selectors are marked for operator repair. Mutable runtime records
 never live under the plugin source tree. The package does not read the retired
 all-domain blob or any catalog/runtime compatibility source. Payload validators
 reject malformed family records. Each state transition is one ordered Hub
@@ -247,7 +252,7 @@ Workspace integration is optional. Standalone Project Pipelines records must be
 complete with explicit repository and spawn-target configuration. When a
 workspace plugin is present, Project Pipelines may store workspace IDs and use
 workspace-provided repo/session grouping as linked context. Missing or failing
-workspace data must not block a standalone session-template spawn request.
+workspace data must not block a standalone session-type spawn request.
 
 ## Provider Capability Contract
 
@@ -258,7 +263,7 @@ boundaries:
 - repository identity and display name
 - explicit spawn target ID for hub sessions
 - branch, worktree, base ref, and run context
-- hub session-template lifecycle events with stable session IDs
+- hub session-type lifecycle events with stable session IDs
 - PR link creation, status observation, ready-for-review, merge, and close facts
 - durable artifact, finding, question, answer, gate, and review persistence
 - notification delivery for human and agent questions
@@ -304,9 +309,9 @@ Expected event kinds include:
 - `step_started`
 - `ticket_dependencies_blocked`
 - `step_activation_preserved`
-- `session_template_spawn_requested`
-- `session_template_spawn_failed`
-- `session_template_spawn_blocked`
+- `session_type_spawn_requested`
+- `session_type_spawn_failed`
+- `session_type_spawn_blocked`
 - `gate_submitted`
 - `artifact_added`
 - `finding_opened`
@@ -322,13 +327,13 @@ Expected event kinds include:
 `fixtures/project_pipelines/domain_contract.json` is the executable contract
 example. It uses synthetic IDs only and is validated by `script/test` for JSON
 shape, required relationships, standalone and workspace-linked examples,
-manifest anchors, provider capability boundaries, selector styles, blocked
+manifest anchors, provider capability boundaries, exact-ID selection, blocked
 ticket/provider diagnostics, and PII/raw-path absence.
 `script/test` also runs a headless Lua runtime harness against `plugin.lua` to
 prove CRUD persistence survives an entrypoint reload, PTY-backed step activation
-builds and stores the real hub DTO field names, template ID/name/capability
-selectors resolve before spawn, optional workspace IDs stay metadata only,
-PTY-backed steps call `session_templates.ensure_worktree_and_spawn`, open dependencies added to an
+builds and stores the real hub DTO field names, exact ID precedence is explicit
+argument then step then device configuration, optional workspace IDs stay metadata only,
+PTY-backed steps call `session_types.ensure_worktree_and_spawn`, open dependencies added to an
 active run block before transition/session/spawn side effects, close/removal
 requires an explicit retry, retries deduplicate agent activation, missing
 references fail safe, non-PTY planning exemptions preserve existing behavior,
@@ -338,4 +343,6 @@ status state, and the literal application primitives used by the operator
 workbench. Hub acceptance for packaged rendering should use
 `PluginSurfaceRender` for package `project-pipelines` and surface
 `project-pipelines.home`, with primitive shapes kept aligned to the
-`botster-hub-test-support` plugin-contract-matrix fixture.
+`@trybotster/hub-test-support@0.1.24` plugin-contract-matrix fixture. That
+published fixture proves shared UI-contract alignment; the real-Hub harness is
+the authoritative session-type proof.

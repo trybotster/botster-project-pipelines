@@ -13,7 +13,7 @@ This repository is the production Project Pipelines plugin. It declares the
 package identity, compatibility, Lua entrypoint, package configuration schema,
 MCP/plugin database capabilities, navigation, and app/settings surface
 descriptors needed for local package install and discovery. Workflow state stays
-in the plugin; PTY execution is requested from hub-owned session templates.
+in the plugin; PTY execution is requested from hub-owned session types.
 The manifest declares stable surface ids and a `pipelines` navigation entry;
 hub-admitted route descriptors own concrete route ids and paths.
 
@@ -31,7 +31,7 @@ The executable contract fixture is
 contract, repository routing (including negative and ambiguous cases),
 PII/operator-path absence, atomic lifecycle failure, dependency and gate
 blocking and explicit overrides, run-step-visit-scoped review routing, correlated spawn replay, malformed
-record rejection, v2 namespace removal, entity snapshots, and source reload.
+record rejection, atomic v3-to-v4 migration, entity snapshots, and source reload.
 It rejects descriptor properties that have no handler-side reference.
 It also proves the app workbench and settings surfaces expose committed state.
 The settings surface renders
@@ -87,20 +87,21 @@ worker sandbox. It contains the versioned prefix-addressable record repository,
 the checked-in Botster Stack Delivery source/reconciliation policy, exact
 repository-charter routing, gate/review/question/checklist/PR/advance handlers,
 workflow CRUD, entity projections, and app/settings surface handlers.
-PTY-backed steps with `session_template_id`,
-`session_template_name`/`template_name`, or
-`session_template_capability`/`session_capability` build and persist
-the semantic inputs accepted by
-`session_templates.ensure_worktree_and_spawn`: `target_id`, `branch`,
-`template_id`, environment, and untrusted prompt/ticket/workspace metadata.
+PTY-backed steps resolve one exact `session_type_id` using explicit tool input,
+then the step field, then the device-local `default_session_type_id` package
+configuration. They build and persist the semantic inputs accepted by
+`session_types.ensure_worktree_and_spawn`: `target_id`, `branch`,
+`session_type_id`, environment, and untrusted prompt/ticket/workspace metadata.
 Hub-owned session, worktree, base-ref, and repository facts are never supplied
-by the caller. Existing ID selection is direct; name and capability selection use
-`session_templates.resolve` or `session_templates.list`. If a selector cannot be
-resolved, or a declared dependency such as `github_auth` is unavailable,
+by the caller. A PTY-backed step without an exact ID fails with
+`session_type_id_required`; an unmappable pre-v4 selector stays blocked until
+an operator repairs it with `update_step(session_type_id)`. If a declared
+dependency such as `github_auth` is unavailable,
 activation persists `status="blocked"` with a structured diagnostic and emits
-`session_template_spawn_blocked`. Manual, human, command, and other non-PTY
-steps do not spawn sessions. The manifest configuration schema is limited to
-package defaults. The `session_actions/session_template_managed_git_spawn`
+`session_type_spawn_blocked`. Manual, human, command, and other non-PTY
+steps do not spawn sessions. Package configuration is snapshotted when the
+plugin worker loads, so changing `default_session_type_id` requires a package
+reload before activation. The `session_actions/session_type_managed_git_spawn`
 capability is the narrow host grant used for correlated managed sessions;
 targets, worktrees, sessions, persistence, MCP registration, workers, and
 UiNode validation remain Hub-owned.
@@ -110,21 +111,44 @@ On an empty plugin database, package initialization reconciles exactly one
 disable/enable, and Hub restart reuse those stable IDs. Checked-in source owns
 metadata, prompts, transitions, gates, routing text, and `source_revision`; an
 existing step's operator-selected `agent_name` remains device policy. Runtime
-records live under `v3/<family>/<id>` plugin-db keys; the retired all-domain
+records live under `v4/<family>/<id>` plugin-db keys. Package load atomically
+migrates v3 records before normal reads; exact IDs are rewritten, while
+name/capability-only selectors require operator repair. The retired all-domain
 state blob is neither read nor written. Record payloads are validated on load
 and before writes. Each state transition uses one capability-gated
 `plugin_db.batch` with the revisions observed during load. Starting a run
 atomically activates its ticket and creates the run/current run-step; advance,
 cancel, merge request, and close atomically reconcile ticket/run/run-step state
-before entity or surface projection. This requires Hub commit
-`11d73d27e01732981e803041ea702aa09db57112`, which contains both the atomic
-plugin database ABI and generic package-owned `entity_provider` admission. The
+before entity or surface projection. This release requires Hub commit
+`8a60bd58841179f8b1fd4040d9362d18ea244230` or newer. Upgrade Hub before
+installing this package release; older Hubs do not admit the authoritative
+session-type capability scope. The minimum Hub also contains the atomic plugin
+database ABI and generic package-owned `entity_provider` admission. The
 package never simulates atomicity with sequential writes. Each package entity
 family has an explicit provider returning a fresh authoritative whole-family
 snapshot from committed state for initial subscription and reconnect hydration.
 Diagnostic events retain the newest 256 records, and mutations fail with
 `store_capacity_exhausted` before any write when the Hub's 1,024-key namespace
 reaches the package's 64-key safety reserve.
+
+## Upgrading From 0.2.0
+
+<!-- BEGIN retired configuration key upgrade note -->
+Durable records migrate themselves; package configuration does not. 0.3.0 replaces
+the `default_session_template_selector` configuration field with
+`default_session_type_id`. Package configuration is Hub-owned and the Hub exposes
+only the fields the installed manifest declares, so the previously configured
+default is not carried over and cannot be read by this package after the upgrade.
+
+Set `default_session_type_id` and reload the package. Until an operator does,
+PTY-backed steps that relied on the device default fail closed with
+`session_type_id_required`; the diagnostic names the field to set, `run.blocked_reason`
+carries it, and the blocked session request appears in the needs-attention queue
+with the same message. No step is silently downgraded and no session type is
+inferred from a retired selector. `script/test-hub-flow` proves that sequence
+against a real Hub: enable without the field, observe the fail-closed diagnostic
+and the empty PTY state, then set the field, reload, and spawn.
+<!-- END retired configuration key upgrade note -->
 
 Every delivery role uses the same exact routing source:
 
@@ -154,7 +178,7 @@ An open or missing prerequisite returns `ok=false` with
 the source visit, requested target, correlation/result, and unmet ticket IDs in
 `run.waiting_transition`; direct activation diagnostics remain in
 `run.blocked_transition`. Neither path creates a target run-step, session
-request, provider/template resolution, worktree, PTY, or spawn. Closing,
+request, provider/session-type resolution, worktree, PTY, or spawn. Closing,
 updating, removing, or deleting the final blocker atomically creates one target
 run-step and clears the waiting state; duplicate clearance and recovery are
 idempotent. Clearance is fail-closed on both ends: a cancelled, merged, or
@@ -175,7 +199,8 @@ operator's gate override. A gate override waives only the gate IDs it named and
 is audited when the transition is applied, not when a dependency-blocked request
 was made. `update_ticket` with `status="closed"` clears its runs' waiting
 transitions without ending those runs, so such a run needs a fresh explicit
-advance.
+advance. Repeated activation of an already spawned run/step reuses the existing
+request.
 
 Transition findings are run-scoped: unresolved `blocker` and `high` findings
 stop advancement until resolved or waived. `medium`, `low`, and `info` findings
@@ -300,20 +325,24 @@ repository's Lua harness. The expected hub path is a packaged
 `project-pipelines.home`, returning `response=plugin_surface` with a surface
 tree containing `toolbar`, `metric_grid`, `metric`, `section`, `status_badge`,
 `table`, `empty_state`, and `form` primitives. The node shapes mirror the
-canonical `botster-hub-test-support` plugin-contract-matrix fixture.
+canonical `@trybotster/hub-test-support@0.1.24` plugin-contract-matrix fixture.
+`script/test-ui-contract.mjs` consumes that published package, verifies its
+protocol-6 metadata, and keeps shared UI shape proof separate from the live
+session-type acceptance below.
 
 Real hub acceptance for this ticket is a live Project Pipelines activation, not
-only package discovery. Use a temporary hub data directory, install and enable
-this package, define a tiny standalone project/ticket/run with a PTY step
-selected by template name or declared capability, activate it, then inspect
+only package discovery. Use a temporary hub data directory, install this
+package, configure `default_session_type_id`, then enable the package worker,
+define a tiny standalone project/ticket/run using the real sourced Plan step,
+activate it without a session-type argument, then inspect
 `project_pipelines.current_context`. Persisted evidence should show
 `session_request.status="spawn_requested"`, `run.session_id`,
-`run.session_request_id`, a `session_template_spawn_requested` event, resolved
-`template_id`, persisted `template_selector`, `target_id`, and request context
+`run.session_request_id`, a `session_type_spawn_requested` event, resolved
+`session_type_id`, `target_id`, and request context
 metadata for `run_id`, `step_id`, and `ticket_id`. The negative case is a PTY
 step declaring a missing provider dependency such as `github_auth`; activation
 should persist `status="blocked"`, a diagnostic naming the dependency/provider,
-and a `session_template_spawn_blocked` event without spawning a PTY session.
+and a `session_type_spawn_blocked` event without spawning a PTY session.
 Ticket dependency acceptance should separately add an open prerequisite through
 `project_pipelines.add_ticket_dependency`, attempt an unexempted delivery step,
 and observe `ticket_dependencies_unmet` with unchanged current-step and session
@@ -329,7 +358,7 @@ proof.
 
 ```sh
 git clone https://github.com/trybotster/botster-hub.git /private/tmp/botster-hub-ui-contract
-git -C /private/tmp/botster-hub-ui-contract checkout 11d73d27e01732981e803041ea702aa09db57112
+git -C /private/tmp/botster-hub-ui-contract checkout 8a60bd58841179f8b1fd4040d9362d18ea244230
 cargo build --locked --manifest-path /private/tmp/botster-hub-ui-contract/Cargo.toml
 cargo build --locked --manifest-path /private/tmp/botster-hub-ui-contract/Cargo.toml -p botster-core --bin botster-session-worker
 BOTSTER_HUB_SOURCE=/private/tmp/botster-hub-ui-contract \

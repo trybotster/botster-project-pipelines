@@ -4,6 +4,10 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import fixtures from "@trybotster/ui-contract/conformance-fixtures" with { type: "json" };
 import schema from "@trybotster/ui-contract/schema" with { type: "json" };
+import {
+  metadata as hubTestSupportMetadata,
+  pluginContractMatrixFixturePath,
+} from "@trybotster/hub-test-support";
 
 const require = createRequire(import.meta.url);
 const entrypoint = require.resolve("@trybotster/ui-contract");
@@ -13,6 +17,19 @@ const packageJson = JSON.parse(
 
 assert.equal(packageJson.version, "0.1.0");
 assert.equal(fixtures.contract_version, "0.1.0");
+
+const hubTestSupportEntrypoint = require.resolve("@trybotster/hub-test-support");
+const hubTestSupportPackage = JSON.parse(
+  fs.readFileSync(path.join(path.dirname(hubTestSupportEntrypoint), "package.json"), "utf8"),
+);
+assert.equal(hubTestSupportPackage.version, "0.1.24");
+assert.equal(hubTestSupportMetadata.protocol_version, 6);
+assert.equal(hubTestSupportMetadata.package_version, "0.1.24");
+const pluginContractMatrixManifest = JSON.parse(
+  fs.readFileSync(path.join(pluginContractMatrixFixturePath(), "botster-package.json"), "utf8"),
+);
+assert.equal(pluginContractMatrixManifest.name, "botster.plugin-contract-matrix");
+assert.ok(pluginContractMatrixManifest.surfaces.some((surface) => surface.id === "contract.app"));
 
 const definitions = schema.$defs;
 assert.deepEqual(definitions.UiActionRequest.required, [
