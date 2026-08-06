@@ -639,6 +639,54 @@ assert(live_waiting_context.dig("run", "current_step_id") == "live_waiting_plan_
 assert(live_waiting_context.fetch("run_steps").length == 1, "waiting created Implement before clearance")
 assert(live_waiting_context.fetch("session_requests").none? { |request_row| request_row["run_id"] == "run_live_dependency_waiting" }, "waiting created a downstream request")
 
+# A run an operator ended while it was waiting must stay ended through real persistence:
+# later clearance of its last blocker may not resurrect it into an agent step.
+call_tool(socket, "project_pipelines.create_ticket", {
+  id: "ticket_live_waiting_cancelled",
+  project_id: project_id,
+  target_id: "tgt_71266a8d976d4535902ffed09c18a7ba",
+  title: "Live waiting cancelled"
+})
+live_cancelled_started = call_tool(socket, "project_pipelines.start_run", {
+  id: "run_live_waiting_cancelled",
+  ticket_id: "ticket_live_waiting_cancelled",
+  pipeline_id: "pipeline_live_dependency_waiting",
+  spawn_target_id: "tgt_71266a8d976d4535902ffed09c18a7ba",
+  branch: "project-pipelines/live-waiting-cancelled",
+  base_ref: "main"
+})
+call_tool(socket, "project_pipelines.create_ticket", {
+  id: "ticket_live_waiting_cancelled_blocker",
+  project_id: project_id,
+  title: "Live waiting cancelled blocker"
+})
+call_tool(socket, "project_pipelines.add_ticket_dependency", {
+  id: "dependency_live_waiting_cancelled",
+  ticket_id: "ticket_live_waiting_cancelled",
+  dependency_ticket_id: "ticket_live_waiting_cancelled_blocker"
+})
+call_tool(socket, "project_pipelines.submit_review", {
+  run_id: "run_live_waiting_cancelled",
+  run_step_id: live_cancelled_started.dig("run_step", "id"),
+  step_id: "live_waiting_plan_review",
+  verdict: "approved"
+})
+live_cancelled_advance = call_tool(socket, "project_pipelines.request_step_advance", {
+  run_id: "run_live_waiting_cancelled",
+  request_id: "advance_live_waiting_cancelled"
+})
+assert(live_cancelled_advance["ok"] == false && live_cancelled_advance.dig("error", "code") == "ticket_dependencies_unmet", "approved live review did not wait before cancellation")
+call_tool(socket, "project_pipelines.cancel_run", { run_id: "run_live_waiting_cancelled", reason: "operator ended the run while it waited" })
+cancelled_waiting_context = call_tool(socket, "project_pipelines.current_context", { run_id: "run_live_waiting_cancelled" })
+assert(cancelled_waiting_context.dig("run", "status") == "cancelled", "cancel_run did not end the waiting run")
+assert(!cancelled_waiting_context.dig("run", "waiting_transition"), "cancel_run left durable waiting state behind")
+call_tool(socket, "project_pipelines.close_ticket", { ticket_id: "ticket_live_waiting_cancelled_blocker" })
+resurrection_context = call_tool(socket, "project_pipelines.current_context", { run_id: "run_live_waiting_cancelled" })
+assert(resurrection_context.dig("run", "status") == "cancelled", "clearing the blocker reactivated a cancelled run")
+assert(resurrection_context.dig("run", "current_step_id") == "live_waiting_plan_review", "clearing the blocker advanced a cancelled run")
+assert(resurrection_context.fetch("run_steps").length == 1, "clearing the blocker created an Implement visit on a cancelled run")
+assert(resurrection_context.fetch("session_requests").none? { |request_row| request_row["run_id"] == "run_live_waiting_cancelled" }, "clearing the blocker spawned on a cancelled run")
+
 final_context = call_tool(socket, "project_pipelines.current_context", {})
 assert(final_context.fetch("runs").any? { |record| record["id"] == run_id }, "current context missing live run")
 run_gate_results = final_context.fetch("gate_results").select { |record| record["run_id"] == run_id }

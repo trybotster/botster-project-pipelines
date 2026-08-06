@@ -93,6 +93,23 @@ exactly one target run-step. Hub-owned agent orchestration remains downstream
 of that committed active visit. Repeated clearance or recovery creates no
 duplicate transition or spawn request.
 
+Clearance never revives ended work and never replays stale authorization.
+Cancelling a run, requesting its merge, closing its ticket, and a merged
+provider PR each clear that run's waiting state and emit
+`ticket_dependencies_waiting_cleared`; reconciliation additionally refuses any
+run that is not `active`, whose ticket is `closed`, or whose preserved source
+visit is no longer `active`. Before applying a waiting transition,
+reconciliation re-derives the route from the current review verdict and
+re-evaluates the same gate, review, and finding inputs that authorized the
+original request. A newer `changes_required` verdict, a new `blocker`/`high`
+finding, or a required gate turning `failed` keeps the run waiting, records
+`unauthorized` and `unmet_authorization` on the waiting state, and emits
+`ticket_dependencies_waiting_unauthorized` once. Waiting state is retained
+rather than discarded, so restoring authorization lets the next reconciliation
+wake the run exactly once. A gate override waives only the gate IDs it named;
+it never waives dependencies, and its `gates_overridden` audit event is emitted
+when the transition is applied, not when the blocked request was made.
+
 Unresolved findings are run-scoped transition inputs. `blocker` and `high`
 findings block advancement; `medium`, `low`, and `info` findings are durable
 carry-forward review context and do not block an otherwise approved transition.

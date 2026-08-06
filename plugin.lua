@@ -1093,7 +1093,10 @@ local function list_tickets(arguments)
   return ok({ tickets = tickets })
 end
 
-local reconcile_waiting_transitions
+-- Step-transition namespace: route derivation, waiting-transition lifecycle, and wakeup
+-- reconciliation. This main chunk is at Lua's 200-local ceiling, so these helpers share
+-- one table instead of each taking a top-level local.
+local step_transitions = {}
 
 local function add_ticket_dependency(arguments)
   arguments = arguments or {}
@@ -1122,7 +1125,7 @@ local function add_ticket_dependency(arguments)
   }
   table.insert(state.ticket_dependencies, dependency)
   push_event(state, "ticket_dependency_added", nil, ticket.id, { dependency_ticket_id = dependency_ticket_id })
-  reconcile_waiting_transitions(state)
+  step_transitions.reconcile_waiting(state)
   local err = save_state(state)
   if err then return err end
   return ok({ ticket = ticket, dependency = dependency })
@@ -1153,7 +1156,7 @@ local function remove_ticket_dependency(arguments)
   end
   if not removed then return ok({ ticket = ticket }) end
   push_event(state, "ticket_dependency_removed", nil, ticket.id, { dependency_ticket_id = dependency_ticket_id })
-  reconcile_waiting_transitions(state)
+  step_transitions.reconcile_waiting(state)
   local err = save_state(state)
   if err then return err end
   return ok({ ticket = ticket })
@@ -1175,6 +1178,25 @@ local function unmet_ticket_dependencies(state, ticket)
     end
   end
   return unmet
+end
+
+function step_transitions.clear_waiting(state, run, reason)
+  local waiting = run.waiting_transition
+  if type(waiting) ~= "table" then return false end
+  run.waiting_transition = nil
+  push_event(state, "ticket_dependencies_waiting_cleared", run.id, waiting.target_step_id, {
+    source_step_id = waiting.source_step_id,
+    source_run_step_id = waiting.source_run_step_id,
+    request_id = waiting.request_id,
+    reason = reason,
+  })
+  return true
+end
+
+function step_transitions.clear_waiting_for_ticket(state, ticket_id, reason)
+  for _, run in ipairs(state.runs) do
+    if run.ticket_id == ticket_id then step_transitions.clear_waiting(state, run, reason) end
+  end
 end
 
 local function existing_spawn_activation(state, run, step)
@@ -1800,6 +1822,50 @@ local function dependency_blockers_for_step(state, ticket, step)
   return unmet_ticket_dependencies(state, ticket)
 end
 
+-- Single authority for the route a source visit is currently allowed to take.
+-- Advancement and waiting-transition wakeup both derive the target from this so a
+-- review verdict landed while waiting cannot be applied against a stale route.
+function step_transitions.route_for(state, run, current_step, requested_next_step_id)
+  local latest_review = review_for_current_visit(state, run, current_step)
+  if latest_review and latest_review.verdict == "approved" then
+    return current_step.on_approved_step_id or current_step.next_step_id, false, latest_review
+  end
+  if latest_review and latest_review.verdict == "changes_required" then
+    return current_step.on_changes_requested_step_id, true, latest_review
+  end
+  if latest_review and latest_review.verdict == "blocked" then
+    return current_step.on_blocked_step_id, true, latest_review
+  end
+  return requested_next_step_id or current_step.next_step_id, false, nil
+end
+
+-- Revalidate a waiting transition against current review, gate, and finding state.
+-- Gate overrides recorded on the transition waive exactly the gate ids the operator
+-- named; nothing else carries forward from the original request.
+function step_transitions.waiting_authorization_blockers(state, run, pipeline, waiting)
+  local source_step = find_pipeline_step(pipeline, waiting.source_step_id)
+  if not source_step then
+    return { { kind = "source_step_missing", step_id = waiting.source_step_id } }
+  end
+  local route, review_rework = step_transitions.route_for(state, run, source_step, waiting.target_step_id)
+  if route ~= waiting.target_step_id then
+    return { {
+      kind = "route_changed",
+      waiting_step_id = waiting.target_step_id,
+      current_step_id = route,
+    } }
+  end
+  if review_rework then return {} end
+  local overridden = array(waiting.overridden_gate_ids)
+  local blockers = {}
+  for _, blocker in ipairs(transition_blockers(state, run, pipeline, source_step)) do
+    if not (blocker.kind == "gate" and table_contains(overridden, blocker.gate_id)) then
+      table.insert(blockers, blocker)
+    end
+  end
+  return blockers
+end
+
 local function transition_response(run, source_step_id, target_step_id)
   local response_run = copy(run)
   response_run.current_step_id = target_step_id
@@ -1817,6 +1883,17 @@ local function apply_step_transition(state, run, transition, recovered)
   local previous_run_step = find_by_id(state.run_steps, transition.source_run_step_id)
   if not previous_run_step then
     return failure("transition_source_missing", "waiting transition source run-step is missing")
+  end
+  -- The gate override is an audit fact about an applied advancement, so it is recorded
+  -- here rather than when the override was requested; a request that never advances
+  -- (dependency wait, remaining blockers) must not leave a consumed override behind.
+  local overridden_gate_ids = array(transition.overridden_gate_ids)
+  if #overridden_gate_ids > 0 then
+    push_event(state, "gates_overridden", run.id, transition.source_step_id, {
+      run_step_id = transition.source_run_step_id,
+      gate_ids = copy(overridden_gate_ids),
+      reason = transition.override_reason,
+    })
   end
   previous_run_step.status = "done"
   run.current_step_id = transition.target_step_id
@@ -1920,19 +1997,8 @@ local function request_step_advance(arguments)
   end
   local current_step = find_pipeline_step(pipeline, run.current_step_id)
   if not current_step then return failure("not_found", "current step not found: " .. tostring(run.current_step_id)) end
-  local latest_review = review_for_current_visit(state, run, current_step)
-  local review_rework = latest_review
-    and (latest_review.verdict == "changes_required" or latest_review.verdict == "blocked")
-  local next_step_id
-  if latest_review and latest_review.verdict == "approved" then
-    next_step_id = current_step.on_approved_step_id or current_step.next_step_id
-  elseif latest_review and latest_review.verdict == "changes_required" then
-    next_step_id = current_step.on_changes_requested_step_id
-  elseif latest_review and latest_review.verdict == "blocked" then
-    next_step_id = current_step.on_blocked_step_id
-  else
-    next_step_id = string_arg(arguments, "next_step_id") or current_step.next_step_id
-  end
+  local next_step_id, review_rework, latest_review =
+    step_transitions.route_for(state, run, current_step, string_arg(arguments, "next_step_id"))
   if review_rework and not next_step_id then
     return failure("review_route_missing", "current step has no route for review verdict " .. latest_review.verdict)
   end
@@ -1940,13 +2006,14 @@ local function request_step_advance(arguments)
   local next_step = find_pipeline_step(pipeline, next_step_id)
   if not next_step then return failure("not_found", "next step not found: " .. next_step_id) end
   local blockers = review_rework and {} or transition_blockers(state, run, pipeline, current_step)
+  local overridden_gate_ids = {}
+  local override_reason
   if arguments.override_unmet_gates == true then
-    local override_reason = trim(arguments.override_reason)
+    override_reason = trim(arguments.override_reason)
     if not override_reason or override_reason == "" then
       return failure("validation_failed", "override_reason is required when override_unmet_gates is true", { "override_reason" })
     end
     local remaining = {}
-    local overridden_gate_ids = {}
     for _, blocker in ipairs(blockers) do
       if blocker.kind == "gate" then
         table.insert(overridden_gate_ids, blocker.gate_id)
@@ -1955,13 +2022,6 @@ local function request_step_advance(arguments)
       end
     end
     blockers = remaining
-    if #overridden_gate_ids > 0 then
-      push_event(state, "gates_overridden", run.id, current_step.id, {
-        run_step_id = run.current_run_step_id,
-        gate_ids = overridden_gate_ids,
-        reason = override_reason,
-      })
-    end
   end
   if #blockers > 0 then
     return diagnostic_failure("transition_blocked", "step transition has unmet requirements", {
@@ -1992,6 +2052,8 @@ local function request_step_advance(arguments)
     target_step_id = next_step_id,
     request_id = request_id,
     advance_request_id = advance_request and advance_request.id,
+    overridden_gate_ids = #overridden_gate_ids > 0 and copy(overridden_gate_ids) or nil,
+    override_reason = #overridden_gate_ids > 0 and override_reason or nil,
     result = copy(response),
   }
   local dependencies = dependency_blockers_for_step(state, ticket, next_step)
@@ -2024,24 +2086,51 @@ local function request_step_advance(arguments)
   return response
 end
 
-reconcile_waiting_transitions = function(state)
+-- A waiting transition may only be applied while the run, its ticket, and the preserved
+-- source visit are all still explicitly resumable. Anything terminal (cancelled run,
+-- merged/closed run, closed ticket, completed source visit) fails closed so dependency
+-- clearance can never resurrect work an operator already ended.
+function step_transitions.waiting_resumable(state, run, waiting)
+  if run.status ~= "active" then return false end
+  local ticket = find_by_id(state.tickets, run.ticket_id)
+  if not ticket or ticket.status == "closed" then return false end
+  local source_visit = find_by_id(state.run_steps, waiting.source_run_step_id)
+  if not source_visit or source_visit.status ~= "active" then return false end
+  if run.current_step_id ~= waiting.source_step_id then return false end
+  if run.current_run_step_id ~= waiting.source_run_step_id then return false end
+  return true, ticket
+end
+
+function step_transitions.reconcile_waiting(state)
   local applied = {}
   for _, run in ipairs(state.runs) do
     local waiting = run.waiting_transition
     if type(waiting) == "table" then
-      local ticket = find_by_id(state.tickets, run.ticket_id)
       local pipeline = find_by_id(state.pipeline_definitions, run.pipeline_definition_id)
       local target_step = pipeline and find_pipeline_step(pipeline, waiting.target_step_id) or nil
-      if ticket and target_step
-        and run.current_step_id == waiting.source_step_id
-        and run.current_run_step_id == waiting.source_run_step_id
-      then
+      local resumable, ticket = step_transitions.waiting_resumable(state, run, waiting)
+      if resumable and target_step then
         local dependencies = dependency_blockers_for_step(state, ticket, target_step)
-        if #dependencies > 0 then
-          waiting.unmet_dependencies = copy(dependencies)
+        local authorization = step_transitions.waiting_authorization_blockers(state, run, pipeline, waiting)
+        waiting.unmet_dependencies = #dependencies > 0 and copy(dependencies) or nil
+        if #authorization > 0 then
+          if not waiting.unauthorized then
+            push_event(state, "ticket_dependencies_waiting_unauthorized", run.id, waiting.target_step_id, {
+              source_step_id = waiting.source_step_id,
+              source_run_step_id = waiting.source_run_step_id,
+              request_id = waiting.request_id,
+              blockers = copy(authorization),
+            })
+          end
+          waiting.unauthorized = true
+          waiting.unmet_authorization = copy(authorization)
         else
-          local result = apply_step_transition(state, run, waiting, true)
-          if result.ok ~= false then table.insert(applied, run.id) end
+          waiting.unauthorized = nil
+          waiting.unmet_authorization = nil
+          if #dependencies == 0 then
+            local result = apply_step_transition(state, run, waiting, true)
+            if result.ok ~= false then table.insert(applied, run.id) end
+          end
         end
       end
     end
@@ -2139,7 +2228,10 @@ local function update_ticket(arguments)
   local ticket = find_by_id(state.tickets, string_arg(arguments, "ticket_id"))
   if not ticket then return failure("not_found", "ticket not found") end
   update_fields(ticket, arguments, { "title", "description", "project_id", "target_id", "status" })
-  reconcile_waiting_transitions(state)
+  if ticket.status == "closed" then
+    step_transitions.clear_waiting_for_ticket(state, ticket.id, "ticket_closed")
+  end
+  step_transitions.reconcile_waiting(state)
   return persist_response(state, "ticket", ticket)
 end
 
@@ -2195,7 +2287,7 @@ local function delete_ticket(arguments)
     local dependency = state.ticket_dependencies[index]
     if dependency.ticket_id == id or dependency.depends_on_ticket_id == id then table.remove(state.ticket_dependencies, index) end
   end
-  reconcile_waiting_transitions(state)
+  step_transitions.reconcile_waiting(state)
   return persist_response(state, "ticket", ticket)
 end
 
@@ -2469,6 +2561,7 @@ local function finish_run(arguments, run_status, ticket_status)
   if ticket then ticket.status = ticket_status end
   local run_step = find_by_id(state.run_steps, run.current_run_step_id)
   if run_step then run_step.status = run_status end
+  step_transitions.clear_waiting(state, run, "run_" .. run_status)
   push_event(state, "run_" .. run_status, run.id, ticket and ticket.id, {
     reason = string_arg(arguments, "reason"),
   })
@@ -2506,14 +2599,17 @@ local function close_ticket(arguments)
   ticket.merge_summary = string_arg(arguments, "merge_summary")
   ticket.base_branch = string_arg(arguments, "base_branch")
   for _, run in ipairs(state.runs) do
-    if run.ticket_id == ticket.id and run.status ~= "closed" and run.status ~= "cancelled" then
-      run.status = "closed"
-      local run_step = find_by_id(state.run_steps, run.current_run_step_id)
-      if run_step then run_step.status = "closed" end
+    if run.ticket_id == ticket.id then
+      if run.status ~= "closed" and run.status ~= "cancelled" then
+        run.status = "closed"
+        local run_step = find_by_id(state.run_steps, run.current_run_step_id)
+        if run_step then run_step.status = "closed" end
+      end
+      step_transitions.clear_waiting(state, run, "ticket_closed")
     end
   end
   push_event(state, "ticket_closed", nil, ticket.id)
-  reconcile_waiting_transitions(state)
+  step_transitions.reconcile_waiting(state)
   return persist_response(state, "ticket", ticket)
 end
 
@@ -2534,12 +2630,13 @@ local function handle_pr_merged(arguments)
   if ticket then ticket.status = "closed" end
   local run_step = find_by_id(state.run_steps, run.current_run_step_id)
   if run_step then run_step.status = "closed" end
+  step_transitions.clear_waiting(state, run, "provider_pr_merged")
   if matched_link then
     matched_link.status = "merged"
     matched_link.merge_commit = string_arg(arguments, "merge_commit")
   end
   push_event(state, "provider_pr_merged", run.id, matched_link and matched_link.id, { merge_commit = arguments.merge_commit })
-  reconcile_waiting_transitions(state)
+  step_transitions.reconcile_waiting(state)
   local err = save_state(state)
   if err then return err end
   return ok({ run = run, run_step = run_step, ticket = ticket, pr_link = matched_link })

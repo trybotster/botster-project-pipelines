@@ -405,6 +405,14 @@ local function context_for(run_id)
   return tools["project_pipelines.current_context"]({ run_id = run_id })
 end
 
+local function count_events(run_id, kind)
+  local total = 0
+  for _, event in ipairs(context_for(run_id).events) do
+    if event.kind == kind then total = total + 1 end
+  end
+  return total
+end
+
 local function create_waiting_scenario(prefix, blocker_count)
   assert(tools["project_pipelines.create_ticket"]({
     id = prefix .. "-ticket", project_id = "project-one", target_id = "target-one", title = prefix .. " ticket",
@@ -580,6 +588,176 @@ local missing_retry = missing_tools["project_pipelines.request_step_advance"]({
 assert(not missing_retry.ok and missing_retry.error.code == "ticket_dependencies_unmet")
 assert(missing_retry.error.unmet_dependencies[1].status == "missing")
 assert(#missing_tools["project_pipelines.current_context"]({ run_id = missing_scenario.run_id }).run_steps == 1)
+
+-- Terminal runs and closed owning tickets must never be resurrected by later dependency
+-- clearance: the waiting transition is cleared at the terminal mutation and reconciliation
+-- refuses anything that is not still explicitly resumable.
+local function assert_not_resurrected(scenario, expected_run_status)
+  local context = context_for(scenario.run_id)
+  assert(context.run.status == expected_run_status)
+  assert(context.run.waiting_transition == nil, "terminal state must clear the waiting transition")
+  assert(context.run.current_step_id == "waiting-plan-review")
+  assert(context.run.current_run_step_id == scenario.run_step_id)
+  assert(#context.run_steps == 1, "terminal run must not gain a target run-step")
+  assert(#spawned == scenario.spawned_before)
+end
+
+local cancelled_scenario = create_waiting_scenario("waiting-cancelled", 1)
+assert(tools["project_pipelines.cancel_run"]({ run_id = cancelled_scenario.run_id, reason = "operator stopped" }).ok)
+assert_not_resurrected(cancelled_scenario, "cancelled")
+assert(tools["project_pipelines.update_ticket"]({
+  ticket_id = cancelled_scenario.dependency_ids[1], status = "closed",
+}).ok)
+assert_not_resurrected(cancelled_scenario, "cancelled")
+
+local closed_owner_scenario = create_waiting_scenario("waiting-closed-owner", 1)
+assert(tools["project_pipelines.close_ticket"]({
+  ticket_id = closed_owner_scenario.ticket_id, merge_confirmed = true,
+}).ok)
+assert_not_resurrected(closed_owner_scenario, "closed")
+assert(tools["project_pipelines.close_ticket"]({ ticket_id = closed_owner_scenario.dependency_ids[1] }).ok)
+assert_not_resurrected(closed_owner_scenario, "closed")
+
+local updated_owner_scenario = create_waiting_scenario("waiting-updated-owner", 1)
+assert(tools["project_pipelines.update_ticket"]({
+  ticket_id = updated_owner_scenario.ticket_id, status = "closed",
+}).ok)
+assert(context_for(updated_owner_scenario.run_id).run.waiting_transition == nil,
+  "closing the owning ticket must clear its waiting transition")
+assert(tools["project_pipelines.update_ticket"]({
+  ticket_id = updated_owner_scenario.dependency_ids[1], status = "closed",
+}).ok)
+assert_not_resurrected(updated_owner_scenario, "active")
+
+-- Dependency clearance must revalidate the source visit against current review, gate, and
+-- finding authorization rather than replaying the authorization captured at request time.
+assert(tools["project_pipelines.create_pipeline"]({
+  id = "pipeline-waiting-authorization", name = "Waiting authorization",
+  steps = {
+    {
+      id = "authorization-review", name = "Authorization review", allows_open_ticket_dependencies = true,
+      on_approved_step_id = "authorization-implement",
+      on_changes_requested_step_id = "authorization-rework",
+      gates = { { id = "authorization-gate", prompt = "Prove authorization before advancing" } },
+    },
+    { id = "authorization-implement", name = "Implement", kind = "pty", session_template_id = "template_codex" },
+    { id = "authorization-rework", name = "Rework" },
+  },
+}).ok)
+
+local function create_authorization_scenario(prefix, waive_unmet_gate)
+  assert(tools["project_pipelines.create_ticket"]({
+    id = prefix .. "-ticket", project_id = "project-one", target_id = "target-one", title = prefix .. " ticket",
+  }).ok)
+  local started = tools["project_pipelines.start_run"]({
+    id = prefix .. "-run", ticket_id = prefix .. "-ticket", pipeline_id = "pipeline-waiting-authorization",
+  })
+  assert(started.ok)
+  assert(tools["project_pipelines.create_ticket"]({
+    id = prefix .. "-dependency", project_id = "project-one", title = prefix .. " dependency",
+  }).ok)
+  assert(tools["project_pipelines.add_ticket_dependency"]({
+    ticket_id = prefix .. "-ticket", dependency_ticket_id = prefix .. "-dependency",
+  }).ok)
+  if not waive_unmet_gate then
+    assert(tools["project_pipelines.submit_gate"]({
+      run_id = prefix .. "-run", run_step_id = started.run_step.id, step_id = "authorization-review",
+      gate_id = "authorization-gate", status = "passed",
+    }).ok)
+  end
+  assert(tools["project_pipelines.submit_review"]({
+    run_id = prefix .. "-run", run_step_id = started.run_step.id,
+    step_id = "authorization-review", verdict = "approved",
+  }).ok)
+  local spawned_before = #spawned
+  local advance_arguments = { run_id = prefix .. "-run" }
+  if waive_unmet_gate then
+    advance_arguments.override_unmet_gates = true
+    advance_arguments.override_reason = "gate waived while dependency-blocked"
+  end
+  local waiting = tools["project_pipelines.request_step_advance"](advance_arguments)
+  assert(not waiting.ok and waiting.error.code == "ticket_dependencies_unmet")
+  return {
+    run_id = prefix .. "-run", ticket_id = prefix .. "-ticket",
+    dependency_id = prefix .. "-dependency", run_step_id = started.run_step.id,
+    spawned_before = spawned_before,
+  }
+end
+
+local function assert_unauthorized_wait(scenario, blocker_kind)
+  local context = context_for(scenario.run_id)
+  assert(context.run.current_step_id == "authorization-review",
+    "dependency clearance must not advance a source visit whose authorization changed")
+  assert(context.run.current_run_step_id == scenario.run_step_id)
+  assert(#context.run_steps == 1, "unauthorized wakeup must not create the target run-step")
+  assert(#spawned == scenario.spawned_before)
+  assert(context.run.waiting_transition.unauthorized == true)
+  assert(context.run.waiting_transition.unmet_dependencies == nil,
+    "a satisfied dependency snapshot must be absent, not an empty collection")
+  assert(context.run.waiting_transition.unmet_authorization[1].kind == blocker_kind,
+    "waiting must record the current authorization blocker " .. blocker_kind)
+  assert(count_events(scenario.run_id, "ticket_dependencies_waiting_unauthorized") == 1)
+end
+
+local stale_review_scenario = create_authorization_scenario("waiting-stale-review")
+assert(tools["project_pipelines.submit_review"]({
+  run_id = stale_review_scenario.run_id, run_step_id = stale_review_scenario.run_step_id,
+  step_id = "authorization-review", verdict = "changes_required",
+}).ok)
+assert(tools["project_pipelines.update_ticket"]({
+  ticket_id = stale_review_scenario.dependency_id, status = "closed",
+}).ok)
+assert_unauthorized_wait(stale_review_scenario, "route_changed")
+
+local failed_gate_scenario = create_authorization_scenario("waiting-failed-gate")
+assert(tools["project_pipelines.submit_gate"]({
+  run_id = failed_gate_scenario.run_id, run_step_id = failed_gate_scenario.run_step_id,
+  step_id = "authorization-review", gate_id = "authorization-gate", status = "failed",
+}).ok)
+assert(tools["project_pipelines.close_ticket"]({ ticket_id = failed_gate_scenario.dependency_id }).ok)
+assert_unauthorized_wait(failed_gate_scenario, "gate")
+
+local late_finding_scenario = create_authorization_scenario("waiting-late-finding")
+assert(tools["project_pipelines.submit_review"]({
+  run_id = late_finding_scenario.run_id, run_step_id = late_finding_scenario.run_step_id,
+  step_id = "authorization-review", verdict = "approved",
+  findings = { { id = "waiting-late-high", severity = "high", title = "Late high finding" } },
+}).ok)
+assert(tools["project_pipelines.update_ticket"]({
+  ticket_id = late_finding_scenario.dependency_id, status = "closed",
+}).ok)
+assert_unauthorized_wait(late_finding_scenario, "finding")
+-- Waiting state is preserved rather than destroyed, so restoring authorization and
+-- reconciling again still wakes the run exactly once.
+assert(tools["project_pipelines.resolve_finding"]({ finding_id = "waiting-late-high" }).ok)
+assert(tools["project_pipelines.remove_ticket_dependency"]({
+  ticket_id = late_finding_scenario.ticket_id, dependency_ticket_id = late_finding_scenario.dependency_id,
+}).ok)
+local reauthorized = context_for(late_finding_scenario.run_id)
+assert(reauthorized.run.current_step_id == "authorization-implement")
+assert(reauthorized.run.waiting_transition == nil)
+assert(#reauthorized.run_steps == 2, "restored authorization must create exactly one target run-step")
+
+-- A gate override on a dependency-blocked advance waives gates only. Nothing advanced, so
+-- the audit event must not be committed until the stored override is actually applied.
+local blocked_override_scenario = create_authorization_scenario("waiting-blocked-override", true)
+assert(count_events(blocked_override_scenario.run_id, "gates_overridden") == 0,
+  "a dependency-blocked override must not commit a gates_overridden audit event")
+assert(tools["project_pipelines.update_ticket"]({
+  ticket_id = blocked_override_scenario.dependency_id, status = "closed",
+}).ok)
+local applied_override = context_for(blocked_override_scenario.run_id)
+assert(applied_override.run.current_step_id == "authorization-implement")
+assert(applied_override.run.waiting_transition == nil)
+assert(#applied_override.run_steps == 2, "the stored override must still create exactly one target run-step")
+assert(count_events(blocked_override_scenario.run_id, "gates_overridden") == 1,
+  "the stored override must be audited exactly once, when the transition is applied")
+for _, event in ipairs(applied_override.events) do
+  if event.kind == "gates_overridden" then
+    assert(event.payload.gate_ids[1] == "authorization-gate")
+    assert(event.payload.reason == "gate waived while dependency-blocked")
+  end
+end
 
 assert(tools["project_pipelines.create_project"]({ id = "project-disposable", name = "Disposable" }).ok)
 assert(tools["project_pipelines.update_project"]({ project_id = "project-disposable", description = "Updated" }).project.description == "Updated")

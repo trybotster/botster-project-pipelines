@@ -157,7 +157,13 @@ the source visit, requested target, correlation/result, and unmet ticket IDs in
 request, provider/template resolution, worktree, PTY, or spawn. Closing,
 updating, removing, or deleting the final blocker atomically creates one target
 run-step and clears the waiting state; duplicate clearance and recovery are
-idempotent.
+idempotent. Clearance is fail-closed on both ends: a cancelled, merged, or
+closed run and a closed owning ticket clear their waiting state and are never
+resurrected, and wakeup re-derives the route and re-checks the current gate,
+review, and finding inputs, so a later `changes_required` verdict, blocking
+finding, or failed gate keeps the run waiting instead of activating the agent
+step. A gate override waives only the gate IDs it named and is audited when the
+transition is applied, not when a dependency-blocked request was made.
 
 Transition findings are run-scoped: unresolved `blocker` and `high` findings
 stop advancement until resolved or waived. `medium`, `low`, and `info` findings
