@@ -1,6 +1,6 @@
-local STORE_SCHEMA_VERSION = 3
-local STORE_ROOT = "v3/"
-local SOURCE_REVISION = "botster-stack-delivery/2026-08-03.1"
+local STORE_SCHEMA_VERSION = 4
+local STORE_ROOT = "v4/"
+local SOURCE_REVISION = "botster-stack-delivery/2026-08-05.1"
 local MAX_STORE_KEYS = 1024
 local STORE_KEY_HEADROOM = 64
 local MAX_EVENTS = 256
@@ -304,6 +304,181 @@ local function list_entries(response)
   return type(response.entries) == "table" and response.entries or {}
 end
 
+-- BEGIN one-time v3-to-v4 session-type migration
+-- Scoped to a single chunk-level name so the retired vocabulary stays confined to the
+-- one-time rewrite and the module keeps room under Lua's 200 active-local ceiling.
+local migrate_v3_store
+do
+  local LEGACY_STORE_ROOT = "v3/"
+  -- Exact identity the package itself wrote, in write precedence order.
+  local LEGACY_IDENTITY_KEYS = { "session_template_id", "template_id" }
+  -- Every selector key the package wrote onto a record it owns. These are removed only from
+  -- the specific records that carried them, never from nested caller payloads.
+  local LEGACY_SELECTOR_KEYS = {
+    "session_template_id",
+    "template_id",
+    "session_template_name",
+    "template_name",
+    "session_template_capability",
+    "session_capability",
+    "template_selector",
+  }
+
+  local LEGACY_EVENT_KINDS = {
+    session_template_spawn_requested = "session_type_spawn_requested",
+    session_template_spawn_failed = "session_type_spawn_failed",
+    session_template_spawn_blocked = "session_type_spawn_blocked",
+  }
+
+  local LEGACY_DIAGNOSTIC_CODES = {
+    session_template_resolution_unavailable = "session_type_resolution_unavailable",
+    session_template_resolution_failed = "session_type_resolution_failed",
+    session_template_unavailable = "session_type_unavailable",
+    session_templates_unavailable = "session_types_unavailable",
+    session_template_spawn_failed = "session_type_spawn_failed",
+  }
+
+  local LEGACY_DIAGNOSTIC_MESSAGES = {
+    ["hub session template resolution capability is unavailable"] = "hub session type resolution capability is unavailable",
+    ["session template selector is unavailable"] = "session type id is unavailable",
+    ["no hub session template matched selector"] = "no hub session type matched id",
+    ["hub session template spawn capability is unavailable"] = "hub session type spawn capability is unavailable",
+    ["managed session template spawn capability is unavailable"] = "managed session type spawn capability is unavailable",
+  }
+
+  -- Rewrites one record's OWN identity fields and nothing else. Nested tables are copied
+  -- through byte-for-byte, because request context, metadata, and Hub results are caller- and
+  -- agent-authored evidence in which a legacy-looking key name means nothing to this package.
+  local function migrate_record_identity(record)
+    if type(record) ~= "table" then return record end
+    local migrated = copy(record)
+    local identity
+    for _, key in ipairs(LEGACY_IDENTITY_KEYS) do
+      local value = record[key]
+      if identity == nil and type(value) == "string" and value ~= "" then identity = value end
+    end
+    for _, key in ipairs(LEGACY_SELECTOR_KEYS) do migrated[key] = nil end
+    if migrated.session_type_id == nil then migrated.session_type_id = identity end
+    return migrated
+  end
+
+  local function migrate_diagnostic(diagnostic)
+    if type(diagnostic) ~= "table" then return diagnostic end
+    local migrated = migrate_record_identity(diagnostic)
+    migrated.code = LEGACY_DIAGNOSTIC_CODES[diagnostic.code] or diagnostic.code
+    migrated.message = LEGACY_DIAGNOSTIC_MESSAGES[diagnostic.message] or diagnostic.message
+    return migrated
+  end
+
+  local function migrate_v3_payload(family, payload)
+    if type(payload) ~= "table" then return payload end
+    if family == "pipeline_definitions" then
+      local migrated = copy(payload)
+      for index, legacy_step in ipairs(array(payload.steps)) do
+        local migrated_step = migrate_record_identity(legacy_step)
+        migrated.steps[index] = migrated_step
+        local had_unmappable_selector = legacy_step.session_template_name
+          or legacy_step.template_name
+          or legacy_step.session_template_capability
+          or legacy_step.session_capability
+        if not migrated_step.session_type_id and had_unmappable_selector then
+          migrated_step.session_type_id_required = true
+        end
+      end
+      return migrated
+    end
+    if family == "session_requests" then
+      local migrated = migrate_record_identity(payload)
+      migrated.request = migrate_record_identity(payload.request)
+      migrated.result = migrate_record_identity(payload.result)
+      -- A blocked or failed activation persisted the SAME diagnostic twice: once as
+      -- session_request.diagnostic and once inside the result envelope as result.error. They
+      -- are one table at write time but two independent copies once durable, so both have to
+      -- be migrated or a consumer reading the envelope still sees the retired contract.
+      if type(migrated.result) == "table" then
+        migrated.result.error = migrate_diagnostic(payload.result.error)
+      end
+      migrated.diagnostic = migrate_diagnostic(payload.diagnostic)
+      return migrated
+    end
+    if family == "events" then
+      local migrated = migrate_record_identity(payload)
+      migrated.kind = LEGACY_EVENT_KINDS[payload.kind] or payload.kind
+      migrated.payload = migrate_record_identity(payload.payload)
+      if type(migrated.payload) == "table" then
+        migrated.payload.diagnostic = migrate_diagnostic(payload.payload.diagnostic)
+      end
+      return migrated
+    end
+    if family == "runs" then
+      local migrated = copy(payload)
+      migrated.diagnostic = migrate_diagnostic(payload.diagnostic)
+      migrated.blocked_reason = LEGACY_DIAGNOSTIC_MESSAGES[payload.blocked_reason] or payload.blocked_reason
+      return migrated
+    end
+    return copy(payload)
+  end
+
+  function migrate_v3_store(plugin_db, namespace_entries)
+    local legacy_entries = {}
+    local obsolete_entries = {}
+    local has_current_entries = false
+    for _, entry in ipairs(namespace_entries) do
+      if type(entry.key) == "string" then
+        if entry.key:sub(1, #LEGACY_STORE_ROOT) == LEGACY_STORE_ROOT then
+          table.insert(legacy_entries, entry)
+        elseif entry.key:sub(1, #STORE_ROOT) == STORE_ROOT then
+          has_current_entries = true
+        elseif entry.key:sub(1, 3) == "v2/" then
+          table.insert(obsolete_entries, entry)
+        end
+      end
+    end
+    if #legacy_entries == 0 and #obsolete_entries == 0 then return namespace_entries end
+    if #legacy_entries > 0 and has_current_entries then
+      error("store_migration_conflict: v3 and v4 records coexist")
+    end
+    if type(plugin_db.batch) ~= "function" then
+      error("store_migration_failed: atomic plugin_db.batch capability is unavailable")
+    end
+
+    local mutations = {}
+    for _, entry in ipairs(legacy_entries) do
+      local response = plugin_db.get({ key = entry.key })
+      local payload = record_payload(response)
+      if not payload then error("store_migration_failed: unreadable record " .. entry.key) end
+      local suffix = entry.key:sub(#LEGACY_STORE_ROOT + 1)
+      local family = suffix:match("^([^/]+)/")
+      table.insert(mutations, {
+        operation = "set",
+        key = STORE_ROOT .. suffix,
+        schema_version = STORE_SCHEMA_VERSION,
+        payload = migrate_v3_payload(family, payload),
+        expected_revision = 0,
+      })
+      table.insert(mutations, {
+        operation = "delete",
+        key = entry.key,
+        expected_revision = entry.revision or 0,
+      })
+    end
+    for _, entry in ipairs(obsolete_entries) do
+      table.insert(mutations, {
+        operation = "delete",
+        key = entry.key,
+        expected_revision = entry.revision or 0,
+      })
+    end
+
+    local invoked, migration = pcall(plugin_db.batch, { mutations = mutations })
+    if not invoked or type(migration) ~= "table" or migration.ok ~= true then
+      error("store_migration_failed: " .. tostring(invoked and (migration.error_kind or migration.message) or migration))
+    end
+    return list_entries(plugin_db.list({ prefix = "" }))
+  end
+end
+-- END one-time v3-to-v4 session-type migration
+
 local function load_state()
   local plugin_db = store()
   local state = default_state()
@@ -311,27 +486,7 @@ local function load_state()
     return state
   end
 
-  local namespace_entries = list_entries(plugin_db.list({ prefix = "" }))
-  local legacy_mutations = {}
-  for _, entry in ipairs(namespace_entries) do
-    if type(entry.key) == "string" and entry.key:sub(1, 3) == "v2/" then
-      table.insert(legacy_mutations, {
-        operation = "delete",
-        key = entry.key,
-        expected_revision = entry.revision or 0,
-      })
-    end
-  end
-  if #legacy_mutations > 0 then
-    if type(plugin_db.batch) ~= "function" then
-      error("legacy_store_cleanup_failed: atomic plugin_db.batch capability is unavailable")
-    end
-    local cleanup = plugin_db.batch({ mutations = legacy_mutations })
-    if type(cleanup) ~= "table" or cleanup.ok ~= true then
-      error("legacy_store_cleanup_failed: " .. tostring(cleanup and (cleanup.error_kind or cleanup.message) or "unknown error"))
-    end
-    namespace_entries = list_entries(plugin_db.list({ prefix = "" }))
-  end
+  local namespace_entries = migrate_v3_store(plugin_db, list_entries(plugin_db.list({ prefix = "" })))
   state._store_key_count = #namespace_entries
   local counter_response = plugin_db.get({ key = STORE_ROOT .. "meta/counters" })
   local counters = record_payload(counter_response)
@@ -609,7 +764,6 @@ local function sourced_step(id, name, position, agent_name, role_prompt, options
     name = name,
     position = position,
     kind = options.kind or "pty",
-    session_template_capability = options.session_template_capability or "botster.pipeline.agent",
     agent_name = agent_name,
     prompt = role_prompt .. "\n\n" .. routing_prompt(),
     allows_open_ticket_dependencies = options.allows_open_ticket_dependencies == true,
@@ -719,31 +873,10 @@ local function reconcile_sourced_pipeline()
   return source
 end
 
-local function step_uses_session_template(step)
+local function step_uses_session_type(step)
   if type(step) ~= "table" then return false end
   local mode = step.kind or step.execution or step.run_mode or step.mode
-  if mode ~= "pty" and mode ~= "session" and mode ~= "session_template" then return false end
-  return step.session_template_id
-    or step.session_template_name
-    or step.template_name
-    or step.session_template_capability
-    or step.session_capability
-end
-
-local function session_template_selector(step)
-  if type(step) ~= "table" then return nil end
-  if type(step.session_template_id) == "string" and step.session_template_id ~= "" then
-    return { kind = "id", template_id = step.session_template_id, value = step.session_template_id }
-  end
-  local name = step.session_template_name or step.template_name
-  if type(name) == "string" and name ~= "" then
-    return { kind = "name", template_name = name, value = name }
-  end
-  local capability = step.session_template_capability or step.session_capability
-  if type(capability) == "string" and capability ~= "" then
-    return { kind = "capability", capability = capability, value = capability }
-  end
-  return nil
+  return mode == "pty" or mode == "session" or mode == "session_type"
 end
 
 local function table_contains(values, expected)
@@ -760,17 +893,22 @@ local function first_required_provider_dependency(step)
     step.provider_dependencies,
     step.required_provider_capabilities,
   }
+  -- A declared entry always yields a descriptor, even an unusable one. Skipping it here would
+  -- drop the whole gate, so a malformed declaration must reach the availability check and fail
+  -- closed rather than disappear.
   for _, source in ipairs(sources) do
     if type(source) == "table" then
       for _, dependency in ipairs(source) do
-        if type(dependency) == "string" and dependency ~= "" then
-          return { dependency = dependency }
+        if type(dependency) == "string" then
+          return { dependency = dependency ~= "" and dependency or nil }
         elseif type(dependency) == "table" then
           return {
             dependency = dependency.dependency or dependency.id or dependency.name or dependency.capability,
             provider = dependency.provider,
             capability = dependency.capability,
           }
+        else
+          return {}
         end
       end
     end
@@ -779,7 +917,10 @@ local function first_required_provider_dependency(step)
 end
 
 local function provider_dependency_available(dependency, capabilities)
-  if not dependency or not dependency.dependency then return true end
+  if not dependency then return true end
+  -- A step that declares a prerequisite it cannot name is a broken declaration, not an absent
+  -- one. Reporting it available would let a declaration silently disable the gate it requested.
+  if type(dependency.dependency) ~= "string" or dependency.dependency == "" then return false end
   local provider_dependencies = capabilities and capabilities.provider_dependencies
   if not provider_dependencies or type(provider_dependencies.check) ~= "function" then return false end
   local ok_response, response = pcall(provider_dependencies.check, dependency)
@@ -795,82 +936,44 @@ local function blocked_diagnostic(code, message, fields)
   return diagnostic_failure(code, message, diagnostic)
 end
 
-local function resolve_from_list(selector, templates)
-  if type(templates) ~= "table" then return nil end
-  for _, template in ipairs(templates) do
-    if selector.kind == "name" and template.name == selector.template_name then
-      return template
-    end
-    if selector.kind == "capability" then
-      if template.capability == selector.capability or table_contains(template.capabilities, selector.capability) then
-        return template
-      end
-    end
-  end
-  return nil
-end
-
-local function resolve_session_template(selector, step, capabilities, target_id)
+local function resolve_session_type_id(arguments, step, capabilities)
   local dependency = first_required_provider_dependency(step)
   if dependency and not provider_dependency_available(dependency, capabilities) then
     return blocked_diagnostic("provider_dependency_missing", "required provider dependency is unavailable", {
       dependency = dependency.dependency,
       provider = dependency.provider,
       capability = dependency.capability,
-      template_selector = selector,
     })
   end
-
-  if selector.kind == "id" then
-    return ok({ template_id = selector.template_id, selector = selector })
-  end
-
-  local session_templates = capabilities and capabilities.session_templates
-  if not session_templates then
-    return blocked_diagnostic("session_template_resolution_unavailable", "hub session template resolution capability is unavailable", {
-      template_selector = selector,
+  local explicit = string_arg(arguments, "session_type_id")
+  if explicit then return ok({ session_type_id = explicit, source = "explicit" }) end
+  local configured = string_arg(step, "session_type_id")
+  if configured then return ok({ session_type_id = configured, source = "step" }) end
+  if step and step.session_type_id_required == true then
+    return blocked_diagnostic("session_type_id_required", "this migrated step requires an operator-supplied session_type_id", {
+      step_id = step.id,
     })
   end
-
-  if type(session_templates.resolve) == "function" then
-    local ok_response, response = pcall(session_templates.resolve, selector)
-    if not ok_response then
-      return blocked_diagnostic("session_template_resolution_failed", tostring(response), {
-        template_selector = selector,
-      })
-    end
-    if type(response) == "table" and response.ok == false then
-      local diagnostic = response.error or response.diagnostic or {}
-      diagnostic.template_selector = diagnostic.template_selector or selector
-      diagnostic.status = diagnostic.status or "blocked"
-      return diagnostic_failure(diagnostic.code or "session_template_unavailable", diagnostic.message or "session template selector is unavailable", diagnostic)
-    end
-    local template_id = response and (response.template_id or response.id)
-    if template_id then
-      return ok({ template_id = template_id, template = response, selector = selector })
+  local config = capabilities and capabilities.config
+  if config and type(config.get) == "function" then
+    local invoked, response = pcall(config.get)
+    if invoked and type(response) == "table" then
+      local configured_value = response.values and response.values.default_session_type_id
+      local fallback = type(configured_value) == "table"
+        and string_arg(configured_value, "value")
+        or string_arg(response.values, "default_session_type_id")
+      if fallback then return ok({ session_type_id = fallback, source = "configuration" }) end
     end
   end
-
-  if type(session_templates.list) == "function" then
-    local ok_response, response = pcall(session_templates.list, { target_id = target_id })
-    if not ok_response then
-      return blocked_diagnostic("session_template_resolution_failed", tostring(response), {
-        template_selector = selector,
-      })
-    end
-    local templates = response and (response.templates or response)
-    local template = resolve_from_list(selector, templates)
-    if template and (template.template_id or template.id) then
-      return ok({ template_id = template.template_id or template.id, template = template, selector = selector })
-    end
-    return blocked_diagnostic("session_template_unavailable", "no hub session template matched selector", {
-      template_selector = selector,
-    })
-  end
-
-  return blocked_diagnostic("session_template_resolution_unavailable", "hub session template resolution capability is unavailable", {
-    template_selector = selector,
-  })
+  -- This is also the upgrade diagnostic. The pre-v4 configuration key was renamed, and the Hub
+  -- only exposes fields the installed manifest declares, so an upgraded install reaches here
+  -- with no default at all. Name the repair in the message: it is what the operator reads in
+  -- run.blocked_reason and in the needs-attention queue.
+  return blocked_diagnostic(
+    "session_type_id_required",
+    "an exact session_type_id is required for PTY-backed pipeline steps; set the package configuration field default_session_type_id and reload the package",
+    { step_id = step and step.id }
+  )
 end
 
 local function bounded_prompt(prompt)
@@ -900,7 +1003,7 @@ local function context_value(arguments, run, ticket, project, step, key)
   return nil
 end
 
-local function build_session_template_request(arguments, run, ticket, project, step)
+local function build_session_type_request(arguments, run, ticket, project, step)
   local prompt = context_value(arguments, run, ticket, project, step, "prompt")
   local metadata = clean_string_map(context_value(arguments, run, ticket, project, step, "metadata"))
   metadata.owner_plugin = metadata.owner_plugin or "project-pipelines"
@@ -925,19 +1028,19 @@ local function build_session_template_request(arguments, run, ticket, project, s
   }
 end
 
-local function spawn_session_template(resolved_template, request)
+local function spawn_session_type(session_type_id, request)
   local capabilities = botster and botster.capabilities or {}
-  local session_templates = capabilities.session_templates
-  if not session_templates then
-    return failure("session_templates_unavailable", "hub session template spawn capability is unavailable")
+  local session_types = capabilities.session_types
+  if not session_types then
+    return failure("session_types_unavailable", "hub session type spawn capability is unavailable")
   end
 
-  if type(session_templates.ensure_worktree_and_spawn) ~= "function" then
-    return failure("session_templates_unavailable", "managed session template spawn capability is unavailable")
+  if type(session_types.ensure_worktree_and_spawn) ~= "function" then
+    return failure("session_types_unavailable", "managed session type spawn capability is unavailable")
   end
-  local operation = session_templates.ensure_worktree_and_spawn
+  local operation = session_types.ensure_worktree_and_spawn
   local dispatched_request = {
-    template_id = resolved_template.template_id,
+    session_type_id = session_type_id,
     target_id = request.target_id,
     branch = request.context and request.context.branch_name,
     environment = request.environment,
@@ -950,7 +1053,7 @@ local function spawn_session_template(resolved_template, request)
   }
   local ok_response, response = pcall(operation, dispatched_request)
   if not ok_response then
-    return failure("session_template_spawn_failed", tostring(response)), dispatched_request
+    return failure("session_type_spawn_failed", tostring(response)), dispatched_request
   end
   if type(response) == "table" and response.ok == true and type(response.result) == "table" then
     return response.result, dispatched_request
@@ -1315,7 +1418,7 @@ local function activate_step(arguments)
     return ok({ activation = existing_activation, run = run })
   end
 
-  if not step_uses_session_template(step) then
+  if not step_uses_session_type(step) then
     run.current_step_id = step.id
     push_event(state, "step_started", run.id, step.id)
     local activation = {
@@ -1323,7 +1426,7 @@ local function activate_step(arguments)
       step_id = step.id,
       spawned = false,
       status = "preserved_non_pty",
-      reason = "step is not a PTY-backed session-template step",
+      reason = "step is not a PTY-backed session-type step",
     }
     push_event(state, "step_activation_preserved", run.id, step.id, activation)
     local err = save_state(state)
@@ -1332,39 +1435,18 @@ local function activate_step(arguments)
   end
 
   request_id = request_id or next_id(state, "session_request")
-  local request = build_session_template_request(arguments, run, ticket, project, step)
+  local request = build_session_type_request(arguments, run, ticket, project, step)
   if not request.target_id or request.target_id == "" then
-    return failure("validation_failed", "spawn target is required for session-template activation", { "target_id" })
+    return failure("validation_failed", "spawn target is required for session-type activation", { "target_id" })
   end
-  local selector = session_template_selector(step)
-  if string_arg(arguments, "session_template_id") then
-    selector = {
-      kind = "id",
-      template_id = string_arg(arguments, "session_template_id"),
-      value = string_arg(arguments, "session_template_id"),
-    }
-  elseif string_arg(arguments, "session_template_name") then
-    selector = {
-      kind = "name",
-      template_name = string_arg(arguments, "session_template_name"),
-      value = string_arg(arguments, "session_template_name"),
-    }
-  elseif string_arg(arguments, "session_template_capability") then
-    selector = {
-      kind = "capability",
-      capability = string_arg(arguments, "session_template_capability"),
-      value = string_arg(arguments, "session_template_capability"),
-    }
-  end
-  local resolved = resolve_session_template(selector, step, botster and botster.capabilities or {}, request.target_id)
+  local resolved = resolve_session_type_id(arguments, step, botster and botster.capabilities or {})
   if resolved and resolved.ok == false then
     local session_request = {
       id = request_id,
       run_id = run.id,
       step_id = step.id,
       ticket_id = ticket.id,
-      template_id = selector and selector.template_id,
-      template_selector = selector,
+      session_type_id = nil,
       session_id = nil,
       status = "blocked",
       request = request,
@@ -1376,8 +1458,7 @@ local function activate_step(arguments)
     run.session_request_id = session_request.id
     run.blocked_reason = resolved.error and resolved.error.message
     run.diagnostic = resolved.error
-    push_event(state, "session_template_spawn_blocked", run.id, session_request.id, {
-      template_selector = selector,
+    push_event(state, "session_type_spawn_blocked", run.id, session_request.id, {
       status = "blocked",
       diagnostic = resolved.error,
     })
@@ -1391,8 +1472,8 @@ local function activate_step(arguments)
     run_id = run.id,
     step_id = step.id,
     ticket_id = ticket.id,
-    template_id = resolved.template_id,
-    template_selector = selector,
+    session_type_id = resolved.session_type_id,
+    session_type_id_source = resolved.source,
     status = "spawning",
     request = request,
     prompt_summary = bounded_prompt(request.context and request.context.prompt),
@@ -1401,7 +1482,7 @@ local function activate_step(arguments)
   local pending_error = save_state(state)
   if pending_error then return pending_error end
 
-  local response, dispatched_request = spawn_session_template(resolved, request)
+  local response, dispatched_request = spawn_session_type(resolved.session_type_id, request)
   state = load_state()
   run = find_by_id(state.runs, run_id)
   session_request = find_by_id(state.session_requests, request_id)
@@ -1420,10 +1501,9 @@ local function activate_step(arguments)
   run.session_request_id = session_request.id
   run.session_id = session_request.session_id
   push_event(state, "step_started", run.id, step.id)
-  local event_kind = status == "failed" and "session_template_spawn_failed" or "session_template_spawn_requested"
+  local event_kind = status == "failed" and "session_type_spawn_failed" or "session_type_spawn_requested"
   push_event(state, event_kind, run.id, session_request.id, {
-    template_id = resolved.template_id,
-    template_selector = selector,
+    session_type_id = resolved.session_type_id,
     session_id = session_request.session_id,
     status = status,
   })
@@ -2433,7 +2513,8 @@ local function update_step(arguments)
   local state = load_state()
   local _, step = find_step_state(state, string_arg(arguments, "step_id"))
   if not step then return failure("not_found", "step not found") end
-  update_fields(step, arguments, { "name", "position", "kind", "agent_name", "prompt", "command", "next_step_id", "on_approved_step_id", "on_changes_requested_step_id", "on_blocked_step_id" })
+  update_fields(step, arguments, { "name", "position", "kind", "agent_name", "prompt", "command", "session_type_id", "next_step_id", "on_approved_step_id", "on_changes_requested_step_id", "on_blocked_step_id" })
+  if string_arg(arguments, "session_type_id") then step.session_type_id_required = nil end
   return persist_response(state, "step", step)
 end
 
@@ -3702,7 +3783,7 @@ local function settings_readiness(context, provider_status)
     provider_status.status
   ))
   local session_status = "available"
-  local session_subtitle = "Session template requests are available for recorded runs."
+  local session_subtitle = "Session type requests are available for recorded runs."
   if summary.failed_sessions > 0 then
     session_status = "failed"
     session_subtitle = tostring(summary.failed_sessions) .. " session request failed."
@@ -3711,8 +3792,8 @@ local function settings_readiness(context, provider_status)
     session_subtitle = tostring(summary.blocked_sessions) .. " session request is blocked."
   end
   table.insert(items, list_item(
-    "project-pipelines-readiness-session-templates",
-    "Session templates",
+    "project-pipelines-readiness-session-types",
+    "Session types",
     session_subtitle,
     session_status
   ))
@@ -3815,10 +3896,10 @@ local function render_settings()
         badge_node("project-pipelines-provider-dependency-status-badge", provider_status.status .. ": " .. tostring(provider_status.blocked_count), provider_status.status == "blocked" and "warning" or "success"),
       }),
       panel_node("project-pipelines-settings-defaults", "Defaults", {
-        text_node("project-pipelines-settings-defaults-summary", "Package configuration supplies optional defaults for spawn targets, session template selection, pipeline mode, and workspace linkage. Standalone records remain valid without workspace configuration."),
+        text_node("project-pipelines-settings-defaults-summary", "Package configuration supplies optional defaults for spawn targets, session type selection, pipeline mode, and workspace linkage. Configuration changes take effect after the package is reloaded. Standalone records remain valid without workspace configuration."),
         list_node("project-pipelines-settings-default-fields", {
           list_item("project-pipelines-settings-default-spawn-target", "Default spawn target", "default_spawn_target_id", "config"),
-          list_item("project-pipelines-settings-default-session-template", "Default session template", "default_session_template_selector", "config"),
+          list_item("project-pipelines-settings-default-session-type", "Default session type", "default_session_type_id", "config"),
           list_item("project-pipelines-settings-default-pipeline-mode", "Default pipeline mode", "default_pipeline_mode", "config"),
           list_item("project-pipelines-settings-workspace-id", "Workspace id", "workspace_id", "config"),
         }),
@@ -4302,6 +4383,9 @@ local TOOL_CONTRACTS = {
                 ["enum"] = {
                   "agent",
                   "command",
+                  "pty",
+                  "session",
+                  "session_type",
                 },
                 ["type"] = "string",
               },
@@ -4324,6 +4408,36 @@ local TOOL_CONTRACTS = {
                 ["type"] = "integer",
               },
               ["prompt"] = {
+                ["type"] = "string",
+              },
+              ["required_provider_dependencies"] = {
+                ["items"] = {
+                  ["oneOf"] = {
+                    {
+                      ["type"] = "string",
+                    },
+                    {
+                      ["properties"] = {
+                        ["capability"] = {
+                          ["type"] = "string",
+                        },
+                        ["dependency"] = {
+                          ["type"] = "string",
+                        },
+                        ["provider"] = {
+                          ["type"] = "string",
+                        },
+                      },
+                      ["required"] = {
+                        "dependency",
+                      },
+                      ["type"] = "object",
+                    },
+                  },
+                },
+                ["type"] = "array",
+              },
+              ["session_type_id"] = {
                 ["type"] = "string",
               },
             },
@@ -5034,14 +5148,6 @@ local TOOL_CONTRACTS = {
         ["prompt"] = {
           ["type"] = "string",
         },
-        ["session_type"] = {
-          ["default"] = "agent",
-          ["enum"] = {
-            "agent",
-            "accessory",
-          },
-          ["type"] = "string",
-        },
         ["ticket_id"] = {
           ["type"] = "string",
         },
@@ -5499,18 +5605,21 @@ extend_contract("create_ticket", {
 }, { "project_id", "title" })
 TOOL_CONTRACTS.create_ticket.description = "Create a project ticket. dependency_ticket_ids is an optional array of ticket IDs that is validated and atomically registered as normalized blocking dependency rows; it is never persisted on the ticket payload."
 extend_contract("create_pipeline", { project_id = STRING_PROPERTY })
+extend_contract("create_step", { session_type_id = STRING_PROPERTY })
+extend_contract("update_step", { session_type_id = STRING_PROPERTY })
 extend_contract("start_run", {
   id = STRING_PROPERTY, spawn_target_id = STRING_PROPERTY, branch = STRING_PROPERTY,
   worktree = OBJECT_PROPERTY, worktree_id = STRING_PROPERTY,
 }, { "ticket_id", "pipeline_id" })
 extend_contract("spawn_ticket_session", {
   run_id = STRING_PROPERTY, step_id = STRING_PROPERTY, request_id = STRING_PROPERTY,
-  session_template_id = STRING_PROPERTY, session_template_name = STRING_PROPERTY,
-  session_template_capability = STRING_PROPERTY,
+  session_type_id = STRING_PROPERTY, branch = STRING_PROPERTY,
+  spawn_target_id = STRING_PROPERTY, environment = OBJECT_PROPERTY, metadata = OBJECT_PROPERTY,
 }, { "run_id" })
 TOOL_CONTRACTS.spawn_ticket_session.input_schema.properties.accessory_name = nil
-TOOL_CONTRACTS.spawn_ticket_session.input_schema.properties.session_type = nil
+TOOL_CONTRACTS.spawn_ticket_session.input_schema.properties.agent_name = nil
 TOOL_CONTRACTS.spawn_ticket_session.input_schema.properties.ticket_id = nil
+TOOL_CONTRACTS.spawn_ticket_session.input_schema.properties.workspace_name = nil
 TOOL_CONTRACTS.spawn_ticket_session.description = "Spawn the current pipeline step's configured agent session for a durable run, using a correlated request so retries cannot dispatch twice."
 extend_contract("request_merge", { run_id = STRING_PROPERTY }, { "run_id" })
 TOOL_CONTRACTS.request_merge.input_schema.properties = { run_id = STRING_PROPERTY }

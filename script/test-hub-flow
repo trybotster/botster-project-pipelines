@@ -9,7 +9,7 @@ require "json"
 ROOT = File.expand_path("..", __dir__)
 # This pin is the merged Hub revision for the contract proven by this package.
 # README.md documents when and how to advance it.
-EXPECTED_HUB_COMMIT = "11d73d27e01732981e803041ea702aa09db57112"
+EXPECTED_HUB_COMMIT = "8a60bd58841179f8b1fd4040d9362d18ea244230"
 
 def required_executable(name)
   path = File.expand_path(ENV.fetch(name) { raise "#{name} must point at an executable" }, ROOT)
@@ -63,6 +63,7 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
 
     require "json"
     require "socket"
+    require "timeout"
 
     context_json = IO.popen([
       ENV.fetch("BOTSTER_HUB_BIN"),
@@ -96,7 +97,7 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
       protocol: "botster-hub-daemon-v1",
       compatibility: {
         protocol: "botster-hub-daemon-v1",
-        minimum_protocol_version: 1,
+        protocol_version: 6,
         required_features: [],
         minimum_conformance_fixture_revision: 1,
         client_name: "downstream-workspaces-plan-agent"
@@ -139,6 +140,9 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
       gate_id: gate.dig("gate_result", "gate_id"),
       step_id: advance["step_id"]
     }))
+    Timeout.timeout(120) do
+      sleep 0.05 until File.file?("release-downstream-plan")
+    end
   RUBY
   File.chmod(0o755, plan_script)
   File.write(
@@ -151,8 +155,14 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
       source: { type: "path", path: "." },
       capabilities: [{ surface: "surfaces" }],
       entrypoints: [{ runtime: "lua", path: "plugin.lua", bootstrap: false }],
-      session_templates: [{
+      session_types: [{
         id: "plan",
+        label: "Downstream Plan",
+        description: "Deterministic downstream Plan acceptance session.",
+        role: "botster.agent",
+        interaction: "interactive",
+        traits: ["pipeline-step", "worktree-aware"],
+        lifecycle: "task",
         command: "bin/plan.rb",
         target_id: "tgt_71266a8d976d4535902ffed09c18a7ba",
         context: ["prompt", "ticket_id", "metadata.run_id"]
@@ -191,6 +201,19 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
     run!(hub, "packages", "install", "--data-dir", data_dir, "--path", template_root)
     run!(hub, "packages", "enable", "--data-dir", data_dir, "downstream-plan.fixture")
     run!(hub, "packages", "install", "--data-dir", data_dir, "--path", ROOT)
+    # An upgraded install reaches the enabled worker with no effective default: the Hub only
+    # exposes configuration fields the installed manifest declares, and 0.3.0 renamed the key.
+    # Enable first without configuring it so that exact state is proven against the real Hub,
+    # then apply the documented operator repair and reload before the primary acceptance run.
+    run!(hub, "packages", "enable", "--data-dir", data_dir, "project-pipelines")
+    run!(File.join(ROOT, "script", "hub_acceptance_smoke"), socket_path, "verify_upgrade_gap", downstream_root)
+    run!(
+      hub,
+      "packages", "config", "set", "--data-dir", data_dir,
+      "project-pipelines",
+      JSON.generate({ default_session_type_id: { type: "string", value: "downstream-plan.fixture/plan" } })
+    )
+    run!(hub, "packages", "disable", "--data-dir", data_dir, "project-pipelines")
     run!(hub, "packages", "enable", "--data-dir", data_dir, "project-pipelines")
     run!(File.join(ROOT, "script", "hub_acceptance_smoke"), socket_path, "primary", downstream_root)
 

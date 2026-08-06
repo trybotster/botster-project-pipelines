@@ -8,22 +8,28 @@ python3 -m json.tool fixtures/project_pipelines/domain_contract.json >/dev/null
 python3 - <<'PY'
 import json
 import re
+import subprocess
 from pathlib import Path
 
 manifest = json.loads(Path("botster-package.json").read_text())
 fixture = json.loads(Path("fixtures/project_pipelines/domain_contract.json").read_text())
 source = Path("plugin.lua").read_text()
 assert manifest["name"] == "project-pipelines"
-assert manifest["version"] == "0.2.0"
+assert manifest["version"] == "0.3.0"
 assert manifest["entrypoints"] == [{"runtime": "lua", "path": "plugin.lua", "bootstrap": False}]
 assert {capability["surface"] for capability in manifest["capabilities"]} == {
     "surfaces", "mcp", "plugin_db", "session_actions"
 }
+session_action = next(capability for capability in manifest["capabilities"] if capability["surface"] == "session_actions")
+assert session_action["scope"] == "session_type_managed_git_spawn"
+configuration_fields = {field["key"] for field in manifest["configuration"]["fields"]}
+assert "default_session_type_id" in configuration_fields
 assert "require(" not in source
 assert "plugin_db.batch" in source
-assert 'STORE_ROOT = "v3/"' in source
-assert fixture["contract_version"] == 3
-assert fixture["persistence_boundaries"]["runtime_storage_namespace"] == "v3/<family>/<id>"
+assert 'STORE_ROOT = "v4/"' in source
+assert "session_types.resolve" not in source
+assert fixture["contract_version"] == 4
+assert fixture["persistence_boundaries"]["runtime_storage_namespace"] == "v4/<family>/<id>"
 for family in ["project_target", "ticket_dependency", "run_step"]:
     assert family in fixture["domain_objects"]
 surface_ids = {surface["id"] for surface in manifest["surfaces"]}
@@ -38,6 +44,38 @@ for phrase in ["Persistence Boundaries", "entity_provider", "provider-specific m
     assert phrase in domain_contract
 for dead_name in ["empty_schema", "repository_from", "show_project", "show_ticket", "update_ticket_status", "list_pipeline_definitions", "record_run", "run_status_tone"]:
     assert f"local function {dead_name}" not in source
+
+legacy_field_pattern = re.compile(
+    r"session[_ -]?" + r"template|" + r"template" + r"_id|" + r"template" + r"_name|session_" + r"capability",
+    re.I,
+)
+for known_positive in [
+    "session_" + "template",
+    "session " + "template",
+    "template" + "_id",
+    "template" + "_name",
+    "session_" + "capability",
+]:
+    assert legacy_field_pattern.search(known_positive), f"legacy guard missed known positive: {known_positive}"
+assert not legacy_field_pattern.search("session_type_id"), "legacy guard rejected authoritative identity"
+allowed_blocks = {
+    "plugin.lua": ("-- BEGIN one-time v3-to-v4 session-type migration", "-- END one-time v3-to-v4 session-type migration"),
+    "script/test": ("-- BEGIN v3 migration seed fixture", "-- END v3 migration seed fixture"),
+    # An operator upgrading from 0.2.0 has to recognize the retired configuration key by name.
+    # It is documentation of a key the package no longer reads, not a live code path.
+    "README.md": ("<!-- BEGIN retired configuration key upgrade note -->", "<!-- END retired configuration key upgrade note -->"),
+}
+for relative_path in subprocess.check_output(["git", "ls-files"], text=True).splitlines():
+    path = Path(relative_path)
+    if not path.is_file():
+        continue
+    text = path.read_text(errors="ignore")
+    markers = allowed_blocks.get(relative_path)
+    if markers:
+        start, finish = markers
+        text = re.sub(re.escape(start) + r".*?" + re.escape(finish), "", text, flags=re.S)
+    match = legacy_field_pattern.search(text)
+    assert not match, f"legacy session selector remains outside migrator/seed fixture in {relative_path}: {match.group(0)}"
 
 scan_paths = [
     ".gitignore", "README.md", "botster-package.json", "plugin.lua",
@@ -137,6 +175,7 @@ local function batch(args)
 end
 
 local spawned = {}
+local default_session_type_id = nil
 botster = {
   capabilities = {
     plugin_db = {
@@ -147,15 +186,11 @@ botster = {
       list = list,
       batch = batch,
     },
-    config = { get = function() return { values = {} } end },
-    session_templates = {
-      list = function()
-        return { templates = { { id = "template_codex", name = "Codex", capabilities = { "codex" } } } }
-      end,
-      spawn = function(args)
-        table.insert(spawned, copy(args))
-        return { ok = true, result = { request_id = args.request_id, session_uuid = "session-" .. tostring(#spawned) } }
-      end,
+    config = { get = function()
+      local value = default_session_type_id and { type = "string", value = default_session_type_id } or nil
+      return { values = { default_session_type_id = value } }
+    end },
+    session_types = {
       ensure_worktree_and_spawn = function(args)
         table.insert(spawned, copy(args))
         return { session_id = "session-" .. tostring(#spawned), worktree_id = "worktree-" .. tostring(#spawned) }
@@ -240,6 +275,48 @@ assert(descriptors["project_pipelines.create_checklist"].input_schema.properties
 assert(descriptors["project_pipelines.list_checklists"].input_schema.properties.run_id.type == "string")
 assert(descriptors["project_pipelines.retry_step_agent"].input_schema.required[1] == "run_id")
 assert(descriptors["project_pipelines.remove_project_target"].input_schema.properties.project_target_id.type == "string")
+local spawn_properties = descriptors["project_pipelines.spawn_ticket_session"].input_schema.properties
+assert(spawn_properties.session_type_id and not spawn_properties.session_type)
+assert(not spawn_properties.session_type_name and not spawn_properties.session_type_capability)
+local expected_spawn_properties = {
+  branch = true, environment = true, metadata = true, prompt = true,
+  request_id = true, run_id = true, session_type_id = true,
+  spawn_target_id = true, step_id = true, workspace_id = true,
+}
+for property in pairs(spawn_properties) do
+  assert(expected_spawn_properties[property], "unexpected spawn_ticket_session property " .. property)
+  expected_spawn_properties[property] = nil
+end
+assert(next(expected_spawn_properties) == nil, "spawn_ticket_session property set is incomplete")
+assert(descriptors["project_pipelines.update_step"].input_schema.properties.session_type_id.type == "string")
+-- Mode is now the only session-type admission input, so the published step schema must name
+-- every admitted mode and the identity that mode requires.
+local pipeline_step_schema = descriptors["project_pipelines.create_pipeline"].input_schema.properties.steps.items
+assert(pipeline_step_schema.properties.session_type_id.type == "string",
+  "create_pipeline steps must publish the authoritative session type identity")
+local published_kinds = {}
+for _, kind in ipairs(pipeline_step_schema.properties.kind.enum) do published_kinds[kind] = true end
+for _, kind in ipairs({ "agent", "command", "pty", "session", "session_type" }) do
+  assert(published_kinds[kind], "create_pipeline step kind enum omits " .. kind)
+  published_kinds[kind] = nil
+end
+assert(next(published_kinds) == nil, "create_pipeline step kind enum publishes an unhandled mode")
+-- Provider prerequisites gate spawn before session-type resolution, so the acceptance path
+-- that proves the block must be constructible from discovery alone.
+local published_dependencies = pipeline_step_schema.properties.required_provider_dependencies
+assert(published_dependencies.type == "array", "create_pipeline steps must publish provider prerequisites")
+assert(published_dependencies.items.oneOf[1].type == "string", "provider prerequisites must publish their id-string form")
+local published_dependency_object = published_dependencies.items.oneOf[2]
+assert(published_dependency_object.type == "object")
+for _, field in ipairs({ "dependency", "provider", "capability" }) do
+  assert(published_dependency_object.properties[field].type == "string",
+    "provider prerequisite object omits " .. field)
+end
+-- Without a required identity the published object admits {} and {provider="github"}, and the
+-- handler used to read those as "nothing to check" and continue. The contract must not offer a
+-- shape that disables the gate it declares.
+assert(#published_dependency_object.required == 1 and published_dependency_object.required[1] == "dependency",
+  "the published provider prerequisite object must require a usable identity")
 
 for _, name in ipairs({
   "add_project_target", "remove_project_target", "update_project", "delete_project",
@@ -315,10 +392,10 @@ assert(durable_dependency_run.ok)
 
 -- Reproduce the observed production/import shape. The normalized dependency row
 -- is durable and the ticket payload has no embedded dependency mirror.
-durable_store["v3/tickets/durable-dependent"].payload.dependency_ticket_ids = nil
-durable_store["v3/ticket_dependencies/durable-dependency-row"] = {
-  key = "v3/ticket_dependencies/durable-dependency-row",
-  schema_version = 3,
+durable_store["v4/tickets/durable-dependent"].payload.dependency_ticket_ids = nil
+durable_store["v4/ticket_dependencies/durable-dependency-row"] = {
+  key = "v4/ticket_dependencies/durable-dependency-row",
+  schema_version = 4,
   revision = 1,
   payload = {
     id = "durable-dependency-row",
@@ -361,10 +438,10 @@ local authored_dependency_ticket = tools["project_pipelines.create_ticket"]({
 assert(authored_dependency_ticket.ok and authored_dependency_ticket.ticket.dependency_ticket_ids == nil)
 local authored_rows = tools["project_pipelines.list_ticket_dependencies"]({ ticket_id = "authored-dependencies" }).dependencies
 assert(#authored_rows == 1 and authored_rows[1].depends_on_ticket_id == "durable-dependency-open")
-durable_store["v3/tickets/authored-dependencies"].payload.dependency_ticket_ids = { "non-authoritative-mirror" }
+durable_store["v4/tickets/authored-dependencies"].payload.dependency_ticket_ids = { "non-authoritative-mirror" }
 assert(tools["project_pipelines.get_ticket"]({ ticket_id = "authored-dependencies" }).ticket.dependency_ticket_ids == nil)
 assert(tools["project_pipelines.update_ticket"]({ ticket_id = "authored-dependencies", description = "Mirror removed" }).ok)
-assert(durable_store["v3/tickets/authored-dependencies"].payload.dependency_ticket_ids == nil,
+assert(durable_store["v4/tickets/authored-dependencies"].payload.dependency_ticket_ids == nil,
   "next atomic write must remove a non-authoritative ticket mirror")
 local tickets_before_invalid_create = #tools["project_pipelines.list_tickets"]({}).tickets
 local invalid_authored_dependency = tools["project_pipelines.create_ticket"]({
@@ -375,7 +452,7 @@ assert(not invalid_authored_dependency.ok and invalid_authored_dependency.error.
 assert(#tools["project_pipelines.list_tickets"]({}).tickets == tickets_before_invalid_create,
   "invalid authored dependencies must create neither ticket nor normalized rows")
 assert(#tools["project_pipelines.list_ticket_dependencies"]({ ticket_id = "invalid-authored-dependencies" }).dependencies == 0)
-fail_batch_key_prefix = "v3/tickets/atomic-authored-dependencies"
+fail_batch_key_prefix = "v4/tickets/atomic-authored-dependencies"
 local failed_authored_dependency = tools["project_pipelines.create_ticket"]({
   id = "atomic-authored-dependencies", project_id = "project-one", title = "Atomic authored dependencies",
   dependency_ticket_ids = { "durable-dependency-open" },
@@ -396,7 +473,7 @@ assert(tools["project_pipelines.create_pipeline"]({
     },
     {
       id = "waiting-implement", name = "Implement", kind = "pty",
-      session_template_id = "template_codex",
+      session_type_id = "codex-session-type",
     },
   },
 }).ok)
@@ -486,7 +563,7 @@ assert(tools["project_pipelines.submit_review"]({
   run_id = "waiting-recovery-run", run_step_id = recovery_started.run_step.id,
   step_id = "waiting-plan-review", verdict = "approved",
 }).ok)
-fail_batch_key_prefix = "v3/run_steps/"
+fail_batch_key_prefix = "v4/run_steps/"
 local interrupted_advance = tools["project_pipelines.request_step_advance"]({
   run_id = "waiting-recovery-run", request_id = "waiting-recovery-advance",
 })
@@ -578,7 +655,7 @@ assert(restarted_waiting_tools["project_pipelines.update_ticket"]({
 assert_woken_once(restart_scenario)
 
 local missing_scenario = create_waiting_scenario("waiting-missing", 1)
-durable_store["v3/tickets/" .. missing_scenario.dependency_ids[1]] = nil
+durable_store["v4/tickets/" .. missing_scenario.dependency_ids[1]] = nil
 local missing_plugin = dofile("plugin.lua")
 local missing_tools = {}
 for _, descriptor in ipairs(missing_plugin.tools) do missing_tools[descriptor.name] = descriptor.call end
@@ -707,7 +784,7 @@ assert(tools["project_pipelines.create_pipeline"]({
       on_changes_requested_step_id = "authorization-rework",
       gates = { { id = "authorization-gate", prompt = "Prove authorization before advancing" } },
     },
-    { id = "authorization-implement", name = "Implement", kind = "pty", session_template_id = "template_codex" },
+    { id = "authorization-implement", name = "Implement", kind = "pty", session_type_id = "codex-session-type" },
     { id = "authorization-rework", name = "Rework" },
   },
 }).ok)
@@ -1004,7 +1081,7 @@ assert(tools["project_pipelines.add_ticket_dependency"]({
 }).ok)
 assert(tools["project_pipelines.update_ticket"]({ ticket_id = "dependency-open", status = "closed" }).ok)
 
-fail_batch_key_prefix = "v3/run_steps/"
+fail_batch_key_prefix = "v4/run_steps/"
 local failed = tools["project_pipelines.start_run"]({
   id = "run-atomic", ticket_id = "ticket-blocked", pipeline_id = "pipeline-two-step",
 })
@@ -1022,7 +1099,7 @@ local started = tools["project_pipelines.start_run"]({
 assert(started.ok and started.ticket.status == "active")
 assert(started.run.current_run_step_id == started.run_step.id)
 assert(#tools["project_pipelines.get_ticket"]({ ticket_id = "ticket-blocked" }).runs == 1)
-fail_batch_key_prefix = "v3/run_steps/"
+fail_batch_key_prefix = "v4/run_steps/"
 local failed_child = tools["project_pipelines.create_child_run"]({
   id = "run-child", ticket_id = "ticket-child", parent_run_id = "run-atomic", title = "Child",
 })
@@ -1118,7 +1195,7 @@ assert(tools["project_pipelines.create_ticket"]({
 assert(tools["project_pipelines.start_run"]({
   id = "run-merge", ticket_id = "ticket-merge", pipeline_id = "pipeline-two-step",
 }).ok)
-fail_batch_key_prefix = "v3/run_steps/"
+fail_batch_key_prefix = "v4/run_steps/"
 assert(not tools["project_pipelines.request_merge"]({ run_id = "run-merge" }).ok)
 local merge_failure = tools["project_pipelines.current_context"]({ run_id = "run-merge" })
 assert(merge_failure.runs[1].status == "active")
@@ -1134,7 +1211,7 @@ assert(tools["project_pipelines.request_merge"]({ run_id = "run-merge" }).ok)
 
 assert(tools["project_pipelines.create_pipeline"]({
   id = "pipeline-spawn", name = "Spawn",
-  steps = { { id = "spawn-step", name = "Spawn", kind = "pty", session_template_id = "template_codex" } },
+  steps = { { id = "spawn-step", name = "Spawn", kind = "pty", session_type_id = "step-session-type" } },
 }).ok)
 assert(tools["project_pipelines.create_ticket"]({
   id = "ticket-spawn", project_id = "project-one", target_id = "target-one", title = "Spawn",
@@ -1143,12 +1220,282 @@ assert(tools["project_pipelines.start_run"]({
   id = "run-spawn", ticket_id = "ticket-spawn", pipeline_id = "pipeline-spawn",
 }).ok)
 local first_spawn = tools["project_pipelines.spawn_ticket_session"]({
-  run_id = "run-spawn", request_id = "spawn-once", session_template_id = "template_codex",
+  run_id = "run-spawn", request_id = "spawn-once", session_type_id = "explicit-session-type",
 })
 assert(first_spawn.ok and #spawned == 1, "first correlated spawn must dispatch once")
+assert(spawned[1].session_type_id == "explicit-session-type", "explicit session_type_id must win")
 local retry_spawn = tools["project_pipelines.retry_step_agent"]({ run_id = "run-spawn" })
 assert(retry_spawn.ok and retry_spawn.activation.id == first_spawn.activation.id, "retry must reuse durable spawn result")
 assert(#spawned == 1, "retry must not dispatch a second managed spawn")
+
+assert(tools["project_pipelines.create_ticket"]({
+  id = "ticket-step-type", project_id = "project-one", target_id = "target-one", title = "Step type",
+}).ok)
+assert(tools["project_pipelines.start_run"]({
+  id = "run-step-type", ticket_id = "ticket-step-type", pipeline_id = "pipeline-spawn",
+}).ok)
+local step_spawn = tools["project_pipelines.spawn_ticket_session"]({
+  run_id = "run-step-type", request_id = "spawn-step-type",
+})
+assert(step_spawn.ok and spawned[2].session_type_id == "step-session-type", "step session_type_id must beat configuration")
+
+default_session_type_id = "configured-session-type"
+assert(tools["project_pipelines.create_ticket"]({
+  id = "ticket-config-type", project_id = "project-one", target_id = "target-one", title = "Configured type",
+}).ok)
+assert(tools["project_pipelines.start_run"]({
+  id = "run-config-type", ticket_id = "ticket-config-type", pipeline_id = "botster_stack_delivery",
+}).ok)
+local configured_spawn = tools["project_pipelines.spawn_ticket_session"]({
+  run_id = "run-config-type", request_id = "spawn-config-type",
+})
+assert(configured_spawn.ok and spawned[3].session_type_id == "configured-session-type", "sourced PTY step must consume default_session_type_id")
+default_session_type_id = nil
+
+assert(tools["project_pipelines.create_pipeline"]({
+  id = "pipeline-missing-type", name = "Missing type",
+  steps = { { id = "missing-type-step", name = "Missing type", kind = "pty" } },
+}).ok)
+assert(tools["project_pipelines.create_ticket"]({
+  id = "ticket-missing-type", project_id = "project-one", target_id = "target-one", title = "Missing type",
+}).ok)
+assert(tools["project_pipelines.start_run"]({
+  id = "run-missing-type", ticket_id = "ticket-missing-type", pipeline_id = "pipeline-missing-type",
+}).ok)
+local missing_type = tools["project_pipelines.spawn_ticket_session"]({
+  run_id = "run-missing-type", request_id = "spawn-missing-type",
+})
+assert(not missing_type.ok and missing_type.error.code == "session_type_id_required", "PTY steps without an exact id must fail loudly")
+-- This is also the 0.2.0 -> 0.3.0 upgrade path: the renamed configuration key leaves an
+-- upgraded install with no effective default, so the diagnostic an operator reads must name
+-- the field to set, and it must reach run.blocked_reason and the attention queue unchanged.
+assert(missing_type.error.message:find("default_session_type_id", 1, true),
+  "the blocked diagnostic must name the configuration field an operator has to set")
+local missing_type_context = tools["project_pipelines.current_context"]({ run_id = "run-missing-type" })
+assert(missing_type_context.run.blocked_reason == missing_type.error.message,
+  "run.blocked_reason must carry the operator repair verbatim")
+local missing_type_attention = collect_nodes(home_surface())["project-pipelines-attention-session-spawn-missing-type-subtitle-text"]
+assert(missing_type_attention and missing_type_attention.props.text:find("default_session_type_id", 1, true),
+  "the attention queue must surface the operator repair")
+assert(tools["project_pipelines.update_step"]({
+  step_id = "missing-type-step", session_type_id = "repaired-session-type",
+}).step.session_type_id == "repaired-session-type")
+local repaired_spawn = tools["project_pipelines.spawn_ticket_session"]({
+  run_id = "run-missing-type", request_id = "spawn-repaired-type",
+})
+assert(repaired_spawn.ok and spawned[4].session_type_id == "repaired-session-type", "update_step must repair a missing exact id")
+
+assert(tools["project_pipelines.create_pipeline"]({
+  id = "pipeline-command", name = "Command",
+  steps = { { id = "command-step", name = "Command", kind = "command", command = "true" } },
+}).ok)
+assert(tools["project_pipelines.create_ticket"]({
+  id = "ticket-command", project_id = "project-one", target_id = "target-one", title = "Command",
+}).ok)
+assert(tools["project_pipelines.start_run"]({
+  id = "run-command", ticket_id = "ticket-command", pipeline_id = "pipeline-command",
+}).ok)
+local command_activation = tools["project_pipelines.spawn_ticket_session"]({ run_id = "run-command" })
+assert(command_activation.ok and command_activation.activation.status == "preserved_non_pty", "command steps must remain non-spawning")
+assert(#spawned == 4, "non-PTY activation must not dispatch")
+
+-- The cut deleted the selector fields the pre-cut predicate also required, so step mode is
+-- now the only admission input. Pin the whole admitted set rather than one example; `pty` and
+-- `command` are already proven above.
+do
+  local cases = {
+    { kind = "session", admitted = true },
+    { kind = "session_type", admitted = true },
+    { kind = "agent", admitted = false },
+    { kind = "review", admitted = false },
+    { kind = nil, admitted = false },
+  }
+  for _, case in ipairs(cases) do
+    local suffix = "kind-" .. tostring(case.kind or "unset")
+    assert(tools["project_pipelines.create_pipeline"]({
+      id = "pipeline-" .. suffix, name = "Kind " .. suffix,
+      steps = { { id = suffix .. "-step", name = "Kind step", kind = case.kind, session_type_id = "kind-session-type" } },
+    }).ok)
+    assert(tools["project_pipelines.create_ticket"]({
+      id = "ticket-" .. suffix, project_id = "project-one", target_id = "target-one", title = "Kind " .. suffix,
+    }).ok)
+    assert(tools["project_pipelines.start_run"]({
+      id = "run-" .. suffix, ticket_id = "ticket-" .. suffix, pipeline_id = "pipeline-" .. suffix,
+    }).ok)
+    local dispatched_before = #spawned
+    local activation = tools["project_pipelines.spawn_ticket_session"]({ run_id = "run-" .. suffix })
+    assert(activation.ok, "activation of " .. suffix .. " failed")
+    if case.admitted then
+      assert(activation.activation.status == "spawn_requested", suffix .. " must reach the session-type spawn path")
+      assert(#spawned == dispatched_before + 1 and spawned[#spawned].session_type_id == "kind-session-type",
+        suffix .. " must dispatch exactly one managed spawn")
+    else
+      assert(activation.activation.status == "preserved_non_pty",
+        suffix .. " must preserve pre-cut non-spawning behavior")
+      assert(#spawned == dispatched_before, suffix .. " must not dispatch")
+    end
+  end
+end
+
+-- Provider prerequisites gate spawn before session-type resolution. Every declaration shape a
+-- step can carry -- including the malformed ones the published schema now forbids -- has to be
+-- checked, never treated as "nothing declared". `provider_dependencies` is not a Hub Lua
+-- capability, so any named prerequisite is unconditionally unavailable and every case below
+-- must block; the final case proves the gate did not become universal.
+do
+  local cases = {
+    { suffix = "named-object", declaration = { { dependency = "github_auth", provider = "github" } }, blocks = true },
+    { suffix = "capability-object", declaration = { { capability = "github.auth" } }, blocks = true },
+    { suffix = "provider-only", declaration = { { provider = "github" } }, blocks = true },
+    { suffix = "empty-object", declaration = { {} }, blocks = true },
+    { suffix = "string", declaration = { "github_auth" }, blocks = true },
+    { suffix = "empty-string", declaration = { "" }, blocks = true },
+    { suffix = "non-entry", declaration = { 7 }, blocks = true },
+    { suffix = "undeclared", declaration = nil, blocks = false },
+  }
+  for _, case in ipairs(cases) do
+    local id = "provider-" .. case.suffix
+    assert(tools["project_pipelines.create_pipeline"]({
+      id = "pipeline-" .. id, name = "Provider " .. case.suffix,
+      steps = { {
+        id = id .. "-step", name = "Provider step", kind = "pty", session_type_id = "provider-session-type",
+        required_provider_dependencies = case.declaration,
+      } },
+    }).ok)
+    assert(tools["project_pipelines.create_ticket"]({
+      id = "ticket-" .. id, project_id = "project-one", target_id = "target-one", title = "Provider " .. case.suffix,
+    }).ok)
+    assert(tools["project_pipelines.start_run"]({
+      id = "run-" .. id, ticket_id = "ticket-" .. id, pipeline_id = "pipeline-" .. id,
+    }).ok)
+    local dispatched_before = #spawned
+    local activation = tools["project_pipelines.spawn_ticket_session"]({
+      run_id = "run-" .. id, request_id = "request-" .. id,
+    })
+    if case.blocks then
+      assert(not activation.ok and activation.error.code == "provider_dependency_missing",
+        "declaration shape " .. case.suffix .. " bypassed the provider gate")
+      assert(#spawned == dispatched_before, "declaration shape " .. case.suffix .. " dispatched a spawn")
+      local blocked_request = context_for("run-" .. id).session_requests[1]
+      assert(blocked_request and blocked_request.status == "blocked" and not blocked_request.session_id,
+        "declaration shape " .. case.suffix .. " did not persist a blocked request")
+    else
+      assert(activation.ok and #spawned == dispatched_before + 1,
+        "a step declaring no prerequisite must still spawn")
+    end
+  end
+end
+
+-- The fail-closed ticket-dependency gate and session-type resolution now live in the same
+-- activation path and merged without a textual conflict, so no review has ever seen them
+-- executed together. Cross them explicitly: which gate wins, what each one persists, and
+-- that the two blocked vocabularies are each counted exactly once by the operator queue.
+do
+  assert(tools["project_pipelines.create_pipeline"]({
+    id = "pipeline-crossed", name = "Crossed gates",
+    steps = {
+      { id = "crossed-plan", name = "Plan", allows_open_ticket_dependencies = true, on_approved_step_id = "crossed-implement" },
+      { id = "crossed-implement", name = "Implement", kind = "pty", session_type_id = "crossed-session-type" },
+      { id = "crossed-unresolvable", name = "Unresolvable", kind = "pty" },
+      {
+        id = "crossed-exempt", name = "Exempt", kind = "pty", allows_open_ticket_dependencies = true,
+        session_type_id = "crossed-exempt-session-type",
+      },
+    },
+  }).ok)
+  local function start_crossed_run(prefix, blocker_id)
+    assert(tools["project_pipelines.create_ticket"]({
+      id = prefix .. "-ticket", project_id = "project-one", target_id = "target-one", title = prefix,
+    }).ok)
+    assert(tools["project_pipelines.start_run"]({
+      id = prefix .. "-run", ticket_id = prefix .. "-ticket", pipeline_id = "pipeline-crossed",
+    }).ok)
+    if blocker_id then
+      assert(tools["project_pipelines.create_ticket"]({
+        id = blocker_id, project_id = "project-one", title = blocker_id,
+      }).ok)
+      assert(tools["project_pipelines.add_ticket_dependency"]({
+        id = prefix .. "-row", ticket_id = prefix .. "-ticket", dependency_ticket_id = blocker_id,
+      }).ok)
+    end
+    return prefix .. "-run"
+  end
+
+  -- (a) An open dependency wins over session-type resolution and leaves no session-type trace.
+  local gated_run = start_crossed_run("crossed", "crossed-blocker")
+  local dispatched = #spawned
+  local gated = tools["project_pipelines.spawn_ticket_session"]({
+    run_id = gated_run, step_id = "crossed-implement", request_id = "crossed-gated",
+  })
+  assert(not gated.ok and gated.error.code == "ticket_dependencies_unmet",
+    "the dependency gate must decide before session-type resolution")
+  local gated_context = context_for(gated_run)
+  assert(gated_context.run.blocked_transition and gated_context.run.blocked_transition.step_id == "crossed-implement")
+  assert(#gated_context.session_requests == 0, "a dependency-blocked PTY step must persist no session request")
+  assert(gated_context.run.blocked_reason == nil and gated_context.run.diagnostic == nil,
+    "the dependency gate must not write session-type diagnostics")
+  assert(count_events(gated_run, "session_type_spawn_blocked") == 0)
+  assert(#spawned == dispatched, "a dependency-blocked PTY step must not dispatch")
+
+  -- (c) With dependencies satisfied, an unresolvable session type blocks in the other vocabulary.
+  local unresolvable_run = start_crossed_run("crossed-unresolved")
+  local unresolvable = tools["project_pipelines.spawn_ticket_session"]({
+    run_id = unresolvable_run, step_id = "crossed-unresolvable", request_id = "crossed-unresolved-request",
+  })
+  assert(not unresolvable.ok and unresolvable.error.code == "session_type_id_required")
+  local unresolvable_context = context_for(unresolvable_run)
+  assert(#unresolvable_context.session_requests == 1 and unresolvable_context.session_requests[1].status == "blocked")
+  assert(unresolvable_context.run.blocked_reason and unresolvable_context.run.diagnostic.code == "session_type_id_required")
+  assert(unresolvable_context.run.blocked_transition == nil,
+    "a session-type block must not masquerade as a dependency hold")
+  assert(count_events(unresolvable_run, "session_type_spawn_blocked") == 1)
+  assert(#spawned == dispatched, "a blocked session-type resolution must not dispatch")
+
+  -- (d) Both hold vocabularies are live at once; each run is queued exactly once and the
+  -- rendered metric still equals the rendered rows.
+  local crossed_nodes = collect_nodes(home_surface())
+  local crossed_list = crossed_nodes["project-pipelines-needs-attention-list"]
+  local function attention_rows(node_id)
+    local total = 0
+    for _, row in ipairs(crossed_list.children or {}) do
+      if row.id == node_id then total = total + 1 end
+    end
+    return total
+  end
+  assert(attention_rows("project-pipelines-attention-dependencies-" .. gated_run) == 1,
+    "a dependency-held run must be queued exactly once")
+  assert(attention_rows("project-pipelines-attention-session-crossed-unresolved-request") == 1,
+    "a session-type-blocked request must be queued exactly once")
+  assert(crossed_nodes["project-pipelines-metric-attention"].props.value == tostring(#crossed_list.children),
+    "the needs-attention metric must equal the rendered rows across both hold vocabularies")
+
+  -- (b) Clearing the dependency lets the same step spawn exactly once; retrying reuses it.
+  assert(tools["project_pipelines.update_ticket"]({ ticket_id = "crossed-blocker", status = "closed" }).ok)
+  local cleared = tools["project_pipelines.spawn_ticket_session"]({
+    run_id = gated_run, step_id = "crossed-implement", request_id = "crossed-spawn",
+  })
+  assert(cleared.ok and #spawned == dispatched + 1, "a cleared dependency must let the same PTY step spawn once")
+  assert(spawned[#spawned].session_type_id == "crossed-session-type")
+  local cleared_context = context_for(gated_run)
+  assert(cleared_context.run.blocked_transition == nil, "activation must consume the dependency hold record")
+  assert(#cleared_context.session_requests == 1 and cleared_context.session_requests[1].status == "spawn_requested")
+  local reactivated = tools["project_pipelines.spawn_ticket_session"]({
+    run_id = gated_run, step_id = "crossed-implement", request_id = "crossed-spawn",
+  })
+  assert(reactivated.ok and reactivated.activation.id == "crossed-spawn", "repeat activation must reuse the request")
+  assert(#spawned == dispatched + 1, "repeat activation must not dispatch again")
+  assert(#context_for(gated_run).session_requests == 1)
+
+  -- (e) An exempt PTY step bypasses the dependency gate and still resolves a session type.
+  local exempt_run = start_crossed_run("crossed-exempt-run-owner", "crossed-exempt-blocker")
+  local exempt = tools["project_pipelines.spawn_ticket_session"]({
+    run_id = exempt_run, step_id = "crossed-exempt", request_id = "crossed-exempt-request",
+  })
+  assert(exempt.ok and spawned[#spawned].session_type_id == "crossed-exempt-session-type",
+    "an exempt PTY step must bypass the dependency gate and still resolve a session type")
+  assert(#spawned == dispatched + 2)
+  assert(context_for(exempt_run).run.blocked_transition == nil)
+end
 
 assert(tools["project_pipelines.create_pipeline"]({
   id = "pipeline-review-routing", name = "Review routing",
@@ -1245,13 +1592,13 @@ assert(find_node(home, "project-pipelines-project-table").type == "table")
 local settings = handlers["project-pipelines.settings"]({})
 assert(find_node(settings, "project-pipelines-provider-dependency-status"), "settings must expose provider diagnostics")
 
-durable_store["v3/tickets/malformed"] = {
-  key = "v3/tickets/malformed", schema_version = 3, revision = 1,
+durable_store["v4/tickets/malformed"] = {
+  key = "v4/tickets/malformed", schema_version = 4, revision = 1,
   payload = { id = "malformed" },
 }
 local malformed_ok = pcall(tools["project_pipelines.current_context"], {})
 assert(not malformed_ok, "malformed durable record must fail closed")
-durable_store["v3/tickets/malformed"] = nil
+durable_store["v4/tickets/malformed"] = nil
 
 durable_store["v2/tickets/legacy"] = {
   key = "v2/tickets/legacy", schema_version = 2, revision = 1,
@@ -1260,9 +1607,11 @@ durable_store["v2/tickets/legacy"] = {
 local cleaned = dofile("plugin.lua")
 assert(cleaned and durable_store["v2/tickets/legacy"] == nil, "v2 namespace must be removed atomically on load")
 
-local source_key = "v3/pipeline_definitions/botster_stack_delivery"
+local source_key = "v4/pipeline_definitions/botster_stack_delivery"
 assert(durable_store[source_key], "sourced delivery definition missing")
 durable_store[source_key].payload.steps[1].agent_name = "operator-selected"
+durable_store[source_key].payload.steps[1].prompt = "stale package-owned prompt"
+durable_store[source_key].payload.name = "Stale package-owned name"
 durable_store[source_key].payload.source_revision = "stale"
 local reloaded = dofile("plugin.lua")
 local reloaded_tools = {}
@@ -1272,6 +1621,11 @@ for _, pipeline in ipairs(reloaded_tools["project_pipelines.list_pipelines"]({})
   if pipeline.id == "botster_stack_delivery" then sourced = pipeline end
 end
 assert(sourced and sourced.steps[1].agent_name == "operator-selected")
+assert(sourced.name ~= "Stale package-owned name", "reconciliation must refresh package-owned pipeline fields")
+assert(sourced.steps[1].prompt ~= "stale package-owned prompt", "reconciliation must refresh package-owned step prompts")
+for _, step in ipairs(sourced.steps) do
+  assert(step.session_type_id == nil, "sourced steps must not hard-code a device session type")
+end
 local sourced_review
 for _, step in ipairs(sourced.steps) do if step.id == "botster_stack_review" then sourced_review = step end end
 assert(sourced_review.on_approved_step_id == "botster_stack_verify")
@@ -1282,6 +1636,242 @@ for _, step in ipairs(sourced.steps) do
   if step.prompt and step.prompt:find("botster%-workspaces%-playbook") then routed = true end
 end
 assert(routed, "Botster Stack Delivery must retain botster-workspaces routing")
+
+-- BEGIN v3 migration seed fixture
+-- Free-text prose the migrator must never rewrite. Seeded and asserted through the same
+-- constants so the byte-for-byte check stays outside the repository legacy-vocabulary guard.
+local LEGACY_PROSE = {
+  request_summary = "Keep session template prose byte-for-byte",
+  request_prompt = "Keep Session template evidence byte-for-byte",
+  event_message = "Keep session template event prose byte-for-byte",
+}
+-- Agent-authored payloads that merely LOOK like package identity. A key name inside caller
+-- context, metadata, or a Hub result means nothing to this package and must survive intact.
+-- The key names live here so the assertions below can address them without writing the
+-- retired vocabulary outside this fence.
+local AUTHORED_KEYS = { "template_id", "template_name", "session_capability" }
+-- Every selector key the pre-cut package could have written onto a record it owns. Assertions
+-- address them from here so the retired vocabulary stays inside this fence.
+local RETIRED_KEYS = {
+  "session_template_id", "template_id",
+  "session_template_name", "template_name",
+  "session_template_capability", "session_capability",
+  "template_selector",
+}
+local AUTHORED = {
+  metadata_identity = "authored-identity-value",
+  metadata_capability = "authored-capability-value",
+  context_note = "authored selector-shaped evidence",
+  result_extra = "authored nested result value",
+  event_metadata = "authored event metadata value",
+}
+durable_store = {
+  ["v3/pipeline_definitions/legacy-custom"] = {
+    key = "v3/pipeline_definitions/legacy-custom", schema_version = 3, revision = 1,
+    payload = {
+      id = "legacy-custom", name = "Legacy custom", steps = {
+        { id = "legacy-name-step", name = "Legacy name", position = 1, kind = "pty", session_template_name = "Old display name" },
+        { id = "legacy-exact-step", name = "Legacy exact", position = 2, kind = "pty", session_template_id = "exact-session-type" },
+        { id = "legacy-capability-step", name = "Legacy capability", position = 3, kind = "pty", session_template_capability = "old.capability" },
+      },
+    },
+  },
+  ["v3/session_requests/legacy-request"] = {
+    key = "v3/session_requests/legacy-request", schema_version = 3, revision = 1,
+    payload = {
+      id = "legacy-request", run_id = "legacy-run", step_id = "legacy-exact-step", status = "spawn_requested",
+      prompt_summary = LEGACY_PROSE.request_summary,
+      template_id = "exact-session-type",
+      request = {
+        template_id = "exact-session-type",
+        context = {
+          prompt = LEGACY_PROSE.request_prompt,
+          note = AUTHORED.context_note,
+          metadata = {
+            [AUTHORED_KEYS[1]] = AUTHORED.metadata_identity,
+            [AUTHORED_KEYS[3]] = AUTHORED.metadata_capability,
+          },
+        },
+      },
+      result = { template_id = "exact-session-type", extra = { [AUTHORED_KEYS[2]] = AUTHORED.result_extra } },
+    },
+  },
+  -- The real blocked-request envelope. The pre-cut writer stored one diagnostic table in two
+  -- durable slots: session_request.diagnostic and result.error. Once persisted they are
+  -- independent copies, so both must land on the authoritative contract.
+  ["v3/session_requests/legacy-blocked"] = {
+    key = "v3/session_requests/legacy-blocked", schema_version = 3, revision = 1,
+    payload = {
+      id = "legacy-blocked", run_id = "legacy-run", step_id = "legacy-name-step", status = "blocked",
+      template_selector = { kind = "name", template_name = "Old display name" },
+      request = { target_id = "target-one", context = { prompt = LEGACY_PROSE.request_prompt } },
+      result = {
+        ok = false,
+        error = {
+          status = "blocked",
+          code = "session_template_unavailable",
+          message = "no hub session template matched selector",
+          template_selector = { kind = "name", template_name = "Old display name" },
+        },
+        note = AUTHORED.result_extra,
+      },
+      diagnostic = {
+        status = "blocked",
+        code = "session_template_unavailable",
+        message = "no hub session template matched selector",
+        template_selector = { kind = "name", template_name = "Old display name" },
+      },
+    },
+  },
+  ["v3/events/legacy-event"] = {
+    key = "v3/events/legacy-event", schema_version = 3, revision = 1,
+    payload = {
+      id = "legacy-event", kind = "session_template_spawn_requested", message = LEGACY_PROSE.event_message,
+      payload = {
+        template_id = "exact-session-type",
+        template_selector = { kind = "id", value = "exact-session-type" },
+        status = "spawn_requested",
+        diagnostic = { code = "session_template_unavailable", message = "session template selector is unavailable" },
+        context = { metadata = { [AUTHORED_KEYS[2]] = AUTHORED.event_metadata } },
+      },
+    },
+  },
+  ["v3/runs/legacy-run"] = {
+    key = "v3/runs/legacy-run", schema_version = 3, revision = 1,
+    payload = {
+      id = "legacy-run", ticket_id = "legacy-ticket", pipeline_definition_id = "legacy-custom",
+      current_step_id = "legacy-exact-step", status = "blocked",
+      diagnostic = {
+        code = "session_template_unavailable",
+        message = "session template selector is unavailable",
+        template_selector = { name = "Old display name" },
+      },
+      blocked_reason = "no hub session template matched selector",
+    },
+  },
+}
+-- END v3 migration seed fixture
+
+fail_batch_key_prefix = "v4/"
+local failed_migration = pcall(dofile, "plugin.lua")
+assert(not failed_migration, "injected v3 migration failure must stop package load")
+assert(durable_store["v3/pipeline_definitions/legacy-custom"], "failed migration must preserve every v3 record")
+assert(not durable_store["v4/pipeline_definitions/legacy-custom"], "failed migration must publish no v4 record")
+
+fail_batch_key_prefix = nil
+local migrated_plugin = dofile("plugin.lua")
+assert(not durable_store["v3/pipeline_definitions/legacy-custom"], "successful migration must remove v3 records")
+assert(durable_store["v4/pipeline_definitions/legacy-custom"].schema_version == 4, "migrated record must use schema v4")
+local migrated_tools = {}
+for _, descriptor in ipairs(migrated_plugin.tools) do migrated_tools[descriptor.name] = descriptor.call end
+local migrated_context = migrated_tools["project_pipelines.current_context"]({})
+local migrated_pipeline
+for _, pipeline in ipairs(migrated_context.pipeline_definitions) do
+  if pipeline.id == "legacy-custom" then migrated_pipeline = pipeline end
+end
+assert(migrated_pipeline, "migrated custom pipeline missing")
+assert(migrated_pipeline.steps[1].session_type_id_required == true, "name-only selector must require operator repair")
+assert(migrated_pipeline.steps[2].session_type_id == "exact-session-type", "exact legacy id must rewrite mechanically")
+assert(migrated_pipeline.steps[3].session_type_id_required == true, "capability-only selector must require operator repair")
+local migrated_request, migrated_blocked
+for _, request in ipairs(migrated_context.session_requests) do
+  if request.id == "legacy-request" then migrated_request = request end
+  if request.id == "legacy-blocked" then migrated_blocked = request end
+end
+assert(migrated_request and migrated_blocked, "migrated session requests missing")
+assert(migrated_request.session_type_id == "exact-session-type")
+assert(migrated_request.request.session_type_id == "exact-session-type")
+assert(migrated_request.result.session_type_id == "exact-session-type")
+assert(migrated_request.prompt_summary == LEGACY_PROSE.request_summary, "migration rewrote human-authored prompt summary prose")
+assert(migrated_request.request.context.prompt == LEGACY_PROSE.request_prompt, "migration rewrote durable request prompt evidence")
+-- The migrator rewrites package-owned identity at known structural paths only. A legacy-looking
+-- key inside caller context, metadata, or a Hub result is authored evidence, not package
+-- identity, and deleting or renaming it would silently corrupt the durable record.
+assert(migrated_request.request.context.note == AUTHORED.context_note, "migration rewrote agent-authored context")
+assert(migrated_request.request.context.metadata[AUTHORED_KEYS[1]] == AUTHORED.metadata_identity,
+  "migration rewrote agent-authored metadata")
+assert(migrated_request.request.context.metadata[AUTHORED_KEYS[3]] == AUTHORED.metadata_capability,
+  "migration rewrote agent-authored metadata")
+assert(migrated_request.result.extra[AUTHORED_KEYS[2]] == AUTHORED.result_extra,
+  "migration rewrote a nested Hub result payload")
+for _, key in ipairs(RETIRED_KEYS) do
+  assert(migrated_request[key] == nil, "package-owned selector survived migration: " .. key)
+  assert(migrated_request.request[key] == nil, "package-owned request selector survived migration: " .. key)
+  assert(migrated_request.result[key] == nil, "package-owned result selector survived migration: " .. key)
+  assert(migrated_blocked[key] == nil, "blocked request selector survived migration: " .. key)
+end
+-- Both durable copies of a blocked activation's diagnostic must land on the authoritative
+-- contract. A consumer reading result.error would otherwise still see the retired one.
+for _, diagnostic in ipairs({ migrated_blocked.diagnostic, migrated_blocked.result.error }) do
+  assert(diagnostic.code == "session_type_unavailable", "blocked diagnostic code survived on the retired contract")
+  assert(diagnostic.message == "no hub session type matched id", "blocked diagnostic message survived on the retired contract")
+  for _, key in ipairs(RETIRED_KEYS) do
+    assert(diagnostic[key] == nil, "blocked diagnostic kept a retired selector: " .. key)
+  end
+  assert(diagnostic.status == "blocked", "blocked diagnostic lost its status")
+end
+assert(migrated_blocked.result.ok == false, "migration rewrote the result envelope")
+assert(migrated_blocked.result.note == AUTHORED.result_extra, "migration rewrote unrelated result payload")
+assert(migrated_blocked.session_type_id == nil, "an unmappable selector must not synthesize an identity")
+assert(migrated_blocked.request.context.prompt == LEGACY_PROSE.request_prompt, "migration rewrote blocked request evidence")
+local migrated_event
+for _, event in ipairs(migrated_context.events) do
+  if event.id == "legacy-event" then migrated_event = event end
+end
+assert(migrated_event and migrated_event.kind == "session_type_spawn_requested")
+assert(migrated_event.message == LEGACY_PROSE.event_message, "migration rewrote durable event prose")
+assert(migrated_event.payload.session_type_id == "exact-session-type", "event identity did not migrate")
+assert(migrated_event.payload.template_selector == nil, "event selector survived migration")
+assert(migrated_event.payload.diagnostic.code == "session_type_unavailable")
+assert(migrated_event.payload.diagnostic.message == "session type id is unavailable")
+assert(migrated_event.payload.context.metadata[AUTHORED_KEYS[2]] == AUTHORED.event_metadata,
+  "migration rewrote agent-authored event context")
+local migrated_run
+for _, run in ipairs(migrated_context.runs) do if run.id == "legacy-run" then migrated_run = run end end
+assert(migrated_run and migrated_run.diagnostic.code == "session_type_unavailable")
+assert(migrated_run.diagnostic.message == "session type id is unavailable")
+assert(migrated_run.diagnostic.template_selector == nil)
+assert(migrated_run.blocked_reason == "no hub session type matched id")
+
+assert(migrated_tools["project_pipelines.create_project"]({
+  id = "legacy-project", name = "Legacy project", target_id = "target-one",
+}).ok)
+assert(migrated_tools["project_pipelines.create_ticket"]({
+  id = "legacy-ticket", project_id = "legacy-project", target_id = "target-one", title = "Repair legacy selector",
+}).ok)
+assert(migrated_tools["project_pipelines.start_run"]({
+  id = "legacy-run-repair", ticket_id = "legacy-ticket", pipeline_id = "legacy-custom",
+}).ok)
+default_session_type_id = "device-default-must-not-satisfy-repair"
+local unmappable = migrated_tools["project_pipelines.spawn_ticket_session"]({
+  run_id = "legacy-run-repair", request_id = "legacy-unmappable",
+})
+assert(not unmappable.ok and unmappable.error.code == "session_type_id_required", "unmappable selectors must fail loudly")
+local repaired_step = migrated_tools["project_pipelines.update_step"]({
+  step_id = "legacy-name-step", session_type_id = "operator-repaired-type",
+})
+assert(repaired_step.ok and repaired_step.step.session_type_id_required == nil)
+local repaired_legacy = migrated_tools["project_pipelines.spawn_ticket_session"]({
+  run_id = "legacy-run-repair", request_id = "legacy-repaired",
+})
+assert(repaired_legacy.ok and spawned[#spawned].session_type_id == "operator-repaired-type")
+default_session_type_id = nil
+
+local settled_revision = durable_store["v4/pipeline_definitions/legacy-custom"].revision
+local restarted_migration = dofile("plugin.lua")
+local restarted_migration_tools = {}
+for _, descriptor in ipairs(restarted_migration.tools) do restarted_migration_tools[descriptor.name] = descriptor.call end
+local restarted_legacy = restarted_migration_tools["project_pipelines.list_pipelines"]({}).pipelines
+local persisted_repair
+for _, pipeline in ipairs(restarted_legacy) do
+  if pipeline.id == "legacy-custom" then persisted_repair = pipeline.steps[1].session_type_id end
+end
+assert(persisted_repair == "operator-repaired-type", "v4 repair must survive restart")
+assert(durable_store["v4/pipeline_definitions/legacy-custom"].revision == settled_revision,
+  "restart must not rewrite settled v4 records")
+for key in pairs(durable_store) do
+  assert(key:sub(1, 3) ~= "v3/", "restart must not resurrect a legacy namespace record: " .. key)
+end
 
 print("project-pipelines authoritative package checks passed")
 LUA

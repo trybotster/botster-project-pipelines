@@ -1,6 +1,6 @@
 {
   "name": "project-pipelines",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "kind": "plugin",
   "botster": ">=0.1.0",
   "source": { "type": "path", "path": "." },
@@ -8,7 +8,7 @@
     { "surface": "surfaces" },
     { "surface": "mcp" },
     { "surface": "plugin_db", "scope": "project-pipelines" },
-    { "surface": "session_actions", "scope": "session_template_managed_git_spawn" }
+    { "surface": "session_actions", "scope": "session_type_managed_git_spawn" }
   ],
   "entrypoints": [
     { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
@@ -33,10 +33,10 @@
         "group": "defaults"
       },
       {
-        "key": "default_session_template_selector",
+        "key": "default_session_type_id",
         "type": "string",
-        "label": "Default session template",
-        "description": "Template id, name, or capability used for PTY-backed pipeline steps without a step selector.",
+        "label": "Default session type",
+        "description": "Exact Hub session type id used for PTY-backed pipeline steps without a step-level id. Reload the package after changing this value.",
         "group": "defaults"
       },
       {

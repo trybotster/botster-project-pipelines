@@ -6,6 +6,7 @@
     "test": "node script/test-ui-contract.mjs"
   },
   "dependencies": {
+    "@trybotster/hub-test-support": "0.1.24",
     "@trybotster/ui-contract": "0.1.0"
   }
 }
