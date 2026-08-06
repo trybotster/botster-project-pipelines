@@ -737,6 +737,18 @@ assert(unauthorized_context.dig("run", "current_step_id") == "live_waiting_plan_
 assert(unauthorized_context.dig("run", "waiting_transition", "unauthorized") == true, "cleared dependencies did not record the stale authorization")
 assert(unauthorized_context.fetch("run_steps").length == 1, "an unauthorized wakeup created an Implement visit")
 assert(unauthorized_context.fetch("session_requests").none? { |request_row| request_row["run_id"] == "run_live_waiting_reauth" }, "an unauthorized wakeup spawned")
+
+# The dependency-blocked advance above persisted a pending advance request, so retrying the
+# same request_id is an ordinary call and must not bypass that hold.
+stale_retry = call_tool(socket, "project_pipelines.request_step_advance", {
+  run_id: "run_live_waiting_reauth",
+  request_id: "advance_live_waiting_reauth"
+})
+assert(stale_retry["ok"] == false && stale_retry.dig("error", "code") == "transition_authorization_changed", "a correlated retry bypassed the stale-authorization hold")
+retried_context = call_tool(socket, "project_pipelines.current_context", { run_id: "run_live_waiting_reauth" })
+assert(retried_context.dig("run", "current_step_id") == "live_waiting_plan_review", "a correlated retry advanced past the hold")
+assert(retried_context.fetch("run_steps").length == 1, "a correlated retry created an Implement visit")
+assert(retried_context.fetch("session_requests").none? { |request_row| request_row["run_id"] == "run_live_waiting_reauth" }, "a correlated retry spawned")
 call_tool(socket, "project_pipelines.resolve_finding", { finding_id: "finding_live_waiting_reauth", resolution: "Resolved so the retained waiting transition can resume" })
 reauthorized_context = call_tool(socket, "project_pipelines.current_context", { run_id: "run_live_waiting_reauth" })
 assert(reauthorized_context.dig("run", "current_step_id") == "live_waiting_implement", "resolving the blocking finding did not resume the retained waiting transition")

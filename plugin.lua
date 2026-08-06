@@ -1926,14 +1926,20 @@ local function apply_step_transition(state, run, transition, recovered)
   return transition.result or transition_response(run, transition.source_step_id, transition.target_step_id)
 end
 
-local function wait_for_ticket_dependencies(state, run, transition, dependencies)
+-- Park an authorized-but-unappliable transition as durable waiting state. Dependency and
+-- authorization holds share one record so the operator sees a single reason set.
+function step_transitions.hold(state, run, transition, dependencies, authorization)
   local waiting = run.waiting_transition
   local first_wait = type(waiting) ~= "table"
     or waiting.source_run_step_id ~= transition.source_run_step_id
     or waiting.target_step_id ~= transition.target_step_id
+  local previously_unauthorized = type(waiting) == "table" and waiting.unauthorized == true
+  local blocked_by_dependencies = #dependencies > 0
   transition.status = "waiting"
-  transition.code = "ticket_dependencies_unmet"
-  transition.unmet_dependencies = copy(dependencies)
+  transition.code = blocked_by_dependencies and "ticket_dependencies_unmet" or "transition_authorization_changed"
+  transition.unmet_dependencies = blocked_by_dependencies and copy(dependencies) or nil
+  transition.unauthorized = #authorization > 0 or nil
+  transition.unmet_authorization = #authorization > 0 and copy(authorization) or nil
   run.waiting_transition = copy(transition)
   if first_wait then
     push_event(state, "ticket_dependencies_waiting", run.id, transition.target_step_id, {
@@ -1943,14 +1949,41 @@ local function wait_for_ticket_dependencies(state, run, transition, dependencies
       unmet_dependencies = copy(dependencies),
     })
   end
-  return diagnostic_failure("ticket_dependencies_unmet", "ticket has open blocking dependencies", {
-    status = "waiting",
-    run_id = run.id,
-    step_id = transition.source_step_id,
-    next_step_id = transition.target_step_id,
-    waiting_transition = copy(run.waiting_transition),
-    unmet_dependencies = copy(dependencies),
-  })
+  if #authorization > 0 and not previously_unauthorized then
+    push_event(state, "ticket_dependencies_waiting_unauthorized", run.id, transition.target_step_id, {
+      source_step_id = transition.source_step_id,
+      source_run_step_id = transition.source_run_step_id,
+      request_id = transition.request_id,
+      blockers = copy(authorization),
+    })
+  end
+  return diagnostic_failure(
+    transition.code,
+    blocked_by_dependencies and "ticket has open blocking dependencies"
+      or "the authorization that justified this transition no longer holds",
+    {
+      status = "waiting",
+      run_id = run.id,
+      step_id = transition.source_step_id,
+      next_step_id = transition.target_step_id,
+      waiting_transition = copy(run.waiting_transition),
+      unmet_dependencies = copy(dependencies),
+      unmet_authorization = copy(authorization),
+    }
+  )
+end
+
+-- The single authority for applying a previously requested transition. A correlated
+-- retry and dependency-clearance wakeup are the same operation and must satisfy the same
+-- two conditions: the ticket's blocking dependencies are met, and the authorization that
+-- justified the original request still holds. Returns (applied_result, hold_failure).
+function step_transitions.settle(state, run, pipeline, ticket, target_step, transition)
+  local dependencies = dependency_blockers_for_step(state, ticket, target_step)
+  local authorization = step_transitions.waiting_authorization_blockers(state, run, pipeline, transition)
+  if #dependencies == 0 and #authorization == 0 then
+    return apply_step_transition(state, run, transition, true), nil
+  end
+  return nil, step_transitions.hold(state, run, transition, dependencies, authorization)
 end
 
 local function request_step_advance(arguments)
@@ -1974,22 +2007,34 @@ local function request_step_advance(arguments)
         if run.current_step_id == request.previous_step_id then
           local target_step = find_pipeline_step(pipeline, request.step_id)
           if not target_step then return failure("not_found", "step not found: " .. tostring(request.step_id)) end
-          local transition = {
-            source_step_id = request.previous_step_id,
-            source_run_step_id = run.current_run_step_id,
-            target_step_id = request.step_id,
-            request_id = request.request_id,
-            advance_request_id = request.id,
-            result = copy(request.result),
-          }
-          local dependencies = dependency_blockers_for_step(state, ticket, target_step)
-          if #dependencies > 0 then
-            local blocked = wait_for_ticket_dependencies(state, run, transition, dependencies)
+          -- While a request is parked, run.waiting_transition is the authority: it carries
+          -- the exact source visit and any gate override the operator authorized.
+          -- Rebuilding from the advance_request alone would silently drop that override.
+          local waiting = run.waiting_transition
+          local transition
+          if type(waiting) == "table"
+            and waiting.request_id == request.request_id
+            and waiting.source_step_id == request.previous_step_id
+            and waiting.target_step_id == request.step_id
+            and waiting.source_run_step_id == run.current_run_step_id
+          then
+            transition = copy(waiting)
+          else
+            transition = {
+              source_step_id = request.previous_step_id,
+              source_run_step_id = run.current_run_step_id,
+              target_step_id = request.step_id,
+              request_id = request.request_id,
+              result = copy(request.result),
+            }
+          end
+          transition.advance_request_id = request.id
+          local applied, held = step_transitions.settle(state, run, pipeline, ticket, target_step, transition)
+          if held then
             local waiting_error = save_state(state)
             if waiting_error then return waiting_error end
-            return blocked
+            return held
           end
-          local applied = apply_step_transition(state, run, transition, true)
           if applied.ok == false then return applied end
           local recovered_error = save_state(state)
           if recovered_error then return recovered_error end
@@ -2067,7 +2112,7 @@ local function request_step_advance(arguments)
   }
   local dependencies = dependency_blockers_for_step(state, ticket, next_step)
   if #dependencies > 0 then
-    local blocked = wait_for_ticket_dependencies(state, run, transition, dependencies)
+    local blocked = step_transitions.hold(state, run, transition, dependencies, {})
     local waiting_error = save_state(state)
     if waiting_error then return waiting_error end
     return blocked
@@ -2082,7 +2127,7 @@ local function request_step_advance(arguments)
     transition.advance_request_id = advance_request.id
     dependencies = dependency_blockers_for_step(state, ticket, next_step)
     if #dependencies > 0 then
-      local blocked = wait_for_ticket_dependencies(state, run, transition, dependencies)
+      local blocked = step_transitions.hold(state, run, transition, dependencies, {})
       local waiting_error = save_state(state)
       if waiting_error then return waiting_error end
       return blocked
@@ -2119,28 +2164,8 @@ function step_transitions.reconcile_waiting(state)
       local target_step = pipeline and find_pipeline_step(pipeline, waiting.target_step_id) or nil
       local resumable, ticket = step_transitions.waiting_resumable(state, run, waiting)
       if resumable and target_step then
-        local dependencies = dependency_blockers_for_step(state, ticket, target_step)
-        local authorization = step_transitions.waiting_authorization_blockers(state, run, pipeline, waiting)
-        waiting.unmet_dependencies = #dependencies > 0 and copy(dependencies) or nil
-        if #authorization > 0 then
-          if not waiting.unauthorized then
-            push_event(state, "ticket_dependencies_waiting_unauthorized", run.id, waiting.target_step_id, {
-              source_step_id = waiting.source_step_id,
-              source_run_step_id = waiting.source_run_step_id,
-              request_id = waiting.request_id,
-              blockers = copy(authorization),
-            })
-          end
-          waiting.unauthorized = true
-          waiting.unmet_authorization = copy(authorization)
-        else
-          waiting.unauthorized = nil
-          waiting.unmet_authorization = nil
-          if #dependencies == 0 then
-            local result = apply_step_transition(state, run, waiting, true)
-            if result.ok ~= false then table.insert(applied, run.id) end
-          end
-        end
+        local result = step_transitions.settle(state, run, pipeline, ticket, target_step, waiting)
+        if result and result.ok ~= false then table.insert(applied, run.id) end
       end
     end
   end

@@ -166,9 +166,16 @@ step. Because that waiting state is retained rather than discarded, the
 mutations that restore authorization reconcile it in the same atomic save:
 `submit_gate`, `submit_review`, and `resolve_finding` wake a run whose
 dependencies are already satisfied, with no dependency row change and no
-explicit advance. A gate override waives only the gate IDs it named and is
-audited when the transition is applied, not when a dependency-blocked request
-was made.
+explicit advance. Retrying the same `request_id` after a dependency-blocked
+advance is ordinary operation, not crash recovery, so it applies the transition
+only under that same authority and otherwise returns
+`error.code="transition_authorization_changed"`; the durable waiting state, not
+the pending advance request, is the authority while parked, so a retry keeps the
+operator's gate override. A gate override waives only the gate IDs it named and
+is audited when the transition is applied, not when a dependency-blocked request
+was made. `update_ticket` with `status="closed"` clears its runs' waiting
+transitions without ending those runs, so such a run needs a fresh explicit
+advance.
 
 Transition findings are run-scoped: unresolved `blocker` and `high` findings
 stop advancement until resolved or waived. `medium`, `low`, and `info` findings

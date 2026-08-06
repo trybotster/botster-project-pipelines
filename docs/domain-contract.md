@@ -115,6 +115,22 @@ advance. A gate override waives only the gate IDs it named;
 it never waives dependencies, and its `gates_overridden` audit event is emitted
 when the transition is applied, not when the blocked request was made.
 
+A dependency-blocked advance persists a pending advance request alongside its
+waiting state, so retrying the same `request_id` is ordinary operation rather
+than crash recovery. That retry applies the transition only under the identical
+authority the clearance path uses: dependencies met and current route, gate,
+review, and finding authorization still holding. When authorization has lapsed
+it returns `error.code: "transition_authorization_changed"` and leaves the run
+waiting. While a request is parked, `run.waiting_transition` is the authority
+rather than the advance request record, so a retry preserves the gate override
+the operator authorized instead of rebuilding a transition without it.
+
+`update_ticket` with `status="closed"` clears the waiting transitions of that
+ticket's runs but, unlike `close_ticket`, does not end those runs. Such a run
+stays active at its preserved source step with no authorized transition:
+reopening the ticket does not restore it, and a fresh explicit advance is
+required.
+
 Unresolved findings are run-scoped transition inputs. `blocker` and `high`
 findings block advancement; `medium`, `low`, and `info` findings are durable
 carry-forward review context and do not block an otherwise approved transition.

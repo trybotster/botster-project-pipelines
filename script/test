@@ -618,6 +618,73 @@ assert_not_resurrected(closed_owner_scenario, "closed")
 assert(tools["project_pipelines.close_ticket"]({ ticket_id = closed_owner_scenario.dependency_ids[1] }).ok)
 assert_not_resurrected(closed_owner_scenario, "closed")
 
+-- Adding a blocker to an already-waiting run can only add blockers, so its reconcile is a
+-- snapshot refresh; assert that refresh rather than leaving the call site unexercised.
+local snapshot_scenario = create_waiting_scenario("waiting-snapshot", 1)
+assert(tools["project_pipelines.create_ticket"]({
+  id = "waiting-snapshot-extra", project_id = "project-one", title = "Extra blocker",
+}).ok)
+assert(tools["project_pipelines.add_ticket_dependency"]({
+  ticket_id = snapshot_scenario.ticket_id, dependency_ticket_id = "waiting-snapshot-extra",
+}).ok)
+local snapshot_context = context_for(snapshot_scenario.run_id)
+assert(#snapshot_context.run.waiting_transition.unmet_dependencies == 2,
+  "adding a blocker to a waiting run must refresh its dependency snapshot")
+assert(#snapshot_context.run_steps == 1 and #spawned == snapshot_scenario.spawned_before)
+
+-- A merged provider PR is a terminal lifecycle mutation delivered through the Hub event
+-- handler rather than a public tool, so exercise the registered handler directly.
+local pr_merged_handler
+for _, handler in ipairs(plugin.handlers) do
+  if handler.id == "pr_merged" then pr_merged_handler = handler.call end
+end
+assert(pr_merged_handler, "pr_merged event handler must be registered")
+local merged_scenario = create_waiting_scenario("waiting-merged", 1)
+-- A merge closes its own ticket, so a different run blocked on that ticket must wake in
+-- the same atomic save. This is what the handler's reconcile call exists for.
+assert(tools["project_pipelines.create_ticket"]({
+  id = "waiting-merge-dependent-ticket", project_id = "project-one", target_id = "target-one",
+  title = "Blocked on the merged ticket",
+}).ok)
+local merge_dependent_started = tools["project_pipelines.start_run"]({
+  id = "waiting-merge-dependent-run", ticket_id = "waiting-merge-dependent-ticket",
+  pipeline_id = "pipeline-waiting-wakeup",
+})
+assert(merge_dependent_started.ok)
+assert(tools["project_pipelines.add_ticket_dependency"]({
+  ticket_id = "waiting-merge-dependent-ticket", dependency_ticket_id = merged_scenario.ticket_id,
+}).ok)
+assert(tools["project_pipelines.submit_review"]({
+  run_id = "waiting-merge-dependent-run", run_step_id = merge_dependent_started.run_step.id,
+  step_id = "waiting-plan-review", verdict = "approved",
+}).ok)
+local merge_dependent_wait = tools["project_pipelines.request_step_advance"]({
+  run_id = "waiting-merge-dependent-run", request_id = "waiting-merge-dependent-advance",
+})
+assert(not merge_dependent_wait.ok and merge_dependent_wait.error.code == "ticket_dependencies_unmet")
+assert(tools["project_pipelines.link_pr"]({
+  run_id = merged_scenario.run_id, url = "https://example.invalid/pull/1",
+}).ok)
+assert(pr_merged_handler({
+  run_id = merged_scenario.run_id, pr_url = "https://example.invalid/pull/1", merge_commit = "deadbeef",
+}).ok)
+local merge_dependent_context = context_for("waiting-merge-dependent-run")
+assert(merge_dependent_context.run.current_step_id == "waiting-implement",
+  "a merge that closes a blocking ticket must wake the run waiting on it")
+assert(merge_dependent_context.run.waiting_transition == nil)
+assert(#merge_dependent_context.run_steps == 2)
+local merged_context = context_for(merged_scenario.run_id)
+assert(merged_context.run.status == "closed")
+assert(merged_context.run.waiting_transition == nil, "a merged provider PR must clear durable waiting state")
+assert(tools["project_pipelines.update_ticket"]({
+  ticket_id = merged_scenario.dependency_ids[1], status = "closed",
+}).ok)
+local after_merge_clearance = context_for(merged_scenario.run_id)
+assert(after_merge_clearance.run.status == "closed")
+assert(after_merge_clearance.run.current_step_id == "waiting-plan-review")
+assert(#after_merge_clearance.run_steps == 1, "clearing the blocker must not resurrect a merged run")
+assert(#spawned == merged_scenario.spawned_before)
+
 local updated_owner_scenario = create_waiting_scenario("waiting-updated-owner", 1)
 assert(tools["project_pipelines.update_ticket"]({
   ticket_id = updated_owner_scenario.ticket_id, status = "closed",
@@ -670,7 +737,9 @@ local function create_authorization_scenario(prefix, waive_unmet_gate)
     step_id = "authorization-review", verdict = "approved",
   }).ok)
   local spawned_before = #spawned
-  local advance_arguments = { run_id = prefix .. "-run" }
+  -- Always correlate: a dependency-blocked advance persists a pending advance_request, so
+  -- the correlated retry path is ordinary operation rather than a crash-only path.
+  local advance_arguments = { run_id = prefix .. "-run", request_id = prefix .. "-advance" }
   if waive_unmet_gate then
     advance_arguments.override_unmet_gates = true
     advance_arguments.override_reason = "gate waived while dependency-blocked"
@@ -680,7 +749,7 @@ local function create_authorization_scenario(prefix, waive_unmet_gate)
   return {
     run_id = prefix .. "-run", ticket_id = prefix .. "-ticket",
     dependency_id = prefix .. "-dependency", run_step_id = started.run_step.id,
-    spawned_before = spawned_before,
+    request_id = prefix .. "-advance", spawned_before = spawned_before,
   }
 end
 
@@ -765,6 +834,58 @@ assert(tools["project_pipelines.update_ticket"]({
 assert_unauthorized_wait(late_finding_scenario, "finding")
 assert(tools["project_pipelines.resolve_finding"]({ finding_id = "waiting-late-high" }).ok)
 assert_reauthorized_once(late_finding_scenario, 1)
+
+-- Every dependency-blocked advance persists a pending advance_request, so retrying the
+-- same request_id is an ordinary operation and must not become a back door around the
+-- authorization revalidation the clearance path performs.
+local retry_review_scenario = create_authorization_scenario("waiting-retry-review")
+assert(tools["project_pipelines.submit_review"]({
+  run_id = retry_review_scenario.run_id, run_step_id = retry_review_scenario.run_step_id,
+  step_id = "authorization-review", verdict = "changes_required",
+  findings = { { id = "waiting-retry-blocker", severity = "blocker", title = "Blocking rework" } },
+}).ok)
+assert(tools["project_pipelines.update_ticket"]({
+  ticket_id = retry_review_scenario.dependency_id, status = "closed",
+}).ok)
+assert_unauthorized_wait(retry_review_scenario, "route_changed")
+local stale_review_retry = tools["project_pipelines.request_step_advance"]({
+  run_id = retry_review_scenario.run_id, request_id = retry_review_scenario.request_id,
+})
+assert(not stale_review_retry.ok and stale_review_retry.error.code == "transition_authorization_changed",
+  "a correlated retry must not apply a transition whose route was superseded by a newer verdict")
+assert_unauthorized_wait(retry_review_scenario, "route_changed")
+
+local retry_gate_scenario = create_authorization_scenario("waiting-retry-gate")
+assert(tools["project_pipelines.submit_gate"]({
+  run_id = retry_gate_scenario.run_id, run_step_id = retry_gate_scenario.run_step_id,
+  step_id = "authorization-review", gate_id = "authorization-gate", status = "failed",
+}).ok)
+assert(tools["project_pipelines.close_ticket"]({ ticket_id = retry_gate_scenario.dependency_id }).ok)
+assert_unauthorized_wait(retry_gate_scenario, "gate")
+local failed_gate_retry = tools["project_pipelines.request_step_advance"]({
+  run_id = retry_gate_scenario.run_id, request_id = retry_gate_scenario.request_id,
+})
+assert(not failed_gate_retry.ok and failed_gate_retry.error.code == "transition_authorization_changed",
+  "a correlated retry must not apply a transition whose required gate now fails")
+assert_unauthorized_wait(retry_gate_scenario, "gate")
+
+-- A correlated retry rebuilt from the advance_request alone would drop the operator's
+-- stored override; the durable waiting transition is the authority while parked.
+local override_retry_scenario = create_authorization_scenario("waiting-override-retry", true)
+assert(context_for(override_retry_scenario.run_id).run.waiting_transition.overridden_gate_ids[1] == "authorization-gate")
+local override_retry = tools["project_pipelines.request_step_advance"]({
+  run_id = override_retry_scenario.run_id, request_id = override_retry_scenario.request_id,
+})
+assert(not override_retry.ok and override_retry.error.code == "ticket_dependencies_unmet")
+assert(context_for(override_retry_scenario.run_id).run.waiting_transition.overridden_gate_ids[1] == "authorization-gate",
+  "a correlated retry while still dependency-blocked must preserve the stored gate override")
+assert(count_events(override_retry_scenario.run_id, "gates_overridden") == 0)
+assert(tools["project_pipelines.update_ticket"]({
+  ticket_id = override_retry_scenario.dependency_id, status = "closed",
+}).ok)
+assert_reauthorized_once(override_retry_scenario, 1)
+assert(count_events(override_retry_scenario.run_id, "gates_overridden") == 1,
+  "the preserved override must be audited exactly once when the transition is applied")
 
 -- A gate override on a dependency-blocked advance waives gates only. Nothing advanced, so
 -- the audit event must not be committed until the stored override is actually applied.
