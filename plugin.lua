@@ -3266,21 +3266,37 @@ local function list_section(id, title, empty_title, items)
   return section_node(id, title, nil, { list_node(id .. "-list", children) })
 end
 
+-- One description for a durable hold, so the attention queue and the runs table agree on
+-- why a run is parked whether it waits on dependencies or on lapsed authorization.
+-- Returns the descriptive clause and the same reasons as discrete labels.
+local function hold_reason(context, blocked)
+  local labels = {}
+  for _, dependency in ipairs(array(blocked.unmet_dependencies)) do
+    local dependency_ticket = find_by_id(context.tickets, dependency.dependency_ticket_id)
+    table.insert(labels, dependency_ticket and dependency_ticket.title or dependency.dependency_ticket_id)
+  end
+  if #labels > 0 then return "for " .. table.concat(labels, ", "), labels end
+  for _, blocker in ipairs(array(blocked.unmet_authorization)) do
+    local subject = blocker.gate_id or blocker.finding_id or blocker.review_id or blocker.current_step_id
+    table.insert(labels, subject and (tostring(blocker.kind) .. " " .. tostring(subject)) or tostring(blocker.kind))
+  end
+  if #labels > 0 then return "until authorization is restored: " .. table.concat(labels, ", "), labels end
+  return "with no recorded blockers", labels
+end
+
 local function attention_items(context)
   local items = {}
   for _, run in ipairs(context.runs) do
     local blocked = run.waiting_transition or run.blocked_transition
-    if type(blocked) == "table" and blocked.code == "ticket_dependencies_unmet" then
+    -- Select on the durable hold record itself, the same predicate status_summary counts,
+    -- so the queue and the needs-attention metric cannot disagree. Keying on a single code
+    -- string silently dropped authorization holds, which are exactly the ones needing a human.
+    if type(blocked) == "table" then
       local ticket = ticket_for_run(context, run)
-      local names = {}
-      for _, dependency in ipairs(array(blocked.unmet_dependencies)) do
-        local dependency_ticket = find_by_id(context.tickets, dependency.dependency_ticket_id)
-        table.insert(names, dependency_ticket and dependency_ticket.title or dependency.dependency_ticket_id)
-      end
       table.insert(items, list_item(
         "project-pipelines-attention-dependencies-" .. run.id,
         ticket and ticket.title or run.ticket_id,
-        "Waiting before " .. tostring(blocked.target_step_id or blocked.step_id) .. " for " .. table.concat(names, ", "),
+        "Waiting before " .. tostring(blocked.target_step_id or blocked.step_id) .. " " .. hold_reason(context, blocked),
         run.waiting_transition and "waiting" or "blocked"
       ))
     end
@@ -3399,9 +3415,9 @@ local function run_rows(context)
     local pipeline = pipeline_for_run(context, run)
     local blocked = run.waiting_transition or run.blocked_transition
     local blockers = {}
-    for _, dependency in ipairs(type(blocked) == "table" and array(blocked.unmet_dependencies) or {}) do
-      local dependency_ticket = find_by_id(context.tickets, dependency.dependency_ticket_id)
-      table.insert(blockers, dependency_ticket and dependency_ticket.title or dependency.dependency_ticket_id)
+    if type(blocked) == "table" then
+      local _, labels = hold_reason(context, blocked)
+      blockers = labels
     end
     table.insert(rows, {
       id = run.id,

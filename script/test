@@ -887,6 +887,53 @@ assert_reauthorized_once(override_retry_scenario, 1)
 assert(count_events(override_retry_scenario.run_id, "gates_overridden") == 1,
   "the preserved override must be audited exactly once when the transition is applied")
 
+-- The operator attention queue keys on the durable hold record, not one code string. An
+-- authorization-held run is precisely the one needing a human, so it must appear alongside
+-- dependency-held runs and the rendered metric must equal the rendered list.
+local home_surface
+for _, handler in ipairs(plugin.handlers) do
+  if handler.id == "home_surface" then home_surface = handler.call end
+end
+assert(home_surface, "home surface handler must be registered")
+local function collect_nodes(node, seen)
+  seen = seen or {}
+  if type(node) ~= "table" then return seen end
+  if node.id then seen[node.id] = node end
+  for _, child in ipairs(node.children or {}) do collect_nodes(child, seen) end
+  for _, slot in pairs(node.slots or {}) do
+    if type(slot) == "table" then
+      for _, child in ipairs(slot) do collect_nodes(child, seen) end
+    end
+  end
+  return seen
+end
+local function attention_subtitle(nodes, run_id)
+  local subtitle = nodes["project-pipelines-attention-dependencies-" .. run_id .. "-subtitle-text"]
+  return subtitle and subtitle.props.text
+end
+
+local dependency_held_scenario = create_waiting_scenario("waiting-attention", 1)
+local home_nodes = collect_nodes(home_surface())
+local dependency_attention = attention_subtitle(home_nodes, dependency_held_scenario.run_id)
+assert(dependency_attention and dependency_attention:find("waiting-attention-dependency-1", 1, true),
+  "a dependency-held run must stay in the attention queue and name its blocking ticket")
+local route_attention = attention_subtitle(home_nodes, retry_review_scenario.run_id)
+assert(route_attention and route_attention:find("route_changed", 1, true),
+  "an authorization-held run must stay in the attention queue and name its authorization blocker")
+local gate_attention = attention_subtitle(home_nodes, retry_gate_scenario.run_id)
+assert(gate_attention and gate_attention:find("gate authorization-gate", 1, true),
+  "a gate-held run must name the gate that now blocks it")
+local attention_list = home_nodes["project-pipelines-needs-attention-list"]
+assert(attention_list, "the needs-attention list must render")
+assert(home_nodes["project-pipelines-metric-attention"].props.value == tostring(#attention_list.children),
+  "the needs-attention metric must equal the number of rendered attention rows")
+local held_run_row
+for _, row in ipairs(home_nodes["project-pipelines-run-table"].props.rows or {}) do
+  if row.id == retry_gate_scenario.run_id then held_run_row = row end
+end
+assert(held_run_row and held_run_row.cells.blocker:find("gate authorization-gate", 1, true),
+  "the runs table blocker cell must name an authorization hold instead of rendering empty")
+
 -- A gate override on a dependency-blocked advance waives gates only. Nothing advanced, so
 -- the audit event must not be committed until the stored override is actually applied.
 local blocked_override_scenario = create_authorization_scenario("waiting-blocked-override", true)
