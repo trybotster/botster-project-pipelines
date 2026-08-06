@@ -699,6 +699,32 @@ local function assert_unauthorized_wait(scenario, blocker_kind)
   assert(count_events(scenario.run_id, "ticket_dependencies_waiting_unauthorized") == 1)
 end
 
+-- Waiting state is retained rather than destroyed while unauthorized, so the mutation that
+-- restores authorization must itself wake the run. Each scenario below leaves the
+-- dependency already satisfied and makes exactly one authorization mutation afterwards,
+-- with no dependency row added, removed, or changed and no explicit advance.
+local function assert_reauthorized_once(scenario, dependency_rows_before)
+  local context = context_for(scenario.run_id)
+  assert(context.run.current_step_id == "authorization-implement",
+    "restoring authorization must itself wake the retained waiting transition")
+  assert(context.run.waiting_transition == nil)
+  assert(#context.run_steps == 2, "restored authorization must create exactly one target run-step")
+  local source_visits, target_visits = 0, 0
+  for _, run_step in ipairs(context.run_steps) do
+    if run_step.id == scenario.run_step_id then
+      source_visits = source_visits + 1
+      assert(run_step.status == "done")
+    elseif run_step.step_id == "authorization-implement" then
+      target_visits = target_visits + 1
+      assert(run_step.status == "active")
+    end
+  end
+  assert(source_visits == 1 and target_visits == 1)
+  local rows = tools["project_pipelines.list_ticket_dependencies"]({ ticket_id = scenario.ticket_id }).dependencies
+  assert(#rows == dependency_rows_before,
+    "waking on restored authorization must not depend on changing a dependency row")
+end
+
 local stale_review_scenario = create_authorization_scenario("waiting-stale-review")
 assert(tools["project_pipelines.submit_review"]({
   run_id = stale_review_scenario.run_id, run_step_id = stale_review_scenario.run_step_id,
@@ -708,6 +734,11 @@ assert(tools["project_pipelines.update_ticket"]({
   ticket_id = stale_review_scenario.dependency_id, status = "closed",
 }).ok)
 assert_unauthorized_wait(stale_review_scenario, "route_changed")
+assert(tools["project_pipelines.submit_review"]({
+  run_id = stale_review_scenario.run_id, run_step_id = stale_review_scenario.run_step_id,
+  step_id = "authorization-review", verdict = "approved",
+}).ok)
+assert_reauthorized_once(stale_review_scenario, 1)
 
 local failed_gate_scenario = create_authorization_scenario("waiting-failed-gate")
 assert(tools["project_pipelines.submit_gate"]({
@@ -716,6 +747,11 @@ assert(tools["project_pipelines.submit_gate"]({
 }).ok)
 assert(tools["project_pipelines.close_ticket"]({ ticket_id = failed_gate_scenario.dependency_id }).ok)
 assert_unauthorized_wait(failed_gate_scenario, "gate")
+assert(tools["project_pipelines.submit_gate"]({
+  run_id = failed_gate_scenario.run_id, run_step_id = failed_gate_scenario.run_step_id,
+  step_id = "authorization-review", gate_id = "authorization-gate", status = "passed",
+}).ok)
+assert_reauthorized_once(failed_gate_scenario, 1)
 
 local late_finding_scenario = create_authorization_scenario("waiting-late-finding")
 assert(tools["project_pipelines.submit_review"]({
@@ -727,16 +763,8 @@ assert(tools["project_pipelines.update_ticket"]({
   ticket_id = late_finding_scenario.dependency_id, status = "closed",
 }).ok)
 assert_unauthorized_wait(late_finding_scenario, "finding")
--- Waiting state is preserved rather than destroyed, so restoring authorization and
--- reconciling again still wakes the run exactly once.
 assert(tools["project_pipelines.resolve_finding"]({ finding_id = "waiting-late-high" }).ok)
-assert(tools["project_pipelines.remove_ticket_dependency"]({
-  ticket_id = late_finding_scenario.ticket_id, dependency_ticket_id = late_finding_scenario.dependency_id,
-}).ok)
-local reauthorized = context_for(late_finding_scenario.run_id)
-assert(reauthorized.run.current_step_id == "authorization-implement")
-assert(reauthorized.run.waiting_transition == nil)
-assert(#reauthorized.run_steps == 2, "restored authorization must create exactly one target run-step")
+assert_reauthorized_once(late_finding_scenario, 1)
 
 -- A gate override on a dependency-blocked advance waives gates only. Nothing advanced, so
 -- the audit event must not be committed until the stored override is actually applied.

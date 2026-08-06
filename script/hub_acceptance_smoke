@@ -687,6 +687,63 @@ assert(resurrection_context.dig("run", "current_step_id") == "live_waiting_plan_
 assert(resurrection_context.fetch("run_steps").length == 1, "clearing the blocker created an Implement visit on a cancelled run")
 assert(resurrection_context.fetch("session_requests").none? { |request_row| request_row["run_id"] == "run_live_waiting_cancelled" }, "clearing the blocker spawned on a cancelled run")
 
+# Retained waiting state must be live, not stranded: once its dependencies are satisfied,
+# the mutation that restores authorization is itself what resumes the run.
+call_tool(socket, "project_pipelines.create_ticket", {
+  id: "ticket_live_waiting_reauth",
+  project_id: project_id,
+  target_id: "tgt_71266a8d976d4535902ffed09c18a7ba",
+  title: "Live waiting reauthorization"
+})
+live_reauth_started = call_tool(socket, "project_pipelines.start_run", {
+  id: "run_live_waiting_reauth",
+  ticket_id: "ticket_live_waiting_reauth",
+  pipeline_id: "pipeline_live_dependency_waiting",
+  spawn_target_id: "tgt_71266a8d976d4535902ffed09c18a7ba",
+  branch: "project-pipelines/live-waiting-reauth",
+  base_ref: "main"
+})
+call_tool(socket, "project_pipelines.create_ticket", {
+  id: "ticket_live_waiting_reauth_blocker",
+  project_id: project_id,
+  title: "Live waiting reauthorization blocker"
+})
+call_tool(socket, "project_pipelines.add_ticket_dependency", {
+  id: "dependency_live_waiting_reauth",
+  ticket_id: "ticket_live_waiting_reauth",
+  dependency_ticket_id: "ticket_live_waiting_reauth_blocker"
+})
+call_tool(socket, "project_pipelines.submit_review", {
+  run_id: "run_live_waiting_reauth",
+  run_step_id: live_reauth_started.dig("run_step", "id"),
+  step_id: "live_waiting_plan_review",
+  verdict: "approved"
+})
+live_reauth_advance = call_tool(socket, "project_pipelines.request_step_advance", {
+  run_id: "run_live_waiting_reauth",
+  request_id: "advance_live_waiting_reauth"
+})
+assert(live_reauth_advance["ok"] == false && live_reauth_advance.dig("error", "code") == "ticket_dependencies_unmet", "approved live review did not wait before reauthorization")
+call_tool(socket, "project_pipelines.submit_review", {
+  run_id: "run_live_waiting_reauth",
+  run_step_id: live_reauth_started.dig("run_step", "id"),
+  step_id: "live_waiting_plan_review",
+  verdict: "approved",
+  findings: [{ id: "finding_live_waiting_reauth", severity: "high", title: "Late blocking finding" }]
+})
+call_tool(socket, "project_pipelines.close_ticket", { ticket_id: "ticket_live_waiting_reauth_blocker" })
+unauthorized_context = call_tool(socket, "project_pipelines.current_context", { run_id: "run_live_waiting_reauth" })
+assert(unauthorized_context.dig("run", "current_step_id") == "live_waiting_plan_review", "a blocking finding did not hold the woken transition")
+assert(unauthorized_context.dig("run", "waiting_transition", "unauthorized") == true, "cleared dependencies did not record the stale authorization")
+assert(unauthorized_context.fetch("run_steps").length == 1, "an unauthorized wakeup created an Implement visit")
+assert(unauthorized_context.fetch("session_requests").none? { |request_row| request_row["run_id"] == "run_live_waiting_reauth" }, "an unauthorized wakeup spawned")
+call_tool(socket, "project_pipelines.resolve_finding", { finding_id: "finding_live_waiting_reauth", resolution: "Resolved so the retained waiting transition can resume" })
+reauthorized_context = call_tool(socket, "project_pipelines.current_context", { run_id: "run_live_waiting_reauth" })
+assert(reauthorized_context.dig("run", "current_step_id") == "live_waiting_implement", "resolving the blocking finding did not resume the retained waiting transition")
+assert(!reauthorized_context.dig("run", "waiting_transition"), "resuming did not consume the waiting state")
+assert(reauthorized_context.fetch("run_steps").length == 2, "resuming created more than one Implement visit")
+assert(call_tool(socket, "project_pipelines.list_ticket_dependencies", { ticket_id: "ticket_live_waiting_reauth" }).fetch("dependencies").length == 1, "resuming required changing a dependency row")
+
 final_context = call_tool(socket, "project_pipelines.current_context", {})
 assert(final_context.fetch("runs").any? { |record| record["id"] == run_id }, "current context missing live run")
 run_gate_results = final_context.fetch("gate_results").select { |record| record["run_id"] == run_id }

@@ -1561,6 +1561,9 @@ local function submit_gate(arguments)
     gate_id = gate_id,
     status = result.status,
   })
+  -- Gate results are transition authorization inputs, so a retained waiting transition
+  -- must be re-evaluated in the same atomic save that changes them.
+  step_transitions.reconcile_waiting(state)
   local err = save_state(state)
   if err then return err end
   return ok({ gate_result = result })
@@ -1611,6 +1614,9 @@ local function submit_review(arguments)
     push_event(state, "finding_opened", run_id, finding.id, { review_id = review.id })
   end
   push_event(state, "review_submitted", run_id, review.id, { verdict = verdict })
+  -- Reviews and their findings are transition authorization inputs; re-evaluate any
+  -- retained waiting transition in the same atomic save.
+  step_transitions.reconcile_waiting(state)
   local err = save_state(state)
   if err then return err end
   return ok({ review = review })
@@ -1628,6 +1634,9 @@ local function resolve_finding(arguments)
   finding.status = status
   finding.resolution = string_arg(arguments, "resolution")
   push_event(state, "finding_resolved", finding.run_id, finding.id)
+  -- Unresolved blocker/high findings are transition authorization inputs; resolving or
+  -- waiving one can restore a retained waiting transition.
+  step_transitions.reconcile_waiting(state)
   local err = save_state(state)
   if err then return err end
   return ok({ finding = finding })

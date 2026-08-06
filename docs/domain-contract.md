@@ -105,8 +105,13 @@ original request. A newer `changes_required` verdict, a new `blocker`/`high`
 finding, or a required gate turning `failed` keeps the run waiting, records
 `unauthorized` and `unmet_authorization` on the waiting state, and emits
 `ticket_dependencies_waiting_unauthorized` once. Waiting state is retained
-rather than discarded, so restoring authorization lets the next reconciliation
-wake the run exactly once. A gate override waives only the gate IDs it named;
+rather than discarded, and the mutation that restores authorization is itself a
+reconciliation point: `submit_gate`, `submit_review`, and `resolve_finding`
+reconcile waiting runs in the same atomic save that changes a gate result,
+review verdict, or finding status. A run whose dependencies are already
+satisfied therefore wakes on a passing gate, a newer approved review, or a
+resolved blocking finding, with no dependency row change and no explicit
+advance. A gate override waives only the gate IDs it named;
 it never waives dependencies, and its `gates_overridden` audit event is emitted
 when the transition is applied, not when the blocked request was made.
 

@@ -162,8 +162,13 @@ closed run and a closed owning ticket clear their waiting state and are never
 resurrected, and wakeup re-derives the route and re-checks the current gate,
 review, and finding inputs, so a later `changes_required` verdict, blocking
 finding, or failed gate keeps the run waiting instead of activating the agent
-step. A gate override waives only the gate IDs it named and is audited when the
-transition is applied, not when a dependency-blocked request was made.
+step. Because that waiting state is retained rather than discarded, the
+mutations that restore authorization reconcile it in the same atomic save:
+`submit_gate`, `submit_review`, and `resolve_finding` wake a run whose
+dependencies are already satisfied, with no dependency row change and no
+explicit advance. A gate override waives only the gate IDs it named and is
+audited when the transition is applied, not when a dependency-blocked request
+was made.
 
 Transition findings are run-scoped: unresolved `blocker` and `high` findings
 stop advancement until resolved or waived. `medium`, `low`, and `info` findings
