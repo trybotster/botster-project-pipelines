@@ -372,6 +372,9 @@ local function load_state()
       state._originals[family][record.id] = copy(record)
     end
   end
+  -- Normalized rows are the sole dependency shape. Remove non-authoritative
+  -- ticket fields from projections and from the next atomic write.
+  for _, ticket in ipairs(state.tickets) do ticket.dependency_ticket_ids = nil end
   return state
 end
 
@@ -1009,23 +1012,68 @@ local function create_ticket(arguments)
   if not title or title == "" then return failure("validation_failed", "title is required", { "title" }) end
   local state = load_state()
   if not find_by_id(state.projects, project_id) then return failure("not_found", "project not found: " .. project_id) end
+  if arguments.dependency_ticket_ids ~= nil and type(arguments.dependency_ticket_ids) ~= "table" then
+    return failure("validation_failed", "dependency_ticket_ids must be an array", { "dependency_ticket_ids" })
+  end
   local requested_id = string_arg(arguments, "id")
   local existing = requested_id and find_by_id(state.tickets, requested_id) or nil
+  local ticket_id = requested_id or next_id(state, "ticket")
+  local dependency_ticket_ids = {}
+  local seen_dependency_ids = {}
+  for _, dependency_ticket_id in ipairs(array(arguments.dependency_ticket_ids)) do
+    if type(dependency_ticket_id) ~= "string" or dependency_ticket_id == "" then
+      return failure("validation_failed", "dependency_ticket_ids must contain ticket ids", { "dependency_ticket_ids" })
+    end
+    if dependency_ticket_id == ticket_id then
+      return failure("validation_failed", "ticket cannot depend on itself", { "dependency_ticket_ids" })
+    end
+    if not find_by_id(state.tickets, dependency_ticket_id) then
+      return failure("not_found", "dependency ticket not found: " .. dependency_ticket_id)
+    end
+    if not seen_dependency_ids[dependency_ticket_id] then
+      seen_dependency_ids[dependency_ticket_id] = true
+      table.insert(dependency_ticket_ids, dependency_ticket_id)
+    end
+  end
   if existing then
     if existing.project_id ~= project_id or existing.title ~= title then return failure("id_conflict", "ticket id belongs to different content") end
+    if arguments.dependency_ticket_ids ~= nil then
+      local existing_dependency_ids = {}
+      local existing_dependency_count = 0
+      for _, dependency in ipairs(state.ticket_dependencies) do
+        if dependency.ticket_id == existing.id then
+          existing_dependency_ids[dependency.depends_on_ticket_id] = true
+          existing_dependency_count = existing_dependency_count + 1
+        end
+      end
+      if existing_dependency_count ~= #dependency_ticket_ids then
+        return failure("id_conflict", "ticket id belongs to different dependency content")
+      end
+      for _, dependency_ticket_id in ipairs(dependency_ticket_ids) do
+        if not existing_dependency_ids[dependency_ticket_id] then
+          return failure("id_conflict", "ticket id belongs to different dependency content")
+        end
+      end
+    end
     return ok({ ticket = existing, adopted = true })
   end
   local ticket = {
-    id = requested_id or next_id(state, "ticket"),
+    id = ticket_id,
     project_id = project_id,
     workspace_id = string_arg(arguments, "workspace_id"),
     title = title,
     description = string_arg(arguments, "description"),
     status = string_arg(arguments, "status") or "open",
     target_id = string_arg(arguments, "target_id"),
-    dependency_ticket_ids = array(arguments.dependency_ticket_ids),
   }
   table.insert(state.tickets, ticket)
+  for _, dependency_ticket_id in ipairs(dependency_ticket_ids) do
+    table.insert(state.ticket_dependencies, {
+      id = next_id(state, "ticket_dependency"),
+      ticket_id = ticket.id,
+      depends_on_ticket_id = dependency_ticket_id,
+    })
+  end
   push_event(state, "ticket_created", nil, ticket.id)
   local err = save_state(state)
   if err then return err end
@@ -1045,6 +1093,11 @@ local function list_tickets(arguments)
   return ok({ tickets = tickets })
 end
 
+-- Step-transition namespace: route derivation, waiting-transition lifecycle, and wakeup
+-- reconciliation. This main chunk is at Lua's 200-local ceiling, so these helpers share
+-- one table instead of each taking a top-level local.
+local step_transitions = {}
+
 local function add_ticket_dependency(arguments)
   arguments = arguments or {}
   local ticket_id = string_arg(arguments, "ticket_id")
@@ -1060,11 +1113,11 @@ local function add_ticket_dependency(arguments)
   if not find_by_id(state.tickets, dependency_ticket_id) then
     return failure("not_found", "dependency ticket not found: " .. dependency_ticket_id)
   end
-  ticket.dependency_ticket_ids = array(ticket.dependency_ticket_ids)
-  if table_contains(ticket.dependency_ticket_ids, dependency_ticket_id) then
-    return ok({ ticket = ticket })
+  for _, existing in ipairs(state.ticket_dependencies) do
+    if existing.ticket_id == ticket.id and existing.depends_on_ticket_id == dependency_ticket_id then
+      return ok({ ticket = ticket, dependency = existing })
+    end
   end
-  table.insert(ticket.dependency_ticket_ids, dependency_ticket_id)
   local dependency = {
     id = string_arg(arguments, "id") or next_id(state, "ticket_dependency"),
     ticket_id = ticket.id,
@@ -1072,9 +1125,10 @@ local function add_ticket_dependency(arguments)
   }
   table.insert(state.ticket_dependencies, dependency)
   push_event(state, "ticket_dependency_added", nil, ticket.id, { dependency_ticket_id = dependency_ticket_id })
+  step_transitions.reconcile_waiting(state)
   local err = save_state(state)
   if err then return err end
-  return ok({ ticket = ticket })
+  return ok({ ticket = ticket, dependency = dependency })
 end
 
 local function remove_ticket_dependency(arguments)
@@ -1093,24 +1147,16 @@ local function remove_ticket_dependency(arguments)
   if not dependency_ticket_id then return failure("validation_failed", "dependency_ticket_id is required", { "dependency_ticket_id" }) end
   local ticket = find_by_id(state.tickets, ticket_id)
   if not ticket then return failure("not_found", "ticket not found: " .. ticket_id) end
-  local dependencies = {}
-  local removed = false
-  for _, id in ipairs(array(ticket.dependency_ticket_ids)) do
-    if id == dependency_ticket_id then
-      removed = true
-    else
-      table.insert(dependencies, id)
-    end
-  end
-  if not removed then return ok({ ticket = ticket }) end
-  ticket.dependency_ticket_ids = dependencies
+  local removed
   for index = #state.ticket_dependencies, 1, -1 do
     local dependency = state.ticket_dependencies[index]
     if dependency.ticket_id == ticket.id and dependency.depends_on_ticket_id == dependency_ticket_id then
-      table.remove(state.ticket_dependencies, index)
+      removed = table.remove(state.ticket_dependencies, index)
     end
   end
+  if not removed then return ok({ ticket = ticket }) end
   push_event(state, "ticket_dependency_removed", nil, ticket.id, { dependency_ticket_id = dependency_ticket_id })
+  step_transitions.reconcile_waiting(state)
   local err = save_state(state)
   if err then return err end
   return ok({ ticket = ticket })
@@ -1118,16 +1164,39 @@ end
 
 local function unmet_ticket_dependencies(state, ticket)
   local unmet = {}
-  for _, dependency_ticket_id in ipairs(array(ticket and ticket.dependency_ticket_ids)) do
-    local dependency_ticket = find_by_id(state.tickets, dependency_ticket_id)
-    if not dependency_ticket or dependency_ticket.status ~= "closed" then
-      table.insert(unmet, {
-        dependency_ticket_id = dependency_ticket_id,
-        status = dependency_ticket and (dependency_ticket.status or "open") or "missing",
-      })
+  if not ticket then return unmet end
+  for _, dependency in ipairs(state.ticket_dependencies) do
+    if dependency.ticket_id == ticket.id then
+      local dependency_ticket = find_by_id(state.tickets, dependency.depends_on_ticket_id)
+      if not dependency_ticket or dependency_ticket.status ~= "closed" then
+        table.insert(unmet, {
+          dependency_id = dependency.id,
+          dependency_ticket_id = dependency.depends_on_ticket_id,
+          status = dependency_ticket and (dependency_ticket.status or "open") or "missing",
+        })
+      end
     end
   end
   return unmet
+end
+
+function step_transitions.clear_waiting(state, run, reason)
+  local waiting = run.waiting_transition
+  if type(waiting) ~= "table" then return false end
+  run.waiting_transition = nil
+  push_event(state, "ticket_dependencies_waiting_cleared", run.id, waiting.target_step_id, {
+    source_step_id = waiting.source_step_id,
+    source_run_step_id = waiting.source_run_step_id,
+    request_id = waiting.request_id,
+    reason = reason,
+  })
+  return true
+end
+
+function step_transitions.clear_waiting_for_ticket(state, ticket_id, reason)
+  for _, run in ipairs(state.runs) do
+    if run.ticket_id == ticket_id then step_transitions.clear_waiting(state, run, reason) end
+  end
 end
 
 local function existing_spawn_activation(state, run, step)
@@ -1492,6 +1561,9 @@ local function submit_gate(arguments)
     gate_id = gate_id,
     status = result.status,
   })
+  -- Gate results are transition authorization inputs, so a retained waiting transition
+  -- must be re-evaluated in the same atomic save that changes them.
+  step_transitions.reconcile_waiting(state)
   local err = save_state(state)
   if err then return err end
   return ok({ gate_result = result })
@@ -1542,6 +1614,9 @@ local function submit_review(arguments)
     push_event(state, "finding_opened", run_id, finding.id, { review_id = review.id })
   end
   push_event(state, "review_submitted", run_id, review.id, { verdict = verdict })
+  -- Reviews and their findings are transition authorization inputs; re-evaluate any
+  -- retained waiting transition in the same atomic save.
+  step_transitions.reconcile_waiting(state)
   local err = save_state(state)
   if err then return err end
   return ok({ review = review })
@@ -1559,6 +1634,9 @@ local function resolve_finding(arguments)
   finding.status = status
   finding.resolution = string_arg(arguments, "resolution")
   push_event(state, "finding_resolved", finding.run_id, finding.id)
+  -- Unresolved blocker/high findings are transition authorization inputs; resolving or
+  -- waiving one can restore a retained waiting transition.
+  step_transitions.reconcile_waiting(state)
   local err = save_state(state)
   if err then return err end
   return ok({ finding = finding })
@@ -1748,6 +1826,166 @@ local function transition_blockers(state, run, pipeline, step)
   return blockers
 end
 
+local function dependency_blockers_for_step(state, ticket, step)
+  if step.allows_open_ticket_dependencies == true then return {} end
+  return unmet_ticket_dependencies(state, ticket)
+end
+
+-- Single authority for the route a source visit is currently allowed to take.
+-- Advancement and waiting-transition wakeup both derive the target from this so a
+-- review verdict landed while waiting cannot be applied against a stale route.
+function step_transitions.route_for(state, run, current_step, requested_next_step_id)
+  local latest_review = review_for_current_visit(state, run, current_step)
+  if latest_review and latest_review.verdict == "approved" then
+    return current_step.on_approved_step_id or current_step.next_step_id, false, latest_review
+  end
+  if latest_review and latest_review.verdict == "changes_required" then
+    return current_step.on_changes_requested_step_id, true, latest_review
+  end
+  if latest_review and latest_review.verdict == "blocked" then
+    return current_step.on_blocked_step_id, true, latest_review
+  end
+  return requested_next_step_id or current_step.next_step_id, false, nil
+end
+
+-- Revalidate a waiting transition against current review, gate, and finding state.
+-- Gate overrides recorded on the transition waive exactly the gate ids the operator
+-- named; nothing else carries forward from the original request.
+function step_transitions.waiting_authorization_blockers(state, run, pipeline, waiting)
+  local source_step = find_pipeline_step(pipeline, waiting.source_step_id)
+  if not source_step then
+    return { { kind = "source_step_missing", step_id = waiting.source_step_id } }
+  end
+  local route, review_rework = step_transitions.route_for(state, run, source_step, waiting.target_step_id)
+  if route ~= waiting.target_step_id then
+    return { {
+      kind = "route_changed",
+      waiting_step_id = waiting.target_step_id,
+      current_step_id = route,
+    } }
+  end
+  if review_rework then return {} end
+  local overridden = array(waiting.overridden_gate_ids)
+  local blockers = {}
+  for _, blocker in ipairs(transition_blockers(state, run, pipeline, source_step)) do
+    if not (blocker.kind == "gate" and table_contains(overridden, blocker.gate_id)) then
+      table.insert(blockers, blocker)
+    end
+  end
+  return blockers
+end
+
+local function transition_response(run, source_step_id, target_step_id)
+  local response_run = copy(run)
+  response_run.current_step_id = target_step_id
+  response_run.status = "active"
+  response_run.waiting_transition = nil
+  return ok({ run = response_run, previous_step_id = source_step_id, step_id = target_step_id })
+end
+
+local function apply_step_transition(state, run, transition, recovered)
+  if run.current_step_id ~= transition.source_step_id
+    or run.current_run_step_id ~= transition.source_run_step_id
+  then
+    return failure("transition_source_changed", "waiting transition no longer matches the current run-step visit")
+  end
+  local previous_run_step = find_by_id(state.run_steps, transition.source_run_step_id)
+  if not previous_run_step then
+    return failure("transition_source_missing", "waiting transition source run-step is missing")
+  end
+  -- The gate override is an audit fact about an applied advancement, so it is recorded
+  -- here rather than when the override was requested; a request that never advances
+  -- (dependency wait, remaining blockers) must not leave a consumed override behind.
+  local overridden_gate_ids = array(transition.overridden_gate_ids)
+  if #overridden_gate_ids > 0 then
+    push_event(state, "gates_overridden", run.id, transition.source_step_id, {
+      run_step_id = transition.source_run_step_id,
+      gate_ids = copy(overridden_gate_ids),
+      reason = transition.override_reason,
+    })
+  end
+  previous_run_step.status = "done"
+  run.current_step_id = transition.target_step_id
+  run.status = "active"
+  local run_step = {
+    id = next_id(state, "run_step"), run_id = run.id, step_id = transition.target_step_id,
+    status = "active", sequence = (previous_run_step.sequence or 0) + 1,
+  }
+  table.insert(state.run_steps, run_step)
+  run.current_run_step_id = run_step.id
+  run.waiting_transition = nil
+  push_event(state, "step_advanced", run.id, transition.target_step_id, {
+    from_step_id = transition.source_step_id,
+    request_id = transition.request_id,
+    recovered = recovered == true,
+  })
+  if transition.advance_request_id then
+    local request = find_by_id(state.advance_requests, transition.advance_request_id)
+    if request then request.status = "applied" end
+  end
+  return transition.result or transition_response(run, transition.source_step_id, transition.target_step_id)
+end
+
+-- Park an authorized-but-unappliable transition as durable waiting state. Dependency and
+-- authorization holds share one record so the operator sees a single reason set.
+function step_transitions.hold(state, run, transition, dependencies, authorization)
+  local waiting = run.waiting_transition
+  local first_wait = type(waiting) ~= "table"
+    or waiting.source_run_step_id ~= transition.source_run_step_id
+    or waiting.target_step_id ~= transition.target_step_id
+  local previously_unauthorized = type(waiting) == "table" and waiting.unauthorized == true
+  local blocked_by_dependencies = #dependencies > 0
+  transition.status = "waiting"
+  transition.code = blocked_by_dependencies and "ticket_dependencies_unmet" or "transition_authorization_changed"
+  transition.unmet_dependencies = blocked_by_dependencies and copy(dependencies) or nil
+  transition.unauthorized = #authorization > 0 or nil
+  transition.unmet_authorization = #authorization > 0 and copy(authorization) or nil
+  run.waiting_transition = copy(transition)
+  if first_wait then
+    push_event(state, "ticket_dependencies_waiting", run.id, transition.target_step_id, {
+      source_step_id = transition.source_step_id,
+      source_run_step_id = transition.source_run_step_id,
+      request_id = transition.request_id,
+      unmet_dependencies = copy(dependencies),
+    })
+  end
+  if #authorization > 0 and not previously_unauthorized then
+    push_event(state, "ticket_dependencies_waiting_unauthorized", run.id, transition.target_step_id, {
+      source_step_id = transition.source_step_id,
+      source_run_step_id = transition.source_run_step_id,
+      request_id = transition.request_id,
+      blockers = copy(authorization),
+    })
+  end
+  return diagnostic_failure(
+    transition.code,
+    blocked_by_dependencies and "ticket has open blocking dependencies"
+      or "the authorization that justified this transition no longer holds",
+    {
+      status = "waiting",
+      run_id = run.id,
+      step_id = transition.source_step_id,
+      next_step_id = transition.target_step_id,
+      waiting_transition = copy(run.waiting_transition),
+      unmet_dependencies = copy(dependencies),
+      unmet_authorization = copy(authorization),
+    }
+  )
+end
+
+-- The single authority for applying a previously requested transition. A correlated
+-- retry and dependency-clearance wakeup are the same operation and must satisfy the same
+-- two conditions: the ticket's blocking dependencies are met, and the authorization that
+-- justified the original request still holds. Returns (applied_result, hold_failure).
+function step_transitions.settle(state, run, pipeline, ticket, target_step, transition)
+  local dependencies = dependency_blockers_for_step(state, ticket, target_step)
+  local authorization = step_transitions.waiting_authorization_blockers(state, run, pipeline, transition)
+  if #dependencies == 0 and #authorization == 0 then
+    return apply_step_transition(state, run, transition, true), nil
+  end
+  return nil, step_transitions.hold(state, run, transition, dependencies, authorization)
+end
+
 local function request_step_advance(arguments)
   arguments = arguments or {}
   local run_id = string_arg(arguments, "run_id")
@@ -1755,6 +1993,10 @@ local function request_step_advance(arguments)
   local state = load_state()
   local run = find_by_id(state.runs, run_id)
   if not run then return failure("not_found", "run not found: " .. run_id) end
+  local pipeline = find_by_id(state.pipeline_definitions, run.pipeline_definition_id)
+  if not pipeline then return failure("not_found", "pipeline definition not found: " .. run.pipeline_definition_id) end
+  local ticket = find_by_id(state.tickets, run.ticket_id)
+  if not ticket then return failure("not_found", "ticket not found: " .. tostring(run.ticket_id)) end
   local request_id = string_arg(arguments, "request_id")
   if request_id then
     for _, request in ipairs(state.advance_requests) do
@@ -1763,22 +2005,37 @@ local function request_step_advance(arguments)
           return failure("request_id_conflict", "advance request_id belongs to another run")
         end
         if run.current_step_id == request.previous_step_id then
-          local previous_run_step = find_by_id(state.run_steps, run.current_run_step_id)
-          if previous_run_step then previous_run_step.status = "done" end
-          run.current_step_id = request.step_id
-          run.status = "active"
-          local recovered_run_step = {
-            id = next_id(state, "run_step"), run_id = run.id, step_id = request.step_id,
-            status = "active", sequence = previous_run_step and (previous_run_step.sequence or 0) + 1 or 1,
-          }
-          table.insert(state.run_steps, recovered_run_step)
-          run.current_run_step_id = recovered_run_step.id
-          push_event(state, "step_advanced", run.id, request.step_id, {
-            from_step_id = request.previous_step_id,
-            request_id = request.request_id,
-            recovered = true,
-          })
-          request.status = "applied"
+          local target_step = find_pipeline_step(pipeline, request.step_id)
+          if not target_step then return failure("not_found", "step not found: " .. tostring(request.step_id)) end
+          -- While a request is parked, run.waiting_transition is the authority: it carries
+          -- the exact source visit and any gate override the operator authorized.
+          -- Rebuilding from the advance_request alone would silently drop that override.
+          local waiting = run.waiting_transition
+          local transition
+          if type(waiting) == "table"
+            and waiting.request_id == request.request_id
+            and waiting.source_step_id == request.previous_step_id
+            and waiting.target_step_id == request.step_id
+            and waiting.source_run_step_id == run.current_run_step_id
+          then
+            transition = copy(waiting)
+          else
+            transition = {
+              source_step_id = request.previous_step_id,
+              source_run_step_id = run.current_run_step_id,
+              target_step_id = request.step_id,
+              request_id = request.request_id,
+              result = copy(request.result),
+            }
+          end
+          transition.advance_request_id = request.id
+          local applied, held = step_transitions.settle(state, run, pipeline, ticket, target_step, transition)
+          if held then
+            local waiting_error = save_state(state)
+            if waiting_error then return waiting_error end
+            return held
+          end
+          if applied.ok == false then return applied end
           local recovered_error = save_state(state)
           if recovered_error then return recovered_error end
         elseif run.current_step_id ~= request.step_id then
@@ -1792,23 +2049,10 @@ local function request_step_advance(arguments)
       end
     end
   end
-  local pipeline = find_by_id(state.pipeline_definitions, run.pipeline_definition_id)
-  if not pipeline then return failure("not_found", "pipeline definition not found: " .. run.pipeline_definition_id) end
   local current_step = find_pipeline_step(pipeline, run.current_step_id)
   if not current_step then return failure("not_found", "current step not found: " .. tostring(run.current_step_id)) end
-  local latest_review = review_for_current_visit(state, run, current_step)
-  local review_rework = latest_review
-    and (latest_review.verdict == "changes_required" or latest_review.verdict == "blocked")
-  local next_step_id
-  if latest_review and latest_review.verdict == "approved" then
-    next_step_id = current_step.on_approved_step_id or current_step.next_step_id
-  elseif latest_review and latest_review.verdict == "changes_required" then
-    next_step_id = current_step.on_changes_requested_step_id
-  elseif latest_review and latest_review.verdict == "blocked" then
-    next_step_id = current_step.on_blocked_step_id
-  else
-    next_step_id = string_arg(arguments, "next_step_id") or current_step.next_step_id
-  end
+  local next_step_id, review_rework, latest_review =
+    step_transitions.route_for(state, run, current_step, string_arg(arguments, "next_step_id"))
   if review_rework and not next_step_id then
     return failure("review_route_missing", "current step has no route for review verdict " .. latest_review.verdict)
   end
@@ -1816,19 +2060,14 @@ local function request_step_advance(arguments)
   local next_step = find_pipeline_step(pipeline, next_step_id)
   if not next_step then return failure("not_found", "next step not found: " .. next_step_id) end
   local blockers = review_rework and {} or transition_blockers(state, run, pipeline, current_step)
-  local ticket = find_by_id(state.tickets, run.ticket_id)
-  if not review_rework and next_step.allows_open_ticket_dependencies ~= true then
-    for _, dependency in ipairs(unmet_ticket_dependencies(state, ticket)) do
-      table.insert(blockers, { kind = "ticket_dependency", dependency = dependency })
-    end
-  end
+  local overridden_gate_ids = {}
+  local override_reason
   if arguments.override_unmet_gates == true then
-    local override_reason = trim(arguments.override_reason)
+    override_reason = trim(arguments.override_reason)
     if not override_reason or override_reason == "" then
       return failure("validation_failed", "override_reason is required when override_unmet_gates is true", { "override_reason" })
     end
     local remaining = {}
-    local overridden_gate_ids = {}
     for _, blocker in ipairs(blockers) do
       if blocker.kind == "gate" then
         table.insert(overridden_gate_ids, blocker.gate_id)
@@ -1837,13 +2076,6 @@ local function request_step_advance(arguments)
       end
     end
     blockers = remaining
-    if #overridden_gate_ids > 0 then
-      push_event(state, "gates_overridden", run.id, current_step.id, {
-        run_step_id = run.current_run_step_id,
-        gate_ids = overridden_gate_ids,
-        reason = override_reason,
-      })
-    end
   end
   if #blockers > 0 then
     return diagnostic_failure("transition_blocked", "step transition has unmet requirements", {
@@ -1854,10 +2086,7 @@ local function request_step_advance(arguments)
       blockers = blockers,
     })
   end
-  local response_run = copy(run)
-  response_run.current_step_id = next_step_id
-  response_run.status = "active"
-  local response = ok({ run = response_run, previous_step_id = current_step.id, step_id = next_step_id })
+  local response = transition_response(run, current_step.id, next_step_id)
   local advance_request
   if request_id then
     advance_request = {
@@ -1870,30 +2099,77 @@ local function request_step_advance(arguments)
       result = copy(response),
     }
     table.insert(state.advance_requests, advance_request)
+  end
+  local transition = {
+    source_step_id = current_step.id,
+    source_run_step_id = run.current_run_step_id,
+    target_step_id = next_step_id,
+    request_id = request_id,
+    advance_request_id = advance_request and advance_request.id,
+    overridden_gate_ids = #overridden_gate_ids > 0 and copy(overridden_gate_ids) or nil,
+    override_reason = #overridden_gate_ids > 0 and override_reason or nil,
+    result = copy(response),
+  }
+  local dependencies = dependency_blockers_for_step(state, ticket, next_step)
+  if #dependencies > 0 then
+    local blocked = step_transitions.hold(state, run, transition, dependencies, {})
+    local waiting_error = save_state(state)
+    if waiting_error then return waiting_error end
+    return blocked
+  end
+  if advance_request then
     local correlation_error = save_state(state)
     if correlation_error then return correlation_error end
     state = load_state()
     run = find_by_id(state.runs, run_id)
+    ticket = find_by_id(state.tickets, run.ticket_id)
     advance_request = find_by_id(state.advance_requests, advance_request.id)
+    transition.advance_request_id = advance_request.id
+    dependencies = dependency_blockers_for_step(state, ticket, next_step)
+    if #dependencies > 0 then
+      local blocked = step_transitions.hold(state, run, transition, dependencies, {})
+      local waiting_error = save_state(state)
+      if waiting_error then return waiting_error end
+      return blocked
+    end
   end
-  run.current_step_id = next_step_id
-  run.status = "active"
-  local previous_run_step = find_by_id(state.run_steps, run.current_run_step_id)
-  if previous_run_step then previous_run_step.status = "done" end
-  local run_step = {
-    id = next_id(state, "run_step"), run_id = run.id, step_id = next_step_id,
-    status = "active", sequence = previous_run_step and (previous_run_step.sequence or 0) + 1 or 1,
-  }
-  table.insert(state.run_steps, run_step)
-  run.current_run_step_id = run_step.id
-  push_event(state, "step_advanced", run.id, next_step_id, {
-    from_step_id = current_step.id,
-    request_id = request_id,
-  })
-  if advance_request then advance_request.status = "applied" end
+  local applied = apply_step_transition(state, run, transition, false)
+  if applied.ok == false then return applied end
   local err = save_state(state)
   if err then return err end
   return response
+end
+
+-- A waiting transition may only be applied while the run, its ticket, and the preserved
+-- source visit are all still explicitly resumable. Anything terminal (cancelled run,
+-- merged/closed run, closed ticket, completed source visit) fails closed so dependency
+-- clearance can never resurrect work an operator already ended.
+function step_transitions.waiting_resumable(state, run, waiting)
+  if run.status ~= "active" then return false end
+  local ticket = find_by_id(state.tickets, run.ticket_id)
+  if not ticket or ticket.status == "closed" then return false end
+  local source_visit = find_by_id(state.run_steps, waiting.source_run_step_id)
+  if not source_visit or source_visit.status ~= "active" then return false end
+  if run.current_step_id ~= waiting.source_step_id then return false end
+  if run.current_run_step_id ~= waiting.source_run_step_id then return false end
+  return true, ticket
+end
+
+function step_transitions.reconcile_waiting(state)
+  local applied = {}
+  for _, run in ipairs(state.runs) do
+    local waiting = run.waiting_transition
+    if type(waiting) == "table" then
+      local pipeline = find_by_id(state.pipeline_definitions, run.pipeline_definition_id)
+      local target_step = pipeline and find_pipeline_step(pipeline, waiting.target_step_id) or nil
+      local resumable, ticket = step_transitions.waiting_resumable(state, run, waiting)
+      if resumable and target_step then
+        local result = step_transitions.settle(state, run, pipeline, ticket, target_step, waiting)
+        if result and result.ok ~= false then table.insert(applied, run.id) end
+      end
+    end
+  end
+  return applied
 end
 
 local function records_for_run(records, run_id)
@@ -1986,6 +2262,10 @@ local function update_ticket(arguments)
   local ticket = find_by_id(state.tickets, string_arg(arguments, "ticket_id"))
   if not ticket then return failure("not_found", "ticket not found") end
   update_fields(ticket, arguments, { "title", "description", "project_id", "target_id", "status" })
+  if ticket.status == "closed" then
+    step_transitions.clear_waiting_for_ticket(state, ticket.id, "ticket_closed")
+  end
+  step_transitions.reconcile_waiting(state)
   return persist_response(state, "ticket", ticket)
 end
 
@@ -2041,6 +2321,7 @@ local function delete_ticket(arguments)
     local dependency = state.ticket_dependencies[index]
     if dependency.ticket_id == id or dependency.depends_on_ticket_id == id then table.remove(state.ticket_dependencies, index) end
   end
+  step_transitions.reconcile_waiting(state)
   return persist_response(state, "ticket", ticket)
 end
 
@@ -2269,7 +2550,6 @@ local function create_child_run(arguments)
     description = string_arg(arguments, "description"),
     status = "active",
     target_id = string_arg(arguments, "target_id") or parent.target_id or parent_ticket.target_id,
-    dependency_ticket_ids = {},
     parent_ticket_id = parent_ticket.id,
   }
   if find_by_id(state.tickets, ticket.id) then return failure("id_conflict", "ticket id already exists") end
@@ -2315,6 +2595,7 @@ local function finish_run(arguments, run_status, ticket_status)
   if ticket then ticket.status = ticket_status end
   local run_step = find_by_id(state.run_steps, run.current_run_step_id)
   if run_step then run_step.status = run_status end
+  step_transitions.clear_waiting(state, run, "run_" .. run_status)
   push_event(state, "run_" .. run_status, run.id, ticket and ticket.id, {
     reason = string_arg(arguments, "reason"),
   })
@@ -2352,13 +2633,17 @@ local function close_ticket(arguments)
   ticket.merge_summary = string_arg(arguments, "merge_summary")
   ticket.base_branch = string_arg(arguments, "base_branch")
   for _, run in ipairs(state.runs) do
-    if run.ticket_id == ticket.id and run.status ~= "closed" and run.status ~= "cancelled" then
-      run.status = "closed"
-      local run_step = find_by_id(state.run_steps, run.current_run_step_id)
-      if run_step then run_step.status = "closed" end
+    if run.ticket_id == ticket.id then
+      if run.status ~= "closed" and run.status ~= "cancelled" then
+        run.status = "closed"
+        local run_step = find_by_id(state.run_steps, run.current_run_step_id)
+        if run_step then run_step.status = "closed" end
+      end
+      step_transitions.clear_waiting(state, run, "ticket_closed")
     end
   end
   push_event(state, "ticket_closed", nil, ticket.id)
+  step_transitions.reconcile_waiting(state)
   return persist_response(state, "ticket", ticket)
 end
 
@@ -2379,11 +2664,13 @@ local function handle_pr_merged(arguments)
   if ticket then ticket.status = "closed" end
   local run_step = find_by_id(state.run_steps, run.current_run_step_id)
   if run_step then run_step.status = "closed" end
+  step_transitions.clear_waiting(state, run, "provider_pr_merged")
   if matched_link then
     matched_link.status = "merged"
     matched_link.merge_commit = string_arg(arguments, "merge_commit")
   end
   push_event(state, "provider_pr_merged", run.id, matched_link and matched_link.id, { merge_commit = arguments.merge_commit })
+  step_transitions.reconcile_waiting(state)
   local err = save_state(state)
   if err then return err end
   return ok({ run = run, run_step = run_step, ticket = ticket, pr_link = matched_link })
@@ -2884,7 +3171,7 @@ local function status_summary(context)
     end
   end
   for _, run in ipairs(context.runs) do
-    if type(run.blocked_transition) == "table" then
+    if type(run.blocked_transition) == "table" or type(run.waiting_transition) == "table" then
       summary.blocked_transitions = summary.blocked_transitions + 1
     end
     if run.status == "active" then
@@ -2979,22 +3266,38 @@ local function list_section(id, title, empty_title, items)
   return section_node(id, title, nil, { list_node(id .. "-list", children) })
 end
 
+-- One description for a durable hold, so the attention queue and the runs table agree on
+-- why a run is parked whether it waits on dependencies or on lapsed authorization.
+-- Returns the descriptive clause and the same reasons as discrete labels.
+local function hold_reason(context, blocked)
+  local labels = {}
+  for _, dependency in ipairs(array(blocked.unmet_dependencies)) do
+    local dependency_ticket = find_by_id(context.tickets, dependency.dependency_ticket_id)
+    table.insert(labels, dependency_ticket and dependency_ticket.title or dependency.dependency_ticket_id)
+  end
+  if #labels > 0 then return "for " .. table.concat(labels, ", "), labels end
+  for _, blocker in ipairs(array(blocked.unmet_authorization)) do
+    local subject = blocker.gate_id or blocker.finding_id or blocker.review_id or blocker.current_step_id
+    table.insert(labels, subject and (tostring(blocker.kind) .. " " .. tostring(subject)) or tostring(blocker.kind))
+  end
+  if #labels > 0 then return "until authorization is restored: " .. table.concat(labels, ", "), labels end
+  return "with no recorded blockers", labels
+end
+
 local function attention_items(context)
   local items = {}
   for _, run in ipairs(context.runs) do
-    local blocked = run.blocked_transition
-    if type(blocked) == "table" and blocked.code == "ticket_dependencies_unmet" then
+    local blocked = run.waiting_transition or run.blocked_transition
+    -- Select on the durable hold record itself, the same predicate status_summary counts,
+    -- so the queue and the needs-attention metric cannot disagree. Keying on a single code
+    -- string silently dropped authorization holds, which are exactly the ones needing a human.
+    if type(blocked) == "table" then
       local ticket = ticket_for_run(context, run)
-      local names = {}
-      for _, dependency in ipairs(array(blocked.unmet_dependencies)) do
-        local dependency_ticket = find_by_id(context.tickets, dependency.dependency_ticket_id)
-        table.insert(names, dependency_ticket and dependency_ticket.title or dependency.dependency_ticket_id)
-      end
       table.insert(items, list_item(
         "project-pipelines-attention-dependencies-" .. run.id,
         ticket and ticket.title or run.ticket_id,
-        "Blocked before " .. tostring(blocked.step_id) .. " by " .. table.concat(names, ", "),
-        "blocked"
+        "Waiting before " .. tostring(blocked.target_step_id or blocked.step_id) .. " " .. hold_reason(context, blocked),
+        run.waiting_transition and "waiting" or "blocked"
       ))
     end
   end
@@ -3030,13 +3333,13 @@ local function running_items(context)
     if run.status == "active" then
       local ticket = ticket_for_run(context, run)
       local pipeline = pipeline_for_run(context, run)
-      local blocked = run.blocked_transition
-      local step_id = type(blocked) == "table" and blocked.step_id or run.current_step_id
+      local blocked = run.waiting_transition or run.blocked_transition
+      local step_id = type(blocked) == "table" and (blocked.target_step_id or blocked.step_id) or run.current_step_id
       table.insert(items, list_item(
         "project-pipelines-running-" .. run.id,
         ticket and ticket.title or run.id,
         (pipeline and pipeline.name or run.pipeline_definition_id) .. " / " .. tostring(step_id),
-        type(blocked) == "table" and "blocked" or run.status
+        run.waiting_transition and "waiting" or (type(blocked) == "table" and "blocked" or run.status)
       ))
     end
   end
@@ -3062,6 +3365,7 @@ end
 local bound_list
 
 local function run_status_label(run)
+  if type(run.waiting_transition) == "table" then return "waiting" end
   if type(run.blocked_transition) == "table" then return "blocked" end
   return run.status or "unknown"
 end
@@ -3109,18 +3413,18 @@ local function run_rows(context)
   for _, run in ipairs(context.runs) do
     local ticket = ticket_for_run(context, run)
     local pipeline = pipeline_for_run(context, run)
-    local blocked = run.blocked_transition
+    local blocked = run.waiting_transition or run.blocked_transition
     local blockers = {}
-    for _, dependency in ipairs(type(blocked) == "table" and array(blocked.unmet_dependencies) or {}) do
-      local dependency_ticket = find_by_id(context.tickets, dependency.dependency_ticket_id)
-      table.insert(blockers, dependency_ticket and dependency_ticket.title or dependency.dependency_ticket_id)
+    if type(blocked) == "table" then
+      local _, labels = hold_reason(context, blocked)
+      blockers = labels
     end
     table.insert(rows, {
       id = run.id,
       cells = {
         ticket = ticket and ticket.title or run.ticket_id,
         pipeline = pipeline and pipeline.name or run.pipeline_definition_id,
-        step = type(blocked) == "table" and blocked.step_id or run.current_step_id or "",
+        step = type(blocked) == "table" and (blocked.target_step_id or blocked.step_id) or run.current_step_id or "",
         blocker = table.concat(blockers, ", "),
         status = run_status_label(run),
       },
@@ -5193,6 +5497,7 @@ extend_contract("create_ticket", {
   status = { type = "string", enum = { "open", "active", "blocked", "closed" } },
   dependency_ticket_ids = { type = "array", items = STRING_PROPERTY },
 }, { "project_id", "title" })
+TOOL_CONTRACTS.create_ticket.description = "Create a project ticket. dependency_ticket_ids is an optional array of ticket IDs that is validated and atomically registered as normalized blocking dependency rows; it is never persisted on the ticket payload."
 extend_contract("create_pipeline", { project_id = STRING_PROPERTY })
 extend_contract("start_run", {
   id = STRING_PROPERTY, spawn_target_id = STRING_PROPERTY, branch = STRING_PROPERTY,

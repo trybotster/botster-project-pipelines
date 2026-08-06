@@ -292,6 +292,669 @@ assert(tools["project_pipelines.create_pipeline"]({
   },
 }).ok)
 
+assert(tools["project_pipelines.create_pipeline"]({
+  id = "pipeline-durable-dependency", name = "Durable dependency",
+  steps = {
+    {
+      id = "plan-review", name = "Plan Review", allows_open_ticket_dependencies = true,
+      on_approved_step_id = "implement",
+    },
+    { id = "implement", name = "Implement" },
+  },
+}).ok)
+assert(tools["project_pipelines.create_ticket"]({
+  id = "durable-dependency-open", project_id = "project-one", title = "Durable dependency",
+}).ok)
+assert(tools["project_pipelines.create_ticket"]({
+  id = "durable-dependent", project_id = "project-one", title = "Durable dependent",
+}).ok)
+local durable_dependency_run = tools["project_pipelines.start_run"]({
+  id = "run-durable-dependency", ticket_id = "durable-dependent", pipeline_id = "pipeline-durable-dependency",
+})
+assert(durable_dependency_run.ok)
+
+-- Reproduce the observed production/import shape. The normalized dependency row
+-- is durable and the ticket payload has no embedded dependency mirror.
+durable_store["v3/tickets/durable-dependent"].payload.dependency_ticket_ids = nil
+durable_store["v3/ticket_dependencies/durable-dependency-row"] = {
+  key = "v3/ticket_dependencies/durable-dependency-row",
+  schema_version = 3,
+  revision = 1,
+  payload = {
+    id = "durable-dependency-row",
+    ticket_id = "durable-dependent",
+    depends_on_ticket_id = "durable-dependency-open",
+  },
+}
+local durable_dependency_plugin = dofile("plugin.lua")
+local durable_dependency_tools = {}
+for _, descriptor in ipairs(durable_dependency_plugin.tools) do
+  durable_dependency_tools[descriptor.name] = descriptor.call
+end
+assert(durable_dependency_tools["project_pipelines.submit_review"]({
+  run_id = "run-durable-dependency",
+  run_step_id = durable_dependency_run.run_step.id,
+  step_id = "plan-review",
+  verdict = "approved",
+}).ok)
+local durable_dependency_advance = durable_dependency_tools["project_pipelines.request_step_advance"]({
+  run_id = "run-durable-dependency",
+  request_id = "advance-durable-dependency",
+})
+assert(not durable_dependency_advance.ok and durable_dependency_advance.error.code == "ticket_dependencies_unmet",
+  "normalized durable dependency must block approved Plan Review advancement")
+local durable_waiting_context = durable_dependency_tools["project_pipelines.current_context"]({ run_id = "run-durable-dependency" })
+assert(durable_waiting_context.run.current_step_id == "plan-review")
+assert(durable_waiting_context.run.current_run_step_id == durable_dependency_run.run_step.id)
+assert(durable_waiting_context.run.waiting_transition.source_run_step_id == durable_dependency_run.run_step.id)
+assert(durable_waiting_context.run.waiting_transition.target_step_id == "implement")
+assert(#durable_waiting_context.run_steps == 1, "waiting must not create the target run-step")
+
+local create_descriptor = descriptors["project_pipelines.create_ticket"]
+assert(create_descriptor.input_schema.properties.dependency_ticket_ids.type == "array")
+assert(create_descriptor.input_schema.properties.dependency_ticket_ids.items.type == "string")
+assert(create_descriptor.description:find("atomically registered as normalized blocking dependency rows", 1, true))
+local authored_dependency_ticket = tools["project_pipelines.create_ticket"]({
+  id = "authored-dependencies", project_id = "project-one", title = "Authored dependencies",
+  dependency_ticket_ids = { "durable-dependency-open", "durable-dependency-open" },
+})
+assert(authored_dependency_ticket.ok and authored_dependency_ticket.ticket.dependency_ticket_ids == nil)
+local authored_rows = tools["project_pipelines.list_ticket_dependencies"]({ ticket_id = "authored-dependencies" }).dependencies
+assert(#authored_rows == 1 and authored_rows[1].depends_on_ticket_id == "durable-dependency-open")
+durable_store["v3/tickets/authored-dependencies"].payload.dependency_ticket_ids = { "non-authoritative-mirror" }
+assert(tools["project_pipelines.get_ticket"]({ ticket_id = "authored-dependencies" }).ticket.dependency_ticket_ids == nil)
+assert(tools["project_pipelines.update_ticket"]({ ticket_id = "authored-dependencies", description = "Mirror removed" }).ok)
+assert(durable_store["v3/tickets/authored-dependencies"].payload.dependency_ticket_ids == nil,
+  "next atomic write must remove a non-authoritative ticket mirror")
+local tickets_before_invalid_create = #tools["project_pipelines.list_tickets"]({}).tickets
+local invalid_authored_dependency = tools["project_pipelines.create_ticket"]({
+  id = "invalid-authored-dependencies", project_id = "project-one", title = "Invalid authored dependencies",
+  dependency_ticket_ids = { "durable-dependency-open", "missing-authored-dependency" },
+})
+assert(not invalid_authored_dependency.ok and invalid_authored_dependency.error.code == "not_found")
+assert(#tools["project_pipelines.list_tickets"]({}).tickets == tickets_before_invalid_create,
+  "invalid authored dependencies must create neither ticket nor normalized rows")
+assert(#tools["project_pipelines.list_ticket_dependencies"]({ ticket_id = "invalid-authored-dependencies" }).dependencies == 0)
+fail_batch_key_prefix = "v3/tickets/atomic-authored-dependencies"
+local failed_authored_dependency = tools["project_pipelines.create_ticket"]({
+  id = "atomic-authored-dependencies", project_id = "project-one", title = "Atomic authored dependencies",
+  dependency_ticket_ids = { "durable-dependency-open" },
+})
+assert(not failed_authored_dependency.ok and failed_authored_dependency.error.code == "persist_failed")
+fail_batch_key_prefix = nil
+assert(#tools["project_pipelines.list_ticket_dependencies"]({ ticket_id = "atomic-authored-dependencies" }).dependencies == 0)
+for _, existing_ticket in ipairs(tools["project_pipelines.list_tickets"]({}).tickets) do
+  assert(existing_ticket.id ~= "atomic-authored-dependencies", "failed create must not persist the ticket")
+end
+
+assert(tools["project_pipelines.create_pipeline"]({
+  id = "pipeline-waiting-wakeup", name = "Waiting wakeup",
+  steps = {
+    {
+      id = "waiting-plan-review", name = "Plan Review", allows_open_ticket_dependencies = true,
+      on_approved_step_id = "waiting-implement",
+    },
+    {
+      id = "waiting-implement", name = "Implement", kind = "pty",
+      session_template_id = "template_codex",
+    },
+  },
+}).ok)
+
+local function context_for(run_id)
+  return tools["project_pipelines.current_context"]({ run_id = run_id })
+end
+
+local function count_events(run_id, kind)
+  local total = 0
+  for _, event in ipairs(context_for(run_id).events) do
+    if event.kind == kind then total = total + 1 end
+  end
+  return total
+end
+
+local function create_waiting_scenario(prefix, blocker_count)
+  assert(tools["project_pipelines.create_ticket"]({
+    id = prefix .. "-ticket", project_id = "project-one", target_id = "target-one", title = prefix .. " ticket",
+  }).ok)
+  local started_waiting = tools["project_pipelines.start_run"]({
+    id = prefix .. "-run", ticket_id = prefix .. "-ticket", pipeline_id = "pipeline-waiting-wakeup",
+  })
+  assert(started_waiting.ok)
+  local dependency_ids = {}
+  for index = 1, blocker_count do
+    local dependency_id = prefix .. "-dependency-" .. tostring(index)
+    table.insert(dependency_ids, dependency_id)
+    assert(tools["project_pipelines.create_ticket"]({
+      id = dependency_id, project_id = "project-one", title = dependency_id,
+    }).ok)
+    assert(tools["project_pipelines.add_ticket_dependency"]({
+      id = prefix .. "-row-" .. tostring(index),
+      ticket_id = prefix .. "-ticket", dependency_ticket_id = dependency_id,
+    }).ok)
+  end
+  assert(tools["project_pipelines.submit_review"]({
+    run_id = prefix .. "-run", run_step_id = started_waiting.run_step.id,
+    step_id = "waiting-plan-review", verdict = "approved",
+  }).ok)
+  local spawned_before = #spawned
+  local waiting = tools["project_pipelines.request_step_advance"]({
+    run_id = prefix .. "-run", request_id = prefix .. "-advance",
+  })
+  assert(not waiting.ok and waiting.error.code == "ticket_dependencies_unmet")
+  local waiting_context = context_for(prefix .. "-run")
+  assert(waiting_context.run.current_step_id == "waiting-plan-review")
+  assert(waiting_context.run.current_run_step_id == started_waiting.run_step.id)
+  assert(waiting_context.run.waiting_transition.source_run_step_id == started_waiting.run_step.id)
+  assert(#waiting_context.run.waiting_transition.unmet_dependencies == blocker_count)
+  assert(#waiting_context.run_steps == 1 and #spawned == spawned_before)
+  return {
+    run_id = prefix .. "-run",
+    ticket_id = prefix .. "-ticket",
+    run_step_id = started_waiting.run_step.id,
+    dependency_ids = dependency_ids,
+    spawned_before = spawned_before,
+  }
+end
+
+local function assert_woken_once(scenario)
+  local context = context_for(scenario.run_id)
+  assert(context.run.current_step_id == "waiting-implement")
+  assert(context.run.waiting_transition == nil)
+  assert(#context.run_steps == 2, "final clearance must create exactly one target run-step")
+  local source_visits, target_visits = 0, 0
+  for _, run_step in ipairs(context.run_steps) do
+    if run_step.id == scenario.run_step_id then
+      source_visits = source_visits + 1
+      assert(run_step.status == "done")
+    elseif run_step.step_id == "waiting-implement" then
+      target_visits = target_visits + 1
+      assert(run_step.status == "active")
+    end
+  end
+  assert(source_visits == 1 and target_visits == 1)
+end
+
+assert(tools["project_pipelines.create_ticket"]({
+  id = "waiting-recovery-ticket", project_id = "project-one", title = "Waiting recovery ticket",
+}).ok)
+local recovery_started = tools["project_pipelines.start_run"]({
+  id = "waiting-recovery-run", ticket_id = "waiting-recovery-ticket", pipeline_id = "pipeline-waiting-wakeup",
+})
+assert(recovery_started.ok)
+assert(tools["project_pipelines.submit_review"]({
+  run_id = "waiting-recovery-run", run_step_id = recovery_started.run_step.id,
+  step_id = "waiting-plan-review", verdict = "approved",
+}).ok)
+fail_batch_key_prefix = "v3/run_steps/"
+local interrupted_advance = tools["project_pipelines.request_step_advance"]({
+  run_id = "waiting-recovery-run", request_id = "waiting-recovery-advance",
+})
+assert(not interrupted_advance.ok and interrupted_advance.error.code == "persist_failed")
+fail_batch_key_prefix = nil
+assert(tools["project_pipelines.create_ticket"]({
+  id = "waiting-recovery-dependency", project_id = "project-one", title = "Waiting recovery dependency",
+}).ok)
+assert(tools["project_pipelines.add_ticket_dependency"]({
+  id = "waiting-recovery-row", ticket_id = "waiting-recovery-ticket",
+  dependency_ticket_id = "waiting-recovery-dependency",
+}).ok)
+local recovered_wait = tools["project_pipelines.request_step_advance"]({
+  run_id = "waiting-recovery-run", request_id = "waiting-recovery-advance",
+})
+assert(not recovered_wait.ok and recovered_wait.error.code == "ticket_dependencies_unmet",
+  "pending correlated recovery must rerun dependency preflight")
+local recovery_context = context_for("waiting-recovery-run")
+assert(recovery_context.run.current_step_id == "waiting-plan-review" and #recovery_context.run_steps == 1)
+local recovery_scenario = {
+  run_id = "waiting-recovery-run",
+  run_step_id = recovery_started.run_step.id,
+}
+assert(tools["project_pipelines.update_ticket"]({ ticket_id = "waiting-recovery-dependency", status = "closed" }).ok)
+assert_woken_once(recovery_scenario)
+local duplicate_recovery = tools["project_pipelines.request_step_advance"]({
+  run_id = "waiting-recovery-run", request_id = "waiting-recovery-advance",
+})
+assert(duplicate_recovery.ok and duplicate_recovery.step_id == "waiting-implement")
+assert_woken_once(recovery_scenario)
+
+local multi = create_waiting_scenario("waiting-multi", 2)
+local override_wait = tools["project_pipelines.request_step_advance"]({
+  run_id = multi.run_id, request_id = "waiting-multi-override",
+  override_unmet_gates = true, override_reason = "gates only",
+})
+assert(not override_wait.ok and override_wait.error.code == "ticket_dependencies_unmet",
+  "gate override must never waive ticket dependencies")
+local direct_spawn = tools["project_pipelines.spawn_ticket_session"]({
+  run_id = multi.run_id, step_id = "waiting-implement", request_id = "waiting-multi-direct-spawn",
+})
+assert(not direct_spawn.ok and direct_spawn.error.code == "ticket_dependencies_unmet")
+local direct_retry = tools["project_pipelines.retry_step_agent"]({
+  run_id = multi.run_id, step_id = "waiting-implement", request_id = "waiting-multi-direct-retry",
+})
+assert(not direct_retry.ok and direct_retry.error.code == "ticket_dependencies_unmet")
+assert(#spawned == multi.spawned_before)
+local exempt_retry = tools["project_pipelines.retry_step_agent"]({
+  run_id = multi.run_id, step_id = "waiting-plan-review", request_id = "waiting-multi-plan-review-retry",
+})
+assert(exempt_retry.ok and context_for(multi.run_id).run.waiting_transition ~= nil,
+  "exempt Plan Review retry must not erase authorized waiting state")
+assert(tools["project_pipelines.update_ticket"]({ ticket_id = multi.dependency_ids[1], status = "closed" }).ok)
+local partial = context_for(multi.run_id)
+assert(partial.run.current_step_id == "waiting-plan-review" and #partial.run_steps == 1)
+assert(#partial.run.waiting_transition.unmet_dependencies == 1)
+assert(tools["project_pipelines.update_ticket"]({ ticket_id = multi.dependency_ids[2], status = "closed" }).ok)
+assert_woken_once(multi)
+assert(tools["project_pipelines.update_ticket"]({ ticket_id = multi.dependency_ids[2], status = "closed" }).ok)
+assert_woken_once(multi)
+local close_scenario = create_waiting_scenario("waiting-close", 1)
+assert(tools["project_pipelines.close_ticket"]({ ticket_id = close_scenario.dependency_ids[1] }).ok)
+assert_woken_once(close_scenario)
+assert(tools["project_pipelines.close_ticket"]({ ticket_id = close_scenario.dependency_ids[1] }).ok)
+assert_woken_once(close_scenario)
+
+local remove_scenario = create_waiting_scenario("waiting-remove", 1)
+assert(tools["project_pipelines.remove_ticket_dependency"]({ dependency_id = "waiting-remove-row-1" }).ok)
+assert_woken_once(remove_scenario)
+local duplicate_remove = tools["project_pipelines.remove_ticket_dependency"]({
+  ticket_id = remove_scenario.ticket_id, dependency_ticket_id = remove_scenario.dependency_ids[1],
+})
+assert(duplicate_remove.ok)
+assert_woken_once(remove_scenario)
+
+local delete_scenario = create_waiting_scenario("waiting-delete", 1)
+assert(tools["project_pipelines.delete_ticket"]({ ticket_id = delete_scenario.dependency_ids[1] }).ok)
+assert_woken_once(delete_scenario)
+
+local restart_scenario = create_waiting_scenario("waiting-restart", 1)
+local restarted_waiting_plugin = dofile("plugin.lua")
+local restarted_waiting_tools = {}
+for _, descriptor in ipairs(restarted_waiting_plugin.tools) do restarted_waiting_tools[descriptor.name] = descriptor.call end
+local restarted_context = restarted_waiting_tools["project_pipelines.current_context"]({ run_id = restart_scenario.run_id })
+assert(restarted_context.run.waiting_transition.source_run_step_id == restart_scenario.run_step_id)
+assert(restarted_waiting_tools["project_pipelines.update_ticket"]({
+  ticket_id = restart_scenario.dependency_ids[1], status = "closed",
+}).ok)
+assert_woken_once(restart_scenario)
+
+local missing_scenario = create_waiting_scenario("waiting-missing", 1)
+durable_store["v3/tickets/" .. missing_scenario.dependency_ids[1]] = nil
+local missing_plugin = dofile("plugin.lua")
+local missing_tools = {}
+for _, descriptor in ipairs(missing_plugin.tools) do missing_tools[descriptor.name] = descriptor.call end
+local missing_retry = missing_tools["project_pipelines.request_step_advance"]({
+  run_id = missing_scenario.run_id, request_id = "waiting-missing-retry",
+})
+assert(not missing_retry.ok and missing_retry.error.code == "ticket_dependencies_unmet")
+assert(missing_retry.error.unmet_dependencies[1].status == "missing")
+assert(#missing_tools["project_pipelines.current_context"]({ run_id = missing_scenario.run_id }).run_steps == 1)
+
+-- Terminal runs and closed owning tickets must never be resurrected by later dependency
+-- clearance: the waiting transition is cleared at the terminal mutation and reconciliation
+-- refuses anything that is not still explicitly resumable.
+local function assert_not_resurrected(scenario, expected_run_status)
+  local context = context_for(scenario.run_id)
+  assert(context.run.status == expected_run_status)
+  assert(context.run.waiting_transition == nil, "terminal state must clear the waiting transition")
+  assert(context.run.current_step_id == "waiting-plan-review")
+  assert(context.run.current_run_step_id == scenario.run_step_id)
+  assert(#context.run_steps == 1, "terminal run must not gain a target run-step")
+  assert(#spawned == scenario.spawned_before)
+end
+
+local cancelled_scenario = create_waiting_scenario("waiting-cancelled", 1)
+assert(tools["project_pipelines.cancel_run"]({ run_id = cancelled_scenario.run_id, reason = "operator stopped" }).ok)
+assert_not_resurrected(cancelled_scenario, "cancelled")
+assert(tools["project_pipelines.update_ticket"]({
+  ticket_id = cancelled_scenario.dependency_ids[1], status = "closed",
+}).ok)
+assert_not_resurrected(cancelled_scenario, "cancelled")
+
+local closed_owner_scenario = create_waiting_scenario("waiting-closed-owner", 1)
+assert(tools["project_pipelines.close_ticket"]({
+  ticket_id = closed_owner_scenario.ticket_id, merge_confirmed = true,
+}).ok)
+assert_not_resurrected(closed_owner_scenario, "closed")
+assert(tools["project_pipelines.close_ticket"]({ ticket_id = closed_owner_scenario.dependency_ids[1] }).ok)
+assert_not_resurrected(closed_owner_scenario, "closed")
+
+-- Adding a blocker to an already-waiting run can only add blockers, so its reconcile is a
+-- snapshot refresh; assert that refresh rather than leaving the call site unexercised.
+local snapshot_scenario = create_waiting_scenario("waiting-snapshot", 1)
+assert(tools["project_pipelines.create_ticket"]({
+  id = "waiting-snapshot-extra", project_id = "project-one", title = "Extra blocker",
+}).ok)
+assert(tools["project_pipelines.add_ticket_dependency"]({
+  ticket_id = snapshot_scenario.ticket_id, dependency_ticket_id = "waiting-snapshot-extra",
+}).ok)
+local snapshot_context = context_for(snapshot_scenario.run_id)
+assert(#snapshot_context.run.waiting_transition.unmet_dependencies == 2,
+  "adding a blocker to a waiting run must refresh its dependency snapshot")
+assert(#snapshot_context.run_steps == 1 and #spawned == snapshot_scenario.spawned_before)
+
+-- A merged provider PR is a terminal lifecycle mutation delivered through the Hub event
+-- handler rather than a public tool, so exercise the registered handler directly.
+local pr_merged_handler
+for _, handler in ipairs(plugin.handlers) do
+  if handler.id == "pr_merged" then pr_merged_handler = handler.call end
+end
+assert(pr_merged_handler, "pr_merged event handler must be registered")
+local merged_scenario = create_waiting_scenario("waiting-merged", 1)
+-- A merge closes its own ticket, so a different run blocked on that ticket must wake in
+-- the same atomic save. This is what the handler's reconcile call exists for.
+assert(tools["project_pipelines.create_ticket"]({
+  id = "waiting-merge-dependent-ticket", project_id = "project-one", target_id = "target-one",
+  title = "Blocked on the merged ticket",
+}).ok)
+local merge_dependent_started = tools["project_pipelines.start_run"]({
+  id = "waiting-merge-dependent-run", ticket_id = "waiting-merge-dependent-ticket",
+  pipeline_id = "pipeline-waiting-wakeup",
+})
+assert(merge_dependent_started.ok)
+assert(tools["project_pipelines.add_ticket_dependency"]({
+  ticket_id = "waiting-merge-dependent-ticket", dependency_ticket_id = merged_scenario.ticket_id,
+}).ok)
+assert(tools["project_pipelines.submit_review"]({
+  run_id = "waiting-merge-dependent-run", run_step_id = merge_dependent_started.run_step.id,
+  step_id = "waiting-plan-review", verdict = "approved",
+}).ok)
+local merge_dependent_wait = tools["project_pipelines.request_step_advance"]({
+  run_id = "waiting-merge-dependent-run", request_id = "waiting-merge-dependent-advance",
+})
+assert(not merge_dependent_wait.ok and merge_dependent_wait.error.code == "ticket_dependencies_unmet")
+assert(tools["project_pipelines.link_pr"]({
+  run_id = merged_scenario.run_id, url = "https://example.invalid/pull/1",
+}).ok)
+assert(pr_merged_handler({
+  run_id = merged_scenario.run_id, pr_url = "https://example.invalid/pull/1", merge_commit = "deadbeef",
+}).ok)
+local merge_dependent_context = context_for("waiting-merge-dependent-run")
+assert(merge_dependent_context.run.current_step_id == "waiting-implement",
+  "a merge that closes a blocking ticket must wake the run waiting on it")
+assert(merge_dependent_context.run.waiting_transition == nil)
+assert(#merge_dependent_context.run_steps == 2)
+local merged_context = context_for(merged_scenario.run_id)
+assert(merged_context.run.status == "closed")
+assert(merged_context.run.waiting_transition == nil, "a merged provider PR must clear durable waiting state")
+assert(tools["project_pipelines.update_ticket"]({
+  ticket_id = merged_scenario.dependency_ids[1], status = "closed",
+}).ok)
+local after_merge_clearance = context_for(merged_scenario.run_id)
+assert(after_merge_clearance.run.status == "closed")
+assert(after_merge_clearance.run.current_step_id == "waiting-plan-review")
+assert(#after_merge_clearance.run_steps == 1, "clearing the blocker must not resurrect a merged run")
+assert(#spawned == merged_scenario.spawned_before)
+
+local updated_owner_scenario = create_waiting_scenario("waiting-updated-owner", 1)
+assert(tools["project_pipelines.update_ticket"]({
+  ticket_id = updated_owner_scenario.ticket_id, status = "closed",
+}).ok)
+assert(context_for(updated_owner_scenario.run_id).run.waiting_transition == nil,
+  "closing the owning ticket must clear its waiting transition")
+assert(tools["project_pipelines.update_ticket"]({
+  ticket_id = updated_owner_scenario.dependency_ids[1], status = "closed",
+}).ok)
+assert_not_resurrected(updated_owner_scenario, "active")
+
+-- Dependency clearance must revalidate the source visit against current review, gate, and
+-- finding authorization rather than replaying the authorization captured at request time.
+assert(tools["project_pipelines.create_pipeline"]({
+  id = "pipeline-waiting-authorization", name = "Waiting authorization",
+  steps = {
+    {
+      id = "authorization-review", name = "Authorization review", allows_open_ticket_dependencies = true,
+      on_approved_step_id = "authorization-implement",
+      on_changes_requested_step_id = "authorization-rework",
+      gates = { { id = "authorization-gate", prompt = "Prove authorization before advancing" } },
+    },
+    { id = "authorization-implement", name = "Implement", kind = "pty", session_template_id = "template_codex" },
+    { id = "authorization-rework", name = "Rework" },
+  },
+}).ok)
+
+local function create_authorization_scenario(prefix, waive_unmet_gate)
+  assert(tools["project_pipelines.create_ticket"]({
+    id = prefix .. "-ticket", project_id = "project-one", target_id = "target-one", title = prefix .. " ticket",
+  }).ok)
+  local started = tools["project_pipelines.start_run"]({
+    id = prefix .. "-run", ticket_id = prefix .. "-ticket", pipeline_id = "pipeline-waiting-authorization",
+  })
+  assert(started.ok)
+  assert(tools["project_pipelines.create_ticket"]({
+    id = prefix .. "-dependency", project_id = "project-one", title = prefix .. " dependency",
+  }).ok)
+  assert(tools["project_pipelines.add_ticket_dependency"]({
+    ticket_id = prefix .. "-ticket", dependency_ticket_id = prefix .. "-dependency",
+  }).ok)
+  if not waive_unmet_gate then
+    assert(tools["project_pipelines.submit_gate"]({
+      run_id = prefix .. "-run", run_step_id = started.run_step.id, step_id = "authorization-review",
+      gate_id = "authorization-gate", status = "passed",
+    }).ok)
+  end
+  assert(tools["project_pipelines.submit_review"]({
+    run_id = prefix .. "-run", run_step_id = started.run_step.id,
+    step_id = "authorization-review", verdict = "approved",
+  }).ok)
+  local spawned_before = #spawned
+  -- Always correlate: a dependency-blocked advance persists a pending advance_request, so
+  -- the correlated retry path is ordinary operation rather than a crash-only path.
+  local advance_arguments = { run_id = prefix .. "-run", request_id = prefix .. "-advance" }
+  if waive_unmet_gate then
+    advance_arguments.override_unmet_gates = true
+    advance_arguments.override_reason = "gate waived while dependency-blocked"
+  end
+  local waiting = tools["project_pipelines.request_step_advance"](advance_arguments)
+  assert(not waiting.ok and waiting.error.code == "ticket_dependencies_unmet")
+  return {
+    run_id = prefix .. "-run", ticket_id = prefix .. "-ticket",
+    dependency_id = prefix .. "-dependency", run_step_id = started.run_step.id,
+    request_id = prefix .. "-advance", spawned_before = spawned_before,
+  }
+end
+
+local function assert_unauthorized_wait(scenario, blocker_kind)
+  local context = context_for(scenario.run_id)
+  assert(context.run.current_step_id == "authorization-review",
+    "dependency clearance must not advance a source visit whose authorization changed")
+  assert(context.run.current_run_step_id == scenario.run_step_id)
+  assert(#context.run_steps == 1, "unauthorized wakeup must not create the target run-step")
+  assert(#spawned == scenario.spawned_before)
+  assert(context.run.waiting_transition.unauthorized == true)
+  assert(context.run.waiting_transition.unmet_dependencies == nil,
+    "a satisfied dependency snapshot must be absent, not an empty collection")
+  assert(context.run.waiting_transition.unmet_authorization[1].kind == blocker_kind,
+    "waiting must record the current authorization blocker " .. blocker_kind)
+  assert(count_events(scenario.run_id, "ticket_dependencies_waiting_unauthorized") == 1)
+end
+
+-- Waiting state is retained rather than destroyed while unauthorized, so the mutation that
+-- restores authorization must itself wake the run. Each scenario below leaves the
+-- dependency already satisfied and makes exactly one authorization mutation afterwards,
+-- with no dependency row added, removed, or changed and no explicit advance.
+local function assert_reauthorized_once(scenario, dependency_rows_before)
+  local context = context_for(scenario.run_id)
+  assert(context.run.current_step_id == "authorization-implement",
+    "restoring authorization must itself wake the retained waiting transition")
+  assert(context.run.waiting_transition == nil)
+  assert(#context.run_steps == 2, "restored authorization must create exactly one target run-step")
+  local source_visits, target_visits = 0, 0
+  for _, run_step in ipairs(context.run_steps) do
+    if run_step.id == scenario.run_step_id then
+      source_visits = source_visits + 1
+      assert(run_step.status == "done")
+    elseif run_step.step_id == "authorization-implement" then
+      target_visits = target_visits + 1
+      assert(run_step.status == "active")
+    end
+  end
+  assert(source_visits == 1 and target_visits == 1)
+  local rows = tools["project_pipelines.list_ticket_dependencies"]({ ticket_id = scenario.ticket_id }).dependencies
+  assert(#rows == dependency_rows_before,
+    "waking on restored authorization must not depend on changing a dependency row")
+end
+
+local stale_review_scenario = create_authorization_scenario("waiting-stale-review")
+assert(tools["project_pipelines.submit_review"]({
+  run_id = stale_review_scenario.run_id, run_step_id = stale_review_scenario.run_step_id,
+  step_id = "authorization-review", verdict = "changes_required",
+}).ok)
+assert(tools["project_pipelines.update_ticket"]({
+  ticket_id = stale_review_scenario.dependency_id, status = "closed",
+}).ok)
+assert_unauthorized_wait(stale_review_scenario, "route_changed")
+assert(tools["project_pipelines.submit_review"]({
+  run_id = stale_review_scenario.run_id, run_step_id = stale_review_scenario.run_step_id,
+  step_id = "authorization-review", verdict = "approved",
+}).ok)
+assert_reauthorized_once(stale_review_scenario, 1)
+
+local failed_gate_scenario = create_authorization_scenario("waiting-failed-gate")
+assert(tools["project_pipelines.submit_gate"]({
+  run_id = failed_gate_scenario.run_id, run_step_id = failed_gate_scenario.run_step_id,
+  step_id = "authorization-review", gate_id = "authorization-gate", status = "failed",
+}).ok)
+assert(tools["project_pipelines.close_ticket"]({ ticket_id = failed_gate_scenario.dependency_id }).ok)
+assert_unauthorized_wait(failed_gate_scenario, "gate")
+assert(tools["project_pipelines.submit_gate"]({
+  run_id = failed_gate_scenario.run_id, run_step_id = failed_gate_scenario.run_step_id,
+  step_id = "authorization-review", gate_id = "authorization-gate", status = "passed",
+}).ok)
+assert_reauthorized_once(failed_gate_scenario, 1)
+
+local late_finding_scenario = create_authorization_scenario("waiting-late-finding")
+assert(tools["project_pipelines.submit_review"]({
+  run_id = late_finding_scenario.run_id, run_step_id = late_finding_scenario.run_step_id,
+  step_id = "authorization-review", verdict = "approved",
+  findings = { { id = "waiting-late-high", severity = "high", title = "Late high finding" } },
+}).ok)
+assert(tools["project_pipelines.update_ticket"]({
+  ticket_id = late_finding_scenario.dependency_id, status = "closed",
+}).ok)
+assert_unauthorized_wait(late_finding_scenario, "finding")
+assert(tools["project_pipelines.resolve_finding"]({ finding_id = "waiting-late-high" }).ok)
+assert_reauthorized_once(late_finding_scenario, 1)
+
+-- Every dependency-blocked advance persists a pending advance_request, so retrying the
+-- same request_id is an ordinary operation and must not become a back door around the
+-- authorization revalidation the clearance path performs.
+local retry_review_scenario = create_authorization_scenario("waiting-retry-review")
+assert(tools["project_pipelines.submit_review"]({
+  run_id = retry_review_scenario.run_id, run_step_id = retry_review_scenario.run_step_id,
+  step_id = "authorization-review", verdict = "changes_required",
+  findings = { { id = "waiting-retry-blocker", severity = "blocker", title = "Blocking rework" } },
+}).ok)
+assert(tools["project_pipelines.update_ticket"]({
+  ticket_id = retry_review_scenario.dependency_id, status = "closed",
+}).ok)
+assert_unauthorized_wait(retry_review_scenario, "route_changed")
+local stale_review_retry = tools["project_pipelines.request_step_advance"]({
+  run_id = retry_review_scenario.run_id, request_id = retry_review_scenario.request_id,
+})
+assert(not stale_review_retry.ok and stale_review_retry.error.code == "transition_authorization_changed",
+  "a correlated retry must not apply a transition whose route was superseded by a newer verdict")
+assert_unauthorized_wait(retry_review_scenario, "route_changed")
+
+local retry_gate_scenario = create_authorization_scenario("waiting-retry-gate")
+assert(tools["project_pipelines.submit_gate"]({
+  run_id = retry_gate_scenario.run_id, run_step_id = retry_gate_scenario.run_step_id,
+  step_id = "authorization-review", gate_id = "authorization-gate", status = "failed",
+}).ok)
+assert(tools["project_pipelines.close_ticket"]({ ticket_id = retry_gate_scenario.dependency_id }).ok)
+assert_unauthorized_wait(retry_gate_scenario, "gate")
+local failed_gate_retry = tools["project_pipelines.request_step_advance"]({
+  run_id = retry_gate_scenario.run_id, request_id = retry_gate_scenario.request_id,
+})
+assert(not failed_gate_retry.ok and failed_gate_retry.error.code == "transition_authorization_changed",
+  "a correlated retry must not apply a transition whose required gate now fails")
+assert_unauthorized_wait(retry_gate_scenario, "gate")
+
+-- A correlated retry rebuilt from the advance_request alone would drop the operator's
+-- stored override; the durable waiting transition is the authority while parked.
+local override_retry_scenario = create_authorization_scenario("waiting-override-retry", true)
+assert(context_for(override_retry_scenario.run_id).run.waiting_transition.overridden_gate_ids[1] == "authorization-gate")
+local override_retry = tools["project_pipelines.request_step_advance"]({
+  run_id = override_retry_scenario.run_id, request_id = override_retry_scenario.request_id,
+})
+assert(not override_retry.ok and override_retry.error.code == "ticket_dependencies_unmet")
+assert(context_for(override_retry_scenario.run_id).run.waiting_transition.overridden_gate_ids[1] == "authorization-gate",
+  "a correlated retry while still dependency-blocked must preserve the stored gate override")
+assert(count_events(override_retry_scenario.run_id, "gates_overridden") == 0)
+assert(tools["project_pipelines.update_ticket"]({
+  ticket_id = override_retry_scenario.dependency_id, status = "closed",
+}).ok)
+assert_reauthorized_once(override_retry_scenario, 1)
+assert(count_events(override_retry_scenario.run_id, "gates_overridden") == 1,
+  "the preserved override must be audited exactly once when the transition is applied")
+
+-- The operator attention queue keys on the durable hold record, not one code string. An
+-- authorization-held run is precisely the one needing a human, so it must appear alongside
+-- dependency-held runs and the rendered metric must equal the rendered list.
+local home_surface
+for _, handler in ipairs(plugin.handlers) do
+  if handler.id == "home_surface" then home_surface = handler.call end
+end
+assert(home_surface, "home surface handler must be registered")
+local function collect_nodes(node, seen)
+  seen = seen or {}
+  if type(node) ~= "table" then return seen end
+  if node.id then seen[node.id] = node end
+  for _, child in ipairs(node.children or {}) do collect_nodes(child, seen) end
+  for _, slot in pairs(node.slots or {}) do
+    if type(slot) == "table" then
+      for _, child in ipairs(slot) do collect_nodes(child, seen) end
+    end
+  end
+  return seen
+end
+local function attention_subtitle(nodes, run_id)
+  local subtitle = nodes["project-pipelines-attention-dependencies-" .. run_id .. "-subtitle-text"]
+  return subtitle and subtitle.props.text
+end
+
+local dependency_held_scenario = create_waiting_scenario("waiting-attention", 1)
+local home_nodes = collect_nodes(home_surface())
+local dependency_attention = attention_subtitle(home_nodes, dependency_held_scenario.run_id)
+assert(dependency_attention and dependency_attention:find("waiting-attention-dependency-1", 1, true),
+  "a dependency-held run must stay in the attention queue and name its blocking ticket")
+local route_attention = attention_subtitle(home_nodes, retry_review_scenario.run_id)
+assert(route_attention and route_attention:find("route_changed", 1, true),
+  "an authorization-held run must stay in the attention queue and name its authorization blocker")
+local gate_attention = attention_subtitle(home_nodes, retry_gate_scenario.run_id)
+assert(gate_attention and gate_attention:find("gate authorization-gate", 1, true),
+  "a gate-held run must name the gate that now blocks it")
+local attention_list = home_nodes["project-pipelines-needs-attention-list"]
+assert(attention_list, "the needs-attention list must render")
+assert(home_nodes["project-pipelines-metric-attention"].props.value == tostring(#attention_list.children),
+  "the needs-attention metric must equal the number of rendered attention rows")
+local held_run_row
+for _, row in ipairs(home_nodes["project-pipelines-run-table"].props.rows or {}) do
+  if row.id == retry_gate_scenario.run_id then held_run_row = row end
+end
+assert(held_run_row and held_run_row.cells.blocker:find("gate authorization-gate", 1, true),
+  "the runs table blocker cell must name an authorization hold instead of rendering empty")
+
+-- A gate override on a dependency-blocked advance waives gates only. Nothing advanced, so
+-- the audit event must not be committed until the stored override is actually applied.
+local blocked_override_scenario = create_authorization_scenario("waiting-blocked-override", true)
+assert(count_events(blocked_override_scenario.run_id, "gates_overridden") == 0,
+  "a dependency-blocked override must not commit a gates_overridden audit event")
+assert(tools["project_pipelines.update_ticket"]({
+  ticket_id = blocked_override_scenario.dependency_id, status = "closed",
+}).ok)
+local applied_override = context_for(blocked_override_scenario.run_id)
+assert(applied_override.run.current_step_id == "authorization-implement")
+assert(applied_override.run.waiting_transition == nil)
+assert(#applied_override.run_steps == 2, "the stored override must still create exactly one target run-step")
+assert(count_events(blocked_override_scenario.run_id, "gates_overridden") == 1,
+  "the stored override must be audited exactly once, when the transition is applied")
+for _, event in ipairs(applied_override.events) do
+  if event.kind == "gates_overridden" then
+    assert(event.payload.gate_ids[1] == "authorization-gate")
+    assert(event.payload.reason == "gate waived while dependency-blocked")
+  end
+end
+
 assert(tools["project_pipelines.create_project"]({ id = "project-disposable", name = "Disposable" }).ok)
 assert(tools["project_pipelines.update_project"]({ project_id = "project-disposable", description = "Updated" }).project.description == "Updated")
 assert(tools["project_pipelines.list_projects"]({ status = "active" }).ok)

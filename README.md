@@ -141,19 +141,41 @@ Every delivery role uses the same exact routing source:
 Zero or multiple matches return `routing_question_required`; there is no
 generic fallback or load-all behavior.
 
-Ticket dependencies are durable `ticket_dependencies` records mirrored onto
-ticket projections. `project_pipelines.add_ticket_dependency`,
+Ticket dependencies are durable normalized `ticket_dependencies` records and
+are never mirrored onto ticket payloads. `create_ticket` translates its public
+`dependency_ticket_ids` convenience input into those rows atomically.
+`project_pipelines.add_ticket_dependency`,
 `project_pipelines.remove_ticket_dependency`, and
-`project_pipelines.update_ticket` mutate that lifecycle without
-auto-advancing a run. Every step is dependency-gated unless it explicitly sets
+`project_pipelines.update_ticket` mutate that lifecycle. Every step is dependency-gated unless it explicitly sets
 `allows_open_ticket_dependencies=true`; standard Plan/Plan Review definitions
 should set that exemption, while legacy unclassified delivery steps fail safe.
 An open or missing prerequisite returns `ok=false` with
-`error.code="ticket_dependencies_unmet"`, persists the attempted step and unmet
-ticket IDs in `run.blocked_transition`, and performs no step transition,
-session-request creation, provider/template resolution, or spawn. Closing or
-removing the blocker permits a later explicit retry, and repeated activation of
-an already spawned run/step reuses the existing request.
+`error.code="ticket_dependencies_unmet"`. An authorized advancement persists
+the source visit, requested target, correlation/result, and unmet ticket IDs in
+`run.waiting_transition`; direct activation diagnostics remain in
+`run.blocked_transition`. Neither path creates a target run-step, session
+request, provider/template resolution, worktree, PTY, or spawn. Closing,
+updating, removing, or deleting the final blocker atomically creates one target
+run-step and clears the waiting state; duplicate clearance and recovery are
+idempotent. Clearance is fail-closed on both ends: a cancelled, merged, or
+closed run and a closed owning ticket clear their waiting state and are never
+resurrected, and wakeup re-derives the route and re-checks the current gate,
+review, and finding inputs, so a later `changes_required` verdict, blocking
+finding, or failed gate keeps the run waiting instead of activating the agent
+step. Because that waiting state is retained rather than discarded, the
+mutations that restore authorization reconcile it in the same atomic save:
+`submit_gate`, `submit_review`, and `resolve_finding` wake a run whose
+dependencies are already satisfied, with no dependency row change and no
+explicit advance. Retrying the same `request_id` after a dependency-blocked
+advance is ordinary operation, not crash recovery, so it applies the transition
+only under that same authority and otherwise returns
+`error.code="transition_authorization_changed"`; the durable waiting state, not
+the pending advance request, is the authority while parked, so a retry keeps the
+operator's gate override. A gate override waives only the gate IDs it named and
+is audited when the transition is applied, not when a dependency-blocked request
+was made. `update_ticket` with `status="closed"` clears its runs' waiting
+transitions without ending those runs, so such a run needs a fresh explicit
+advance.
 
 Transition findings are run-scoped: unresolved `blocker` and `high` findings
 stop advancement until resolved or waived. `medium`, `low`, and `info` findings
