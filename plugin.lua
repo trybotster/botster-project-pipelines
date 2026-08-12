@@ -113,6 +113,42 @@ local function action_result(arguments, state, extra)
   return result
 end
 
+-- Map durable engine codes to short operator copy. Keep technical repair names
+-- (field ids, config keys) so the attention queue and forms stay actionable.
+local function operator_error_message(error)
+  if type(error) ~= "table" then return "Action rejected" end
+  local code = error.code
+  local message = error.message or "Action rejected"
+  if code == "session_type_id_required" then
+    return message
+  end
+  if code == "session_types_unavailable" then
+    return "Hub session types are unavailable. Check package capabilities and Hub version."
+  end
+  if code == "session_type_spawn_failed" then
+    return "Session type spawn failed: " .. message
+  end
+  if code == "provider_dependency_missing" then
+    return message
+  end
+  if code == "ticket_dependencies_unmet" then
+    return "Open ticket dependencies block this step. Close or remove them, then retry."
+  end
+  if code == "validation_failed" or code == "not_found" or code == "id_conflict" then
+    return message
+  end
+  if code == "missing_argument" then
+    return message
+  end
+  if code == "persist_failed" then
+    return "Could not save workflow state. Retry after the plugin database is writable."
+  end
+  if code then
+    return message .. " (" .. tostring(code) .. ")"
+  end
+  return message
+end
+
 local function require_action_request(arguments)
   if type(arguments) ~= "table"
     or type(arguments.request_id) ~= "string"
@@ -146,18 +182,20 @@ local function action_from_tool(arguments, call, options)
   local response = call(values)
   if response and response.ok == false then
     local error = response.error or {}
+    local message = operator_error_message(error)
     local fields = {}
     for _, field in ipairs(error.fields or {}) do
       local field_id = options.field_ids and options.field_ids[field] or field
-      fields[field_id] = { error.message or "Action rejected" }
+      fields[field_id] = { message }
     end
     local state = error.code == "validation_failed" and "rejected" or "error"
     local extra = {
-      error = error.message or "Action rejected",
-      form_errors = { error.message or "Action rejected" },
+      error = message,
+      form_errors = { message },
       payload = response,
       normalized_values = copy(values),
     }
+    if error.code then extra.error_code = error.code end
     if next(fields) ~= nil then extra.field_errors = fields end
     return action_result(arguments, state, extra)
   end
@@ -3014,10 +3052,13 @@ local function start_run_action(arguments)
       { kind = "clear", key = "project-pipelines.record-run-dialog" },
     },
     replacement = function(response)
+      local run = response.run or {}
       return {
         type = "text",
         id = "project-pipelines-recorded-run",
-        props = { text = "Recorded run " .. tostring(response.run.id) },
+        props = {
+          text = "Started run " .. tostring(run.id) .. " at step " .. tostring(run.current_step_id or "current"),
+        },
       }
     end,
   })
@@ -3030,19 +3071,27 @@ local function spawn_ticket_session_action(arguments)
     field_ids = {
       run_id = "project-pipelines-action-run-id",
       step_id = "project-pipelines-action-step-id",
+      session_type_id = "project-pipelines-action-session-type-id",
     },
     presentation = {
       { kind = "clear", key = "project-pipelines.activate-step-dialog" },
     },
     replacement = function(response)
       local activation = response.activation or {}
+      local status = activation.status or "spawned"
+      local session_type = activation.session_type_id or activation.resolved_session_type_id
+      local label = "Agent " .. tostring(status)
+      if session_type and tostring(session_type) ~= "" then
+        label = label .. " · " .. tostring(session_type)
+      end
+      local tone = status == "blocked" and "warning" or status == "failed" and "danger" or "success"
       return {
         type = "status_badge",
         id = "project-pipelines-activated-step",
         props = {
-          label = "Step " .. tostring(activation.status or "activated"),
-          status = activation.status or "active",
-          tone = "success",
+          label = label,
+          status = status,
+          tone = tone,
         },
       }
     end,
@@ -3056,8 +3105,9 @@ local function filter_action(arguments)
   local payload = type(arguments.payload) == "table" and arguments.payload or {}
   if type(payload.status) ~= "string" or payload.status == "" then
     return action_result(arguments, "rejected", {
-      error = "filter status is required",
-      form_errors = { "Filter status is required." },
+      error = "Choose a filter before applying it.",
+      error_code = "validation_failed",
+      form_errors = { "Choose a filter before applying it." },
     })
   end
   return action_ack(arguments, {
@@ -3075,8 +3125,9 @@ local function select_row_action(arguments)
   local row_id = payload.row_id or payload.id or payload.value
   if type(row_id) ~= "string" or row_id == "" then
     return action_result(arguments, "rejected", {
-      error = "selected row id is required",
-      form_errors = { "Selected row id is required." },
+      error = "Select a row first.",
+      error_code = "validation_failed",
+      form_errors = { "Select a row first." },
     })
   end
   return action_ack(arguments, {
@@ -3207,8 +3258,38 @@ local function list_node(id, children)
   return node
 end
 
+-- Operator-facing status presentation. Nested helpers stay off the main local budget.
+local function human_status_label(status)
+  local labels = {
+    spawn_requested = "spawn requested",
+    ready_for_review = "ready for review",
+    waiting = "waiting",
+    blocked = "blocked",
+    failed = "failed",
+    active = "running",
+    open = "open",
+    closed = "closed",
+    question = "question",
+    available = "available",
+    review = "in review",
+    ready = "ready",
+  }
+  if status == nil or status == "" then return "unknown" end
+  return labels[status] or tostring(status):gsub("_", " ")
+end
+
 local function list_item(id, title, subtitle, status)
-  local tone = status == "failed" and "danger" or status == "blocked" and "warning" or "muted"
+  local tone = "muted"
+  if status == "failed" then
+    tone = "danger"
+  elseif status == "blocked" or status == "waiting" or status == "question" then
+    tone = "warning"
+  elseif status == "spawn_requested" or status == "active" or status == "running" then
+    tone = "accent"
+  elseif status == "ready_for_review" or status == "review" or status == "ready" or status == "available" then
+    tone = "success"
+  end
+  local label = human_status_label(status)
   return {
     type = "list_item",
     id = id,
@@ -3218,7 +3299,7 @@ local function list_item(id, title, subtitle, status)
       subtitle = {
         inline_node(id .. "-subtitle", {
           text_node(id .. "-subtitle-text", subtitle),
-          status_badge_node(id .. "-status", status or "unknown", status or "unknown", tone),
+          status_badge_node(id .. "-status", label, status or "unknown", tone),
         }),
       },
     },
@@ -3231,6 +3312,22 @@ end
 
 local function pipeline_for_run(context, run)
   return find_by_id(context.pipeline_definitions, run.pipeline_definition_id)
+end
+
+local function step_label(context, run, step_id)
+  if step_id == nil or step_id == "" then return "current step" end
+  local pipeline = run and pipeline_for_run(context, run) or nil
+  local step = nil
+  if type(pipeline) == "table" then
+    for _, candidate in ipairs(pipeline.steps or {}) do
+      if candidate.id == step_id then
+        step = candidate
+        break
+      end
+    end
+  end
+  if step and type(step.name) == "string" and step.name ~= "" then return step.name end
+  return tostring(step_id)
 end
 
 local function status_summary(context)
@@ -3319,10 +3416,10 @@ local function toolbar_node(id)
       filters = {
         button_node("project-pipelines-toolbar-filter-attention", "Needs attention", "project_pipelines.filter", { status = "attention" }, "warning"),
         button_node("project-pipelines-toolbar-filter-running", "Running", "project_pipelines.filter", { status = "active" }, "accent"),
-        button_node("project-pipelines-toolbar-filter-review", "Review", "project_pipelines.filter", { status = "review" }, "success"),
+        button_node("project-pipelines-toolbar-filter-review", "Ready for review", "project_pipelines.filter", { status = "review" }, "success"),
       },
       actions = {
-        button_node("project-pipelines-toolbar-activate-step", "Spawn step agent", "project_pipelines.spawn_ticket_session", { intent = "open_dialog" }),
+        button_node("project-pipelines-toolbar-activate-step", "Spawn agent", "project_pipelines.spawn_ticket_session", { intent = "open_dialog" }),
       },
     },
   }
@@ -3337,11 +3434,18 @@ local function section_node(id, title, description, children, tone)
   return node
 end
 
-local function list_section(id, title, empty_title, items)
+local function list_section(id, title, empty_title, empty_description, items)
   local children = items
   if #items == 0 then
     children = {
-      { type = "empty_state", id = id .. "-empty", props = { title = empty_title, description = "No matching workflow records are currently persisted." } },
+      {
+        type = "empty_state",
+        id = id .. "-empty",
+        props = {
+          title = empty_title,
+          description = empty_description or "Nothing to show right now.",
+        },
+      },
     }
   end
   return section_node(id, title, nil, { list_node(id .. "-list", children) })
@@ -3374,10 +3478,12 @@ local function attention_items(context)
     -- string silently dropped authorization holds, which are exactly the ones needing a human.
     if type(blocked) == "table" then
       local ticket = ticket_for_run(context, run)
+      local step_id = blocked.target_step_id or blocked.step_id
+      local reason, _ = hold_reason(context, blocked)
       table.insert(items, list_item(
         "project-pipelines-attention-dependencies-" .. run.id,
         ticket and ticket.title or run.ticket_id,
-        "Waiting before " .. tostring(blocked.target_step_id or blocked.step_id) .. " " .. hold_reason(context, blocked),
+        "Waiting before " .. step_label(context, run, step_id) .. " " .. reason,
         run.waiting_transition and "waiting" or "blocked"
       ))
     end
@@ -3385,22 +3491,34 @@ local function attention_items(context)
   for _, request in ipairs(context.session_requests) do
     if request.status == "blocked" or request.status == "failed" then
       local ticket = find_by_id(context.tickets, request.ticket_id)
+      local run = find_by_id(context.runs, request.run_id)
       local diagnostic = request.diagnostic or (request.result and request.result.error) or {}
       local status = request.status == "failed" and "failed" or "blocked"
+      local parts = {}
+      local step_name = step_label(context, run, request.step_id)
+      if request.step_id then table.insert(parts, step_name) end
+      if request.session_type_id and tostring(request.session_type_id) ~= "" then
+        table.insert(parts, "session type " .. tostring(request.session_type_id))
+      end
+      local detail = diagnostic.message or request.prompt_summary or "Agent spawn needs attention"
+      if #parts > 0 then detail = table.concat(parts, " · ") .. " — " .. detail end
       table.insert(items, list_item(
         "project-pipelines-attention-session-" .. request.id,
         ticket and ticket.title or request.ticket_id or request.id,
-        diagnostic.message or request.prompt_summary or "Session request needs attention",
+        detail,
         status
       ))
     end
   end
   for _, question in ipairs(context.questions) do
     if question.status == "open" or question.status == nil then
+      local run = find_by_id(context.runs, question.run_id)
+      local ticket = run and ticket_for_run(context, run) or find_by_id(context.tickets, question.ticket_id)
+      local scope = ticket and ticket.title or ("run " .. tostring(question.run_id))
       table.insert(items, list_item(
         "project-pipelines-attention-question-" .. question.id,
         question.question,
-        "Open question for run " .. tostring(question.run_id),
+        "Open question on " .. scope,
         "question"
       ))
     end
@@ -3416,10 +3534,11 @@ local function running_items(context)
       local pipeline = pipeline_for_run(context, run)
       local blocked = run.waiting_transition or run.blocked_transition
       local step_id = type(blocked) == "table" and (blocked.target_step_id or blocked.step_id) or run.current_step_id
+      local pipeline_name = pipeline and pipeline.name or run.pipeline_definition_id
       table.insert(items, list_item(
         "project-pipelines-running-" .. run.id,
         ticket and ticket.title or run.id,
-        (pipeline and pipeline.name or run.pipeline_definition_id) .. " / " .. tostring(step_id),
+        tostring(pipeline_name) .. " · " .. step_label(context, run, step_id),
         run.waiting_transition and "waiting" or (type(blocked) == "table" and "blocked" or run.status)
       ))
     end
@@ -3435,7 +3554,7 @@ local function review_items(context)
       table.insert(items, list_item(
         "project-pipelines-review-" .. run.id,
         ticket and ticket.title or run.id,
-        "Current step " .. tostring(run.current_step_id),
+        "At " .. step_label(context, run, run.current_step_id),
         run.status
       ))
     end
@@ -3459,7 +3578,7 @@ local function project_rows(context)
       cells = {
         name = project.name,
         mode = project.mode or "standalone",
-        spawn_target = project.spawn_target_id or "",
+        spawn_target = project.spawn_target_id or "—",
       },
     }
     if type(project.workspace_id) == "string" and project.workspace_id ~= "" then
@@ -3482,7 +3601,7 @@ local function ticket_rows(context)
       cells = {
         title = ticket.title,
         project = project and project.name or ticket.project_id,
-        status = ticket.status or "open",
+        status = human_status_label(ticket.status or "open"),
       },
     })
   end
@@ -3500,14 +3619,15 @@ local function run_rows(context)
       local _, labels = hold_reason(context, blocked)
       blockers = labels
     end
+    local step_id = type(blocked) == "table" and (blocked.target_step_id or blocked.step_id) or run.current_step_id
     table.insert(rows, {
       id = run.id,
       cells = {
         ticket = ticket and ticket.title or run.ticket_id,
         pipeline = pipeline and pipeline.name or run.pipeline_definition_id,
-        step = type(blocked) == "table" and (blocked.target_step_id or blocked.step_id) or run.current_step_id or "",
+        step = step_label(context, run, step_id),
         blocker = table.concat(blockers, ", "),
-        status = run_status_label(run),
+        status = human_status_label(run_status_label(run)),
       },
     })
   end
@@ -3517,27 +3637,32 @@ end
 local function session_request_rows(context)
   local rows = {}
   for _, request in ipairs(context.session_requests) do
+    local ticket = find_by_id(context.tickets, request.ticket_id)
+    local run = find_by_id(context.runs, request.run_id)
     table.insert(rows, {
       id = request.id,
       cells = {
-        request = request.id,
-        run = request.run_id or "",
-        step = request.step_id or "",
-        status = request.status or "unknown",
+        ticket = ticket and ticket.title or request.ticket_id or request.id,
+        step = step_label(context, run, request.step_id),
+        session_type = request.session_type_id or "—",
+        status = human_status_label(request.status or "unknown"),
       },
     })
   end
   return rows
 end
 
-local function table_node(id, columns, rows, empty_title)
+local function table_node(id, columns, rows, empty_title, empty_description)
   local props = {
     columns = columns,
     selection = { mode = "single" },
     empty_state = {
       type = "empty_state",
       id = id .. "-empty",
-      props = { title = empty_title },
+      props = {
+        title = empty_title,
+        description = empty_description or "Create work from the toolbar to fill this table.",
+      },
     },
   }
   if rows and #rows > 0 then props.rows = rows end
@@ -3554,15 +3679,15 @@ local function action_feedback_form()
     id = "project-pipelines-action-feedback",
     props = {
       action = { id = "project_pipelines.spawn_ticket_session" },
-      submit_label = "Activate step",
+      submit_label = "Spawn agent",
     },
     children = {
       {
         type = "form_section",
         id = "project-pipelines-action-feedback-section",
         props = {
-          title = "Action Feedback",
-          description = "Activate a run step or inspect persisted action results.",
+          title = "Spawn agent",
+          description = "Starts a Hub session for a run step. Session type comes from the form override, the step, or the package default.",
         },
         children = {
           {
@@ -3572,7 +3697,7 @@ local function action_feedback_form()
               schema = {
                 kind = "text",
                 name = "run_id",
-                label = "Run id",
+                label = "Run",
                 required = true,
               },
             },
@@ -3584,12 +3709,26 @@ local function action_feedback_form()
               schema = {
                 kind = "text",
                 name = "step_id",
-                label = "Step id",
-                required = true,
+                label = "Step",
+                required = false,
+                description = "Optional. Defaults to the run's current step.",
               },
             },
           },
-          button_node("project-pipelines-action-submit", "Spawn step agent", "project_pipelines.spawn_ticket_session", {}, "accent"),
+          {
+            type = "form_field",
+            id = "project-pipelines-action-session-type-id",
+            props = {
+              schema = {
+                kind = "text",
+                name = "session_type_id",
+                label = "Session type",
+                required = false,
+                description = "Optional Hub session type id. Leave blank to use the step or package default.",
+              },
+            },
+          },
+          button_node("project-pipelines-action-submit", "Spawn agent", "project_pipelines.spawn_ticket_session", {}, "accent"),
         },
       },
     },
@@ -3647,29 +3786,29 @@ local function workbench_dialogs(context)
         "project_pipelines.create_ticket",
         "Create ticket",
         {
-          text_input_node("project-pipelines-create-ticket-project-id", "project_id", "Project id", true),
-          text_input_node("project-pipelines-create-ticket-title", "title", "Title", true),
+          text_input_node("project-pipelines-create-ticket-project-id", "project_id", "Project", true),
+          text_input_node("project-pipelines-create-ticket-title", "title", "Ticket title", true),
         }
       )
     ),
     presentation_dialog(
       "project-pipelines.record-run-dialog",
       "project-pipelines-record-run-dialog",
-      "Record run",
+      "Start run",
       dialog_form(
         "project-pipelines-record-run-form",
         "project_pipelines.start_run",
-        "Record run",
+        "Start run",
         {
-          text_input_node("project-pipelines-record-run-ticket-id", "ticket_id", "Ticket id", true),
-          text_input_node("project-pipelines-record-run-pipeline-id", "pipeline_definition_id", "Pipeline definition id", true),
+          text_input_node("project-pipelines-record-run-ticket-id", "ticket_id", "Ticket", true),
+          text_input_node("project-pipelines-record-run-pipeline-id", "pipeline_definition_id", "Pipeline", true),
         }
       )
     ),
     presentation_dialog(
       "project-pipelines.activate-step-dialog",
       "project-pipelines-activate-step-dialog",
-      "Activate step",
+      "Spawn agent",
       action_feedback_form()
     ),
   }
@@ -3684,7 +3823,7 @@ local function workbench_dialogs(context)
         },
         node = text_node(
           "project-pipelines-selected-workspace-" .. project.id,
-          "Workspace " .. project.name .. " selected"
+          "Selected workspace: " .. project.name
         ),
       })
     end
@@ -3693,40 +3832,72 @@ local function workbench_dialogs(context)
 end
 
 local function drilldown_tables(context)
-  return section_node("project-pipelines-workbench", "Project/Ticket/Run Drilldown", "Current persisted workflow records with selectable rows.", {
-    table_node("project-pipelines-project-table", {
-      { id = "name", label = "Project" },
-      { id = "mode", label = "Mode" },
-      { id = "spawn_target", label = "Spawn target" },
-    }, project_rows(context), "No projects"),
-    table_node("project-pipelines-ticket-table", {
-      { id = "title", label = "Ticket" },
-      { id = "project", label = "Project" },
-      { id = "status", label = "Status" },
-    }, ticket_rows(context), "No tickets"),
-    table_node("project-pipelines-run-table", {
-      { id = "ticket", label = "Ticket" },
-      { id = "pipeline", label = "Pipeline" },
-      { id = "step", label = "Step" },
-      { id = "blocker", label = "Blocking prerequisite" },
-      { id = "status", label = "Status" },
-    }, run_rows(context), "No runs"),
-    table_node("project-pipelines-session-request-table", {
-      { id = "request", label = "Request" },
-      { id = "run", label = "Run" },
-      { id = "step", label = "Step" },
-      { id = "status", label = "Status" },
-    }, session_request_rows(context), "No session requests"),
+  return section_node(
+    "project-pipelines-workbench",
+    "Records",
+    "Projects, tickets, runs, and agent spawns. Select a workspace-linked project to focus it.",
+    {
+    table_node(
+      "project-pipelines-project-table",
+      {
+        { id = "name", label = "Project" },
+        { id = "mode", label = "Mode" },
+        { id = "spawn_target", label = "Spawn point" },
+      },
+      project_rows(context),
+      "No projects yet",
+      "Create a project with the Project Pipelines tools, then create tickets here."
+    ),
+    table_node(
+      "project-pipelines-ticket-table",
+      {
+        { id = "title", label = "Ticket" },
+        { id = "project", label = "Project" },
+        { id = "status", label = "Status" },
+      },
+      ticket_rows(context),
+      "No tickets yet",
+      "Use Create ticket to open work under a project."
+    ),
+    table_node(
+      "project-pipelines-run-table",
+      {
+        { id = "ticket", label = "Ticket" },
+        { id = "pipeline", label = "Pipeline" },
+        { id = "step", label = "Step" },
+        { id = "blocker", label = "Blocked by" },
+        { id = "status", label = "Status" },
+      },
+      run_rows(context),
+      "No runs yet",
+      "Use Start run to begin a pipeline on a ticket."
+    ),
+    table_node(
+      "project-pipelines-session-request-table",
+      {
+        { id = "ticket", label = "Ticket" },
+        { id = "step", label = "Step" },
+        { id = "session_type", label = "Session type" },
+        { id = "status", label = "Status" },
+      },
+      session_request_rows(context),
+      "No agent spawns yet",
+      "Use Spawn agent on a run step. Hub owns the session type launch contract."
+    ),
   })
 end
 
 local function entity_stream_section()
-  return section_node("project-pipelines-entity-streams", "Entity Streams", "Live client rows bind to plugin-owned entity families.", {
+  return section_node(
+    "project-pipelines-entity-streams",
+    "Live records",
+    "Hosts bind these lists to plugin entity frames for live refresh. Prefer the tables above for day-to-day work.",
+    {
     list_node("project-pipelines-workbench-lists", {
       bound_list("project-pipelines-project-list", "project-pipelines.project", "No projects"),
       bound_list("project-pipelines-ticket-list", "project-pipelines.ticket", "No tickets"),
       bound_list("project-pipelines-run-list", "project-pipelines.run", "No runs"),
-      bound_list("project-pipelines-session-request-list", "project-pipelines.session_request", "No session requests"),
+      bound_list("project-pipelines-session-request-list", "project-pipelines.session_request", "No agent spawns"),
     }),
   })
 end
@@ -3759,12 +3930,12 @@ end
 
 local function provider_status_text(status)
   if status.blocked_count == 0 then
-    return "Provider dependencies are available for recorded session requests."
+    return "Provider dependencies are available for recorded agent spawns."
   end
   local first = status.blocked[1] or {}
   local label = first.dependency or first.capability or "provider dependency"
   if first.provider then label = first.provider .. ":" .. label end
-  return "Provider dependency blocked: " .. label
+  return "Provider dependency blocked: " .. label .. ". Fix the provider, then retry Spawn agent."
 end
 
 local function settings_readiness(context, provider_status)
@@ -3773,7 +3944,7 @@ local function settings_readiness(context, provider_status)
   table.insert(items, list_item(
     "project-pipelines-readiness-storage",
     "Plugin database",
-    "Runtime state is persisted by the plugin database capability.",
+    "Workflow state is stored in the package database.",
     "available"
   ))
   table.insert(items, list_item(
@@ -3783,13 +3954,15 @@ local function settings_readiness(context, provider_status)
     provider_status.status
   ))
   local session_status = "available"
-  local session_subtitle = "Session type requests are available for recorded runs."
+  local session_subtitle = "Session types are ready for agent spawns."
   if summary.failed_sessions > 0 then
     session_status = "failed"
-    session_subtitle = tostring(summary.failed_sessions) .. " session request failed."
+    local n = summary.failed_sessions
+    session_subtitle = tostring(n) .. (n == 1 and " agent spawn failed." or " agent spawns failed.")
   elseif summary.blocked_sessions > 0 then
     session_status = "blocked"
-    session_subtitle = tostring(summary.blocked_sessions) .. " session request is blocked."
+    local n = summary.blocked_sessions
+    session_subtitle = tostring(n) .. (n == 1 and " agent spawn is blocked." or " agent spawns are blocked.")
   end
   table.insert(items, list_item(
     "project-pipelines-readiness-session-types",
@@ -3820,7 +3993,10 @@ function bound_list(id, source, empty_title)
     empty_template = {
       type = "empty_state",
       id = id .. "-empty",
-      props = { title = empty_title },
+      props = {
+        title = empty_title,
+        description = "Live rows appear here after hosts subscribe to entity frames.",
+      },
     },
   }
 end
@@ -3829,45 +4005,56 @@ local function render_home()
   local context = current_context()
   local summary = status_summary(context)
   local children = {
-      panel_node("project-pipelines-command-center", "Command Center", {
+      panel_node("project-pipelines-command-center", "Overview", {
         toolbar_node("project-pipelines-workbench-toolbar"),
         metric_grid_node("project-pipelines-command-center-metrics", {
-          metric_node("project-pipelines-metric-attention", "Needs attention", summary.needs_attention, summary.needs_attention > 0 and "warning" or "default", "Blocked, failed, or open questions", summary.needs_attention > 0 and "needs_attention" or "clear"),
+          metric_node("project-pipelines-metric-attention", "Needs attention", summary.needs_attention, summary.needs_attention > 0 and "warning" or "default", "Blocked steps, failed spawns, open questions", summary.needs_attention > 0 and "needs_attention" or "clear"),
           metric_node("project-pipelines-metric-running", "Running", summary.active_runs, "accent", "Active pipeline runs", "active"),
           metric_node("project-pipelines-metric-review", "Ready for review", summary.review_runs, "success", "Review or merge queue", "ready"),
-          metric_node("project-pipelines-metric-open-tickets", "Open tickets", summary.open_tickets, "muted", "Open ticket records", "open"),
+          metric_node("project-pipelines-metric-open-tickets", "Open tickets", summary.open_tickets, "muted", "Tickets still open", "open"),
         }),
       }),
       list_section(
         "project-pipelines-needs-attention",
-        "Needs Attention",
-        "No blocked transitions, blocked sessions, failed requests, or open questions",
+        "Needs attention",
+        "All clear",
+        "No blocked steps, failed agent spawns, or open questions.",
         attention_items(context)
       ),
       list_section(
         "project-pipelines-running",
         "Running",
-        "No active runs",
+        "Nothing running",
+        "Start a run to see active pipeline work here.",
         running_items(context)
       ),
       list_section(
         "project-pipelines-ready-for-review",
-        "Ready For Review",
-        "No runs are waiting for review",
+        "Ready for review",
+        "Nothing waiting for review",
+        "Runs that are ready for review appear here.",
         review_items(context)
+      ),
+      section_node(
+        "project-pipelines-create-guidance",
+        "Common path",
+        "Day-to-day operator loop. Advanced tools remain available through MCP.",
+        {
+          text_node(
+            "project-pipelines-create-guidance-summary",
+            "Create a ticket, start a run, then spawn an agent on the current step. Session types are Hub launch contracts; this package does not invent a second launch system."
+          ),
+          list_node("project-pipelines-create-guidance-actions", {
+            list_item("project-pipelines-create-project-action", "Create project", "Group tickets and set a default spawn point", "tool"),
+            list_item("project-pipelines-create-ticket-action", "Create ticket", "Open work under a project", "tool"),
+            list_item("project-pipelines-define-pipeline-action", "Create pipeline", "Define ordered steps and gates", "tool"),
+            list_item("project-pipelines-record-run-action", "Start run", "Begin a pipeline on a ticket", "tool"),
+            list_item("project-pipelines-activate-step-action", "Spawn agent", "Launch a Hub session type for the step", "tool"),
+          }),
+        }
       ),
       drilldown_tables(context),
       entity_stream_section(),
-      section_node("project-pipelines-create-guidance", "Create And Start Work", nil, {
-        text_node("project-pipelines-create-guidance-summary", "Use the Project Pipelines tools to create projects, tickets, pipeline definitions, runs, and PTY-backed step activations. The app surface reflects persisted state after those actions."),
-        list_node("project-pipelines-create-guidance-actions", {
-          list_item("project-pipelines-create-project-action", "Create project", "project_pipelines.create_project", "tool"),
-          list_item("project-pipelines-create-ticket-action", "Create ticket", "project_pipelines.create_ticket", "tool"),
-          list_item("project-pipelines-define-pipeline-action", "Create pipeline", "project_pipelines.create_pipeline", "tool"),
-          list_item("project-pipelines-record-run-action", "Start run", "project_pipelines.start_run", "tool"),
-          list_item("project-pipelines-activate-step-action", "Spawn step agent", "project_pipelines.spawn_ticket_session", "tool"),
-        }),
-      }),
     }
   for _, dialog in ipairs(workbench_dialogs(context)) do
     table.insert(children, dialog)
@@ -3884,24 +4071,27 @@ local function render_settings()
         metric_node("project-pipelines-settings-count-projects", "Projects", #context.projects, "muted"),
         metric_node("project-pipelines-settings-count-tickets", "Tickets", #context.tickets, "muted"),
         metric_node("project-pipelines-settings-count-runs", "Runs", #context.runs, "muted"),
-        metric_node("project-pipelines-settings-count-sessions", "Session requests", #context.session_requests, "muted"),
+        metric_node("project-pipelines-settings-count-sessions", "Agent spawns", #context.session_requests, "muted"),
         metric_node("project-pipelines-settings-count-open-questions", "Open questions", summary.open_questions, summary.open_questions > 0 and "warning" or "muted"),
       }),
       panel_node("project-pipelines-readiness", "Readiness", {
         list_node("project-pipelines-readiness-list", settings_readiness(context, provider_status)),
       }),
-      text_node("project-pipelines-settings-storage", "Runtime state is persisted by the plugin database capability."),
-      panel_node("project-pipelines-provider-dependency-status", "Provider Dependencies", {
+      text_node("project-pipelines-settings-storage", "Workflow state is stored in the package database."),
+      panel_node("project-pipelines-provider-dependency-status", "Provider dependencies", {
         text_node("project-pipelines-provider-dependency-status-summary", provider_status_text(provider_status)),
         badge_node("project-pipelines-provider-dependency-status-badge", provider_status.status .. ": " .. tostring(provider_status.blocked_count), provider_status.status == "blocked" and "warning" or "success"),
       }),
       panel_node("project-pipelines-settings-defaults", "Defaults", {
-        text_node("project-pipelines-settings-defaults-summary", "Package configuration supplies optional defaults for spawn targets, session type selection, pipeline mode, and workspace linkage. Configuration changes take effect after the package is reloaded. Standalone records remain valid without workspace configuration."),
+        text_node(
+          "project-pipelines-settings-defaults-summary",
+          "Package defaults cover spawn point, session type, pipeline mode, and optional workspace link. Reload the package after changes. Standalone projects stay valid without a workspace."
+        ),
         list_node("project-pipelines-settings-default-fields", {
-          list_item("project-pipelines-settings-default-spawn-target", "Default spawn target", "default_spawn_target_id", "config"),
+          list_item("project-pipelines-settings-default-spawn-target", "Default spawn point", "default_spawn_target_id", "config"),
           list_item("project-pipelines-settings-default-session-type", "Default session type", "default_session_type_id", "config"),
           list_item("project-pipelines-settings-default-pipeline-mode", "Default pipeline mode", "default_pipeline_mode", "config"),
-          list_item("project-pipelines-settings-workspace-id", "Workspace id", "workspace_id", "config"),
+          list_item("project-pipelines-settings-workspace-id", "Workspace", "workspace_id", "config"),
         }),
       }),
     })
@@ -5577,10 +5767,12 @@ local TOOL_CONTRACTS = {
   },
 }
 
-local STRING_PROPERTY = { type = "string" }
-local OBJECT_PROPERTY = { type = "object" }
-local BOOLEAN_PROPERTY = { type = "boolean" }
-local INTEGER_PROPERTY = { type = "integer" }
+local PROP = {
+  string = { type = "string" },
+  object = { type = "object" },
+  boolean = { type = "boolean" },
+  integer = { type = "integer" },
+}
 
 local function extend_contract(name, properties, required)
   local contract = TOOL_CONTRACTS[name]
@@ -5593,40 +5785,40 @@ end
 -- The legacy descriptors are the public reference vocabulary. These extensions
 -- describe package-owned fields needed by the cold-cut store and its importer.
 extend_contract("create_project", {
-  id = STRING_PROPERTY, repository = OBJECT_PROPERTY, repository_id = STRING_PROPERTY,
-  repository_name = STRING_PROPERTY, repository_remote = STRING_PROPERTY,
-  spawn_target_id = STRING_PROPERTY, workspace_id = STRING_PROPERTY,
+  id = PROP.string, repository = PROP.object, repository_id = PROP.string,
+  repository_name = PROP.string, repository_remote = PROP.string,
+  spawn_target_id = PROP.string, workspace_id = PROP.string,
   status = { type = "string", enum = { "open", "active", "blocked", "closed" } },
 })
 extend_contract("create_ticket", {
-  id = STRING_PROPERTY, workspace_id = STRING_PROPERTY,
+  id = PROP.string, workspace_id = PROP.string,
   status = { type = "string", enum = { "open", "active", "blocked", "closed" } },
-  dependency_ticket_ids = { type = "array", items = STRING_PROPERTY },
+  dependency_ticket_ids = { type = "array", items = PROP.string },
 }, { "project_id", "title" })
 TOOL_CONTRACTS.create_ticket.description = "Create a project ticket. dependency_ticket_ids is an optional array of ticket IDs that is validated and atomically registered as normalized blocking dependency rows; it is never persisted on the ticket payload."
-extend_contract("create_pipeline", { project_id = STRING_PROPERTY })
-extend_contract("create_step", { session_type_id = STRING_PROPERTY })
-extend_contract("update_step", { session_type_id = STRING_PROPERTY })
+extend_contract("create_pipeline", { project_id = PROP.string })
+extend_contract("create_step", { session_type_id = PROP.string })
+extend_contract("update_step", { session_type_id = PROP.string })
 extend_contract("start_run", {
-  id = STRING_PROPERTY, spawn_target_id = STRING_PROPERTY, branch = STRING_PROPERTY,
-  worktree = OBJECT_PROPERTY, worktree_id = STRING_PROPERTY,
+  id = PROP.string, spawn_target_id = PROP.string, branch = PROP.string,
+  worktree = PROP.object, worktree_id = PROP.string,
 }, { "ticket_id", "pipeline_id" })
 extend_contract("spawn_ticket_session", {
-  run_id = STRING_PROPERTY, step_id = STRING_PROPERTY, request_id = STRING_PROPERTY,
-  session_type_id = STRING_PROPERTY, branch = STRING_PROPERTY,
-  spawn_target_id = STRING_PROPERTY, environment = OBJECT_PROPERTY, metadata = OBJECT_PROPERTY,
+  run_id = PROP.string, step_id = PROP.string, request_id = PROP.string,
+  session_type_id = PROP.string, branch = PROP.string,
+  spawn_target_id = PROP.string, environment = PROP.object, metadata = PROP.object,
 }, { "run_id" })
 TOOL_CONTRACTS.spawn_ticket_session.input_schema.properties.accessory_name = nil
 TOOL_CONTRACTS.spawn_ticket_session.input_schema.properties.agent_name = nil
 TOOL_CONTRACTS.spawn_ticket_session.input_schema.properties.ticket_id = nil
 TOOL_CONTRACTS.spawn_ticket_session.input_schema.properties.workspace_name = nil
 TOOL_CONTRACTS.spawn_ticket_session.description = "Spawn the current pipeline step's configured agent session for a durable run, using a correlated request so retries cannot dispatch twice."
-extend_contract("request_merge", { run_id = STRING_PROPERTY }, { "run_id" })
-TOOL_CONTRACTS.request_merge.input_schema.properties = { run_id = STRING_PROPERTY }
+extend_contract("request_merge", { run_id = PROP.string }, { "run_id" })
+TOOL_CONTRACTS.request_merge.input_schema.properties = { run_id = PROP.string }
 TOOL_CONTRACTS.request_merge.description = "Atomically mark a run merge-requested while keeping its owning ticket active for provider merge reconciliation."
 extend_contract("remove_ticket_dependency", {
-  ticket_id = STRING_PROPERTY, depends_on_ticket_id = STRING_PROPERTY,
-  dependency_ticket_id = STRING_PROPERTY,
+  ticket_id = PROP.string, depends_on_ticket_id = PROP.string,
+  dependency_ticket_id = PROP.string,
 })
 TOOL_CONTRACTS.remove_ticket_dependency.input_schema.required = nil
 TOOL_CONTRACTS.remove_ticket_dependency.input_schema.anyOf = {
@@ -5634,10 +5826,10 @@ TOOL_CONTRACTS.remove_ticket_dependency.input_schema.anyOf = {
   { required = { "ticket_id", "depends_on_ticket_id" } },
   { required = { "ticket_id", "dependency_ticket_id" } },
 }
-extend_contract("add_checklist_item", { text = STRING_PROPERTY })
-extend_contract("request_step_advance", { request_id = STRING_PROPERTY }, { "run_id" })
+extend_contract("add_checklist_item", { text = PROP.string })
+extend_contract("request_step_advance", { request_id = PROP.string }, { "run_id" })
 extend_contract("remove_project_target", {
-  project_id = STRING_PROPERTY, target_id = STRING_PROPERTY,
+  project_id = PROP.string, target_id = PROP.string,
 })
 TOOL_CONTRACTS.remove_project_target.input_schema.required = nil
 TOOL_CONTRACTS.remove_project_target.input_schema.anyOf = {
@@ -5645,36 +5837,36 @@ TOOL_CONTRACTS.remove_project_target.input_schema.anyOf = {
   { required = { "project_id", "target_id" } },
 }
 extend_contract("create_child_run", {
-  id = STRING_PROPERTY, ticket_id = STRING_PROPERTY,
+  id = PROP.string, ticket_id = PROP.string,
 }, { "parent_run_id", "title" })
 extend_contract("create_checklist", {
-  id = STRING_PROPERTY, run_id = STRING_PROPERTY, step_id = STRING_PROPERTY,
+  id = PROP.string, run_id = PROP.string, step_id = PROP.string,
 }, { "name" })
 TOOL_CONTRACTS.create_checklist.input_schema.anyOf = {
   { required = { "owner_id" } },
   { required = { "run_id" } },
 }
-extend_contract("list_checklists", { run_id = STRING_PROPERTY })
-extend_contract("list_pr_links", { ticket_id = STRING_PROPERTY, run_id = STRING_PROPERTY })
-extend_contract("retry_step_agent", { request_id = STRING_PROPERTY }, { "run_id" })
+extend_contract("list_checklists", { run_id = PROP.string })
+extend_contract("list_pr_links", { ticket_id = PROP.string, run_id = PROP.string })
+extend_contract("retry_step_agent", { request_id = PROP.string }, { "run_id" })
 TOOL_CONTRACTS.retry_step_agent.input_schema.properties.reason = nil
 TOOL_CONTRACTS.retry_step_agent.description = "Retry the current blocked agent step for the specified run after agent spawn or lifecycle failure. Clears stale session linkage on the current run step visit and reuses the durable correlated spawn request."
 
-extend_contract("list_projects", { status = STRING_PROPERTY })
-extend_contract("list_tickets", { project_id = STRING_PROPERTY, status = STRING_PROPERTY })
+extend_contract("list_projects", { status = PROP.string })
+extend_contract("list_tickets", { project_id = PROP.string, status = PROP.string })
 extend_contract("checklist_instructions", { scope = { type = "string", enum = { "project", "ticket", "run" } } })
-extend_contract("question_orchestrator_status", { project_id = STRING_PROPERTY })
+extend_contract("question_orchestrator_status", { project_id = PROP.string })
 
 TOOL_CONTRACTS.resolve_repository_playbook = {
   description = "Resolve one repository or Project Pipelines package path to exactly one supported ownership charter; ambiguous and unknown inputs require a routing question.",
   input_schema = object_schema({
-    repository = STRING_PROPERTY, repository_name = STRING_PROPERTY,
-    name = STRING_PROPERTY, path = STRING_PROPERTY,
+    repository = PROP.string, repository_name = PROP.string,
+    name = PROP.string, path = PROP.string,
   }),
 }
 TOOL_CONTRACTS.entities = {
   description = "Inspect committed Project Pipelines records as request-facing entity frames; Hub reconnect hydration uses the package's explicit entity providers.",
-  input_schema = object_schema({ run_id = STRING_PROPERTY }),
+  input_schema = object_schema({ run_id = PROP.string }),
 }
 
 

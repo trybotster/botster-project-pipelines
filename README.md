@@ -228,32 +228,37 @@ remain a hub-admitted route descriptor concern outside this package manifest.
 
 Dynamic model state belongs in plugin-owned entity output. Surface snapshots
 should stay structural and declare bindings for project, ticket, run, and
-session request lists instead of becoming a raw HTML or provider-specific data
-transport. UI vocabulary should refer to sessions, templates, and accessories,
-not a separate execution or agent runtime class.
+agent-spawn lists instead of becoming a raw HTML or provider-specific data
+transport. UI vocabulary uses Hub session types and spawn points, not a second
+package-local launch system.
 
 The first app render is an operator workbench, not a placeholder. It emits the
 literal application UiNode primitives consumed by hub clients: `metric_grid` and
-`metric` for the command-center summary, `toolbar` command/filter/action slots
-for the operator controls, `section` groupings for attention/running/review
-queues, `status_badge` state cues, selectable `table` rows for the
-project/ticket/run/session-request drilldown, `empty_state` fallbacks, and a
-`form`/`form_section`/`form_field` action feedback block for step activation.
-The first viewport answers needs attention, running, and ready for review before
-the drilldown tables. Entity-backed lists remain bound to
+`metric` for the overview summary, `toolbar` command/filter/action slots for the
+operator controls, `section` groupings for attention/running/review queues plus
+the common path, `status_badge` state cues, selectable `table` rows for the
+project/ticket/run/agent-spawn drilldown, `empty_state` fallbacks with actionable
+descriptions, and a `form`/`form_section`/`form_field` block for spawning a Hub
+session type on a run step. The first viewport answers needs attention, running,
+ready for review, and the common ticket→run→spawn path before drilldown tables
+and live entity-bound lists. Entity-backed lists remain bound to
 `/project-pipelines.project`, `/project-pipelines.ticket`,
 `/project-pipelines.run`, and `/project-pipelines.session_request` so durable
 model state stays in plugin-owned entity frames instead of the UI snapshot.
 Ticket-dependency blocks appear in needs-attention and in run rows, where the
-operator sees the attempted step and blocking prerequisite ticket.
+operator sees the attempted step and blocking prerequisite ticket. Failed or
+blocked agent spawns name the step, session type when known, and the durable
+repair diagnostic (for example `default_session_type_id`).
 
 Workbench controls are structured UiNodes only. Tables declare single-row
 selection and row-action metadata; toolbar and form buttons route to
 plugin-owned action ids such as `project_pipelines.create_ticket`,
-`project_pipelines.start_run`, and `project_pipelines.spawn_ticket_session`. Raw HTML
-and iframes are intentionally out of scope for CRUD/workbench controls. Future
-graph or report surfaces may use an iframe only when they need a custom
-full-screen visual app with an explicit plugin asset bridge.
+`project_pipelines.start_run`, and `project_pipelines.spawn_ticket_session`.
+Rejected actions return Hub-style error codes through `error_code` with short
+operator copy while preserving field ids for form repair. Raw HTML and iframes
+are intentionally out of scope for CRUD/workbench controls. Future graph or
+report surfaces may use an iframe only when they need a custom full-screen
+visual app with an explicit plugin asset bridge.
 
 Every plugin action consumes the complete worker-visible `UiActionRequest`
 envelope: `request_id`, `surface_id`, `action_id`, optional `node_id`, `kind`,
@@ -264,13 +269,15 @@ handlers read domain input only from `values`; filter and row selection read
 metadata only from `payload`. Flat legacy arguments are not accepted.
 
 Every Form declares an explicit `submit_label`. Create-ticket, start-run, and
-spawn-step dialogs use `presentation="auto"` and are wrapped in scoped
+spawn-agent dialogs use `presentation="auto"` and are wrapped in scoped
 `presentation_if` presence predicates; selected workspace content uses an
 equality predicate. Dialogs never use `props.open`. Modal visibility remains
 client-local presentation state, while tickets and runs remain plugin-owned
 entity state. Toolbar buttons dispatch product-authored `open_dialog` payloads
 that set their scoped presence keys; form submission is the only path that
-invokes the matching workflow mutation.
+invokes the matching workflow mutation. The spawn form accepts optional
+`step_id` (defaults to the run's current step) and optional `session_type_id`
+(Hub session type override; otherwise step or package default).
 
 Action results echo request, surface, action, and optional node identity exactly.
 Accepted filter/select results set scoped presentation values. Accepted

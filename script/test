@@ -1589,8 +1589,52 @@ local function find_node(node, id)
 end
 assert(find_node(home, "project-pipelines-workbench-toolbar").type == "toolbar")
 assert(find_node(home, "project-pipelines-project-table").type == "table")
+-- Operator workbench copy: daily path first, session-type vocabulary, plugin-owned UiNodes.
+assert(home.props and home.props.title == "Project Pipelines")
+assert(find_node(home, "project-pipelines-command-center").props.title == "Overview")
+assert(find_node(home, "project-pipelines-create-guidance").props.title == "Common path")
+assert(find_node(home, "project-pipelines-toolbar-activate-step").props.label == "Spawn agent")
+assert(find_node(home, "project-pipelines-toolbar-filter-review").props.label == "Ready for review")
+assert(find_node(home, "project-pipelines-create-guidance-summary").props.text:find("Session types are Hub launch contracts", 1, true))
+local session_request_table = find_node(home, "project-pipelines-session-request-table")
+assert(session_request_table and session_request_table.type == "table")
+local session_request_columns = {}
+for _, column in ipairs(session_request_table.props.columns or {}) do
+  session_request_columns[column.id] = column.label
+end
+assert(session_request_columns.session_type == "Session type", "agent spawn table must expose session type")
+assert(session_request_columns.ticket == "Ticket")
+assert(session_request_columns.request == nil, "request-id column is not an operator path")
+local spawn_form = find_node(home, "project-pipelines-action-feedback")
+assert(spawn_form and spawn_form.props.submit_label == "Spawn agent")
+assert(find_node(home, "project-pipelines-action-session-type-id"), "spawn form must accept an optional Hub session type")
+local filter_rejected = handlers["project_pipelines.filter"]({
+  request_id = "ux-filter-missing-status",
+  surface_id = "project-pipelines.home",
+  action_id = "project_pipelines.filter",
+  kind = "submit",
+  payload = {},
+})
+assert(filter_rejected.state == "rejected")
+assert(filter_rejected.error_code == "validation_failed")
+assert(filter_rejected.error:find("filter", 1, true) or filter_rejected.error:find("Choose", 1, true))
+local spawn_missing = handlers["project_pipelines.spawn_ticket_session"]({
+  request_id = "ux-spawn-missing-run",
+  surface_id = "project-pipelines.home",
+  action_id = "project_pipelines.spawn_ticket_session",
+  kind = "submit",
+  values = {},
+})
+assert(spawn_missing.state == "error" or spawn_missing.state == "rejected")
+assert(spawn_missing.error_code == "validation_failed" or spawn_missing.error_code == "not_found")
+assert(type(spawn_missing.error) == "string" and spawn_missing.error ~= "")
 local settings = handlers["project-pipelines.settings"]({})
 assert(find_node(settings, "project-pipelines-provider-dependency-status"), "settings must expose provider diagnostics")
+assert(find_node(settings, "project-pipelines-settings-count-sessions").props.label == "Agent spawns")
+assert(
+  find_node(settings, "project-pipelines-settings-default-spawn-target-title").props.text == "Default spawn point",
+  "settings defaults must use spawn point language"
+)
 
 durable_store["v4/tickets/malformed"] = {
   key = "v4/tickets/malformed", schema_version = 4, revision = 1,
