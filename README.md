@@ -23,7 +23,9 @@ The current Project Pipelines domain contract lives in
 [`docs/domain-contract.md`](docs/domain-contract.md). It defines projects,
 tickets, pipeline definitions, steps, gates, artifacts, findings,
 questions/answers, runs, PR links, provider lifecycle boundaries, events, and
-persistence ownership.
+persistence ownership. Durable `question_asked` audit records stay in plugin
+state. Transient Hub `question.opened` notices are a separate live-delivery
+plane and are not used to reconstruct question state.
 
 The executable contract fixture is
 [`fixtures/project_pipelines/domain_contract.json`](fixtures/project_pipelines/domain_contract.json).
@@ -120,9 +122,10 @@ and before writes. Each state transition uses one capability-gated
 atomically activates its ticket and creates the run/current run-step; advance,
 cancel, merge request, and close atomically reconcile ticket/run/run-step state
 before entity or surface projection. This release requires Hub commit
-`8a60bd58841179f8b1fd4040d9362d18ea244230` or newer. Upgrade Hub before
+`d52c3ebc4190286c4b7c3812f8c65251c646ade5` or newer. Upgrade Hub before
 installing this package release; older Hubs do not admit the authoritative
-session-type capability scope. The minimum Hub also contains the atomic plugin
+session-type capability scope or the package event router used by
+`question.opened`. The minimum Hub also contains the atomic plugin
 database ABI and generic package-owned `entity_provider` admission. The
 package never simulates atomicity with sequential writes. Each package entity
 family has an explicit provider returning a fresh authoritative whole-family
@@ -254,8 +257,8 @@ Workbench controls are structured UiNodes only. Tables declare single-row
 selection and row-action metadata; toolbar and form buttons route to
 plugin-owned action ids such as `project_pipelines.create_ticket`,
 `project_pipelines.start_run`, and `project_pipelines.spawn_ticket_session`.
-Rejected actions return Hub-style error codes through `error_code` with short
-operator copy while preserving field ids for form repair. Raw HTML and iframes
+Rejected actions return short operator copy in `error` and keep domain codes
+in the action payload while preserving field ids for form repair. Raw HTML and iframes
 are intentionally out of scope for CRUD/workbench controls. Future graph or
 report surfaces may use an iframe only when they need a custom full-screen
 visual app with an explicit plugin asset bridge.
@@ -359,15 +362,16 @@ should spawn once and a repeat activation should reuse that request.
 For the Hub-owned UI contract flow, build the exact merged Hub and its locked
 Core session worker from a fresh checkout. The second binary is a
 `botster-core` target pinned by that Hub commit's `Cargo.lock`; it does not carry
-the Hub SHA. `script/test-hub-flow` runs both locked build commands itself after
+the Hub SHA. The worker binary is the `botster-core-daemon` target pinned by that
+lockfile. `script/test-hub-flow` runs both locked build commands itself after
 verifying the checkout revision, so stale target artifacts cannot satisfy the
 proof.
 
 ```sh
 git clone https://github.com/trybotster/botster-hub.git /private/tmp/botster-hub-ui-contract
-git -C /private/tmp/botster-hub-ui-contract checkout 8a60bd58841179f8b1fd4040d9362d18ea244230
+git -C /private/tmp/botster-hub-ui-contract checkout d52c3ebc4190286c4b7c3812f8c65251c646ade5
 cargo build --locked --manifest-path /private/tmp/botster-hub-ui-contract/Cargo.toml
-cargo build --locked --manifest-path /private/tmp/botster-hub-ui-contract/Cargo.toml -p botster-core --bin botster-session-worker
+cargo build --locked --manifest-path /private/tmp/botster-hub-ui-contract/Cargo.toml -p botster-core-daemon --bin botster-session-worker
 BOTSTER_HUB_SOURCE=/private/tmp/botster-hub-ui-contract \
 BOTSTER_HUB_BIN=/private/tmp/botster-hub-ui-contract/target/debug/botster-hub \
 BOTSTER_SESSION_WORKER_BIN=/private/tmp/botster-hub-ui-contract/target/debug/botster-session-worker \

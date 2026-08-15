@@ -108,5 +108,27 @@
       "id": "atomic_lifecycle_projection",
       "label": "Atomic ticket, run, and run-step lifecycle projection"
     }
-  ]
+  ],
+  "events": {
+    "emitted": [
+      {
+        "name": "question.opened",
+        "audience": ["clients", "plugins"],
+        "payload_schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "question_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "kind": { "type": "string", "enum": ["human", "agent"] },
+            "notice": { "type": "string", "minLength": 1, "maxLength": 280 },
+            "blocking": { "type": "boolean" },
+            "run_id": { "type": "string", "maxLength": 128 },
+            "step_id": { "type": "string", "maxLength": 128 },
+            "ticket_id": { "type": "string", "maxLength": 128 }
+          },
+          "required": ["question_id", "kind", "notice"]
+        }
+      }
+    ]
+  }
 }

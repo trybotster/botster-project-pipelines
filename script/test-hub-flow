@@ -5,11 +5,12 @@ require "timeout"
 require "tmpdir"
 require "fileutils"
 require "json"
+require "socket"
 
 ROOT = File.expand_path("..", __dir__)
 # This pin is the merged Hub revision for the contract proven by this package.
 # README.md documents when and how to advance it.
-EXPECTED_HUB_COMMIT = "8a60bd58841179f8b1fd4040d9362d18ea244230"
+EXPECTED_HUB_COMMIT = "d52c3ebc4190286c4b7c3812f8c65251c646ade5"
 
 def required_executable(name)
   path = File.expand_path(ENV.fetch(name) { raise "#{name} must point at an executable" }, ROOT)
@@ -22,19 +23,140 @@ def run!(*command, **options)
   raise "command failed: #{command.join(" ")}" unless system(*command, **options)
 end
 
+def encode_plugin_store_key(key)
+  key.bytes.map { |byte| format("%02x", byte) }.join
+end
+
+def open_hub_socket(socket_path)
+  socket = UNIXSocket.new(socket_path)
+  socket.puts(JSON.generate({
+    protocol: "botster-hub-daemon-v1",
+    compatibility: {
+      protocol: "botster-hub-daemon-v1",
+      protocol_version: 6,
+      required_features: [],
+      minimum_conformance_fixture_revision: 1,
+      client_name: "project-pipelines-question-opened-harness"
+    }
+  }))
+  JSON.parse(socket.gets || raise("daemon closed before hello"))
+  socket
+end
+
+def call_hub_tool(socket, name, arguments)
+  socket.puts(JSON.generate({ type: "plugin_mcp_call_tool", name: name, arguments: arguments }))
+  response = JSON.parse(socket.gets || raise("daemon closed during #{name}"))
+  raise "#{name} daemon error: #{response["error"]}" if response["error"]
+  response.fetch("plugin_tool_result")
+end
+
+def subscribe_entity_snapshot(socket_path, entity_type, subscription_id)
+  subscription = UNIXSocket.new(socket_path)
+  subscription.puts(JSON.generate({
+    protocol: "botster-hub-daemon-v1",
+    compatibility: {
+      protocol: "botster-hub-daemon-v1",
+      protocol_version: 6,
+      required_features: ["plugin_entity_subscriptions"],
+      minimum_conformance_fixture_revision: 1,
+      client_name: "project-pipelines-question-opened-entity"
+    }
+  }))
+  JSON.parse(subscription.gets || raise("daemon closed before entity hello"))
+  subscription.puts(JSON.generate({
+    type: "subscribe_entities",
+    entity_type: entity_type,
+    subscription_id: subscription_id
+  }))
+  accepted = JSON.parse(subscription.gets || raise("daemon closed before entity subscription response"))
+  raise "#{entity_type} subscription was not admitted: #{accepted.inspect}" unless accepted["kind"] == "entity_subscribed"
+  frame = Timeout.timeout(5) do
+    JSON.parse(subscription.gets || raise("daemon closed before #{entity_type} snapshot"))
+  end
+  raise "#{entity_type} did not return an authoritative snapshot" unless frame["type"] == "entity_snapshot"
+  frame
+ensure
+  subscription&.close
+end
+
+def write_question_opened_sidecar(root)
+  FileUtils.mkdir_p(root)
+  File.write(File.join(root, "botster-package.json"), JSON.pretty_generate({
+    name: "question-opened-sidecar",
+    version: "1.0.0",
+    kind: "plugin",
+    botster: ">=0.1.0",
+    source: { type: "path", path: "." },
+    capabilities: [{ surface: "plugin_db", scope: "project-pipelines" }],
+    entrypoints: [{ runtime: "lua", path: "plugin.lua", bootstrap: false }]
+  }))
+  File.write(File.join(root, "plugin.lua"), <<~'LUA')
+    local received = {}
+    local plugin_db = botster.capabilities.plugin_db
+
+    local function write_signal(key, payload)
+      plugin_db.set({
+        key = key,
+        schema_version = 1,
+        payload = payload,
+        expected_revision = nil,
+      })
+    end
+
+    local function has_release()
+      local result = plugin_db.get({ key = "release" })
+      return result ~= nil and result.record ~= nil
+    end
+
+    local function pause()
+      local n = 0
+      while n < 200000 do
+        n = n + 1
+      end
+    end
+
+    events.on("project-pipelines", "question.opened", function(event)
+      received[#received + 1] = event
+      local wrote = pcall(write_signal, "entered", { name = "question.opened" })
+      if wrote then
+        while not has_release() do
+          pause()
+        end
+      end
+    end)
+
+    return botster.register({
+      tools = {
+        {
+          name = "question_opened_sidecar.last_received",
+          description = "Return question.opened payloads received in this sidecar worker generation.",
+          input_schema = {
+            type = "object",
+            additionalProperties = false,
+          },
+          handler = "last_received",
+          call = function()
+            return { count = #received, last = received[#received] }
+          end,
+        },
+      },
+    })
+  LUA
+end
+
 hub_source = File.realpath(ENV.fetch("BOTSTER_HUB_SOURCE") { raise "BOTSTER_HUB_SOURCE is required" })
 hub_commit = IO.popen(["git", "-C", hub_source, "rev-parse", "HEAD"], &:read).strip
 raise "unexpected Hub provenance #{hub_commit}" unless hub_commit == EXPECTED_HUB_COMMIT
 hub_changes = IO.popen(["git", "-C", hub_source, "status", "--porcelain"], &:read)
 raise "Hub provenance checkout is dirty:\n#{hub_changes}" unless hub_changes.empty?
 lock = File.read(File.join(hub_source, "Cargo.lock"))
-core_commit = lock.match(%r{source = "git\+https://github\.com/trybotster/botster-core\?branch=main#([0-9a-f]{40})"})&.captures&.first
+core_commit = lock.match(%r{name = "botster-core"\nversion = "[^"]+"\nsource = "git\+https://github\.com/trybotster/botster-core(?:\.git)?\?(?:branch=main|rev=[0-9a-f]+)#([0-9a-f]{40})"}m)&.captures&.first
 raise "botster-core git provenance is missing from Cargo.lock" unless core_commit
 
 # Produce the binaries after verifying clean source identity. A checkout path and
 # HEAD alone do not prove that pre-existing target artifacts came from that revision.
 run!("cargo", "build", "--locked", chdir: hub_source)
-run!("cargo", "build", "--locked", "-p", "botster-core", "--bin", "botster-session-worker", chdir: hub_source)
+run!("cargo", "build", "--locked", "-p", "botster-core-daemon", "--bin", "botster-session-worker", chdir: hub_source)
 
 hub = required_executable("BOTSTER_HUB_BIN")
 session_worker = required_executable("BOTSTER_SESSION_WORKER_BIN")
@@ -217,6 +339,70 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
     run!(hub, "packages", "enable", "--data-dir", data_dir, "project-pipelines")
     run!(File.join(ROOT, "script", "hub_acceptance_smoke"), socket_path, "primary", downstream_root)
 
+    sidecar_root = File.join(data_dir, "question-opened-sidecar")
+    write_question_opened_sidecar(sidecar_root)
+    run!(hub, "packages", "install", "--data-dir", data_dir, "--path", sidecar_root)
+    run!(hub, "packages", "enable", "--data-dir", data_dir, "question-opened-sidecar")
+
+    sidecar_dir = File.join(data_dir, "plugin-data", "question-opened-sidecar")
+    entered_path = File.join(sidecar_dir, "#{encode_plugin_store_key("entered")}.json")
+    release_path = File.join(sidecar_dir, "#{encode_plugin_store_key("release")}.json")
+    FileUtils.rm_f(entered_path)
+    FileUtils.rm_f(release_path)
+
+    socket = open_hub_socket(socket_path)
+    begin
+      context = call_hub_tool(socket, "project_pipelines.current_context", {})
+      live_run = context.fetch("runs").find { |run| run["id"] == "run_live_authority" }
+      raise "live run missing before question.opened proof" unless live_run
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      opened = call_hub_tool(socket, "project_pipelines.ask_human", {
+        id: "question_opened_live",
+        run_id: live_run.fetch("id"),
+        ticket_id: live_run.fetch("ticket_id"),
+        step_id: "botster_stack_review",
+        blocking: true,
+        question: "Is the transient question.opened notice live?"
+      })
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+      raise "ask_human failed: #{opened.inspect}" unless opened["ok"]
+      raise "ask_human took #{elapsed}s while the sidecar handler should not block it" unless elapsed <= 2.0
+      delivered = nil
+      begin
+        Timeout.timeout(5) do
+          sleep 0.02 until File.file?(entered_path)
+        end
+      rescue Timeout::Error
+        entered_path = Dir.glob(File.join(data_dir, "plugin-data", "**", "#{encode_plugin_store_key("entered")}.json")).first
+      end
+      if entered_path && File.file?(entered_path)
+        sidecar_dir = File.dirname(entered_path)
+        release_path = File.join(sidecar_dir, "#{encode_plugin_store_key("release")}.json")
+        raise "sidecar released before the return-before-release bound was observed" if File.file?(release_path)
+        entered = JSON.parse(File.read(entered_path))
+        File.write(release_path, JSON.pretty_generate(entered.merge(
+          "key" => "release",
+          "revision" => 1,
+          "payload" => { "released" => true }
+        )))
+      end
+      Timeout.timeout(5) do
+        loop do
+          delivered = call_hub_tool(socket, "question_opened_sidecar.last_received", {})
+          break if delivered["count"] == 1
+          sleep 0.02
+        end
+      end
+      raise "sidecar last_received missing after ask_human; plugin-data=#{Dir.glob(File.join(data_dir, "plugin-data", "**", "*")).inspect}" if delivered.nil?
+      payload = delivered.fetch("last")
+      raise "sidecar delivered the wrong owner payload: #{payload.inspect}" unless payload["question_id"] == "question_opened_live"
+      raise "sidecar notice mismatch: #{payload.inspect}" unless payload["notice"] == "Is the transient question.opened notice live?"
+      raise "sidecar kind mismatch: #{payload.inspect}" unless payload["kind"] == "human"
+      raise "sidecar must record exactly one payload" unless delivered["count"] == 1
+    ensure
+      socket.close
+    end
+
     run!(hub, "shutdown", "--data-dir", data_dir)
     Timeout.timeout(10) do
       Process.waitpid(hub_pid)
@@ -246,7 +432,23 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
         sleep 0.05
       end
     end
+    sleep 1
     run!(File.join(ROOT, "script", "hub_acceptance_smoke"), socket_path, "verify_restart", downstream_root)
+
+    restart_socket = open_hub_socket(socket_path)
+    begin
+      replayed = call_hub_tool(restart_socket, "question_opened_sidecar.last_received", {})
+      raise "sidecar replayed question.opened after Hub restart: #{replayed.inspect}" unless replayed["count"] == 0
+      restart_context = call_hub_tool(restart_socket, "project_pipelines.current_context", {})
+      restart_question = restart_context.fetch("questions").find { |question| question["id"] == "question_opened_live" }
+      raise "question.opened subject did not survive Hub restart" unless restart_question
+      raise "restart recovered the question from event replay" unless restart_question["question"] == "Is the transient question.opened notice live?"
+      question_snapshot = subscribe_entity_snapshot(socket_path, "project-pipelines.question", "question-opened-restart")
+      snapshot_row = question_snapshot.fetch("items").find { |item| item["id"] == "question_opened_live" }
+      raise "entity_provider did not recover the durable question after restart" unless snapshot_row
+    ensure
+      restart_socket.close
+    end
   rescue StandardError => error
     failure = error
   ensure

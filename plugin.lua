@@ -195,7 +195,6 @@ local function action_from_tool(arguments, call, options)
       payload = response,
       normalized_values = copy(values),
     }
-    if error.code then extra.error_code = error.code end
     if next(fields) ~= nil then extra.field_errors = fields end
     return action_result(arguments, state, extra)
   end
@@ -1598,6 +1597,32 @@ local function record_question(arguments)
   push_event(state, "question_asked", run_id, question.id)
   local err = save_state(state)
   if err then return err end
+  -- Unicode-character truncation for the transient notice. Do not reuse
+  -- bounded_prompt: that helper is byte-oriented and can cut mid-codepoint.
+  local notice = "?"
+  if type(question.question) == "string" and question.question ~= "" then
+    local measured, length = pcall(utf8.len, question.question)
+    if measured and type(length) == "number" then
+      if length <= 280 then
+        notice = question.question
+      else
+        local offset = utf8.offset(question.question, 281)
+        if type(offset) == "number" then notice = question.question:sub(1, offset - 1) end
+      end
+    end
+  end
+  local payload = {
+    question_id = question.id,
+    kind = question.kind,
+    notice = notice,
+    blocking = question.blocking == true,
+  }
+  if type(question.run_id) == "string" and question.run_id ~= "" then payload.run_id = question.run_id end
+  if type(question.ticket_id) == "string" and question.ticket_id ~= "" then payload.ticket_id = question.ticket_id end
+  if type(question.step_id) == "string" and question.step_id ~= "" then payload.step_id = question.step_id end
+  pcall(function()
+    events.emit("question.opened", payload)
+  end)
   return ok({ question = question })
 end
 
@@ -3106,7 +3131,6 @@ local function filter_action(arguments)
   if type(payload.status) ~= "string" or payload.status == "" then
     return action_result(arguments, "rejected", {
       error = "Choose a filter before applying it.",
-      error_code = "validation_failed",
       form_errors = { "Choose a filter before applying it." },
     })
   end
@@ -3126,7 +3150,6 @@ local function select_row_action(arguments)
   if type(row_id) ~= "string" or row_id == "" then
     return action_result(arguments, "rejected", {
       error = "Select a row first.",
-      error_code = "validation_failed",
       form_errors = { "Select a row first." },
     })
   end
@@ -5975,7 +5998,10 @@ local function authoritative_handlers()
     { id = "spawn_ticket_session_action", kind = "ui_action", descriptor_id = "project_pipelines.spawn_ticket_session", descriptor = { action_id = "project_pipelines.spawn_ticket_session", surface_id = "project-pipelines.home" }, call = spawn_ticket_session_action },
     { id = "filter_action", kind = "ui_action", descriptor_id = "project_pipelines.filter", descriptor = { action_id = "project_pipelines.filter", surface_id = "project-pipelines.home" }, call = filter_action },
     { id = "select_row_action", kind = "ui_action", descriptor_id = "project_pipelines.select_row", descriptor = { action_id = "project_pipelines.select_row", surface_id = "project-pipelines.home" }, call = select_row_action },
-    { id = "pr_merged", kind = "event", event = "pr_merged", descriptor_id = "pr_merged", descriptor = { event = "pr_merged" }, call = handle_pr_merged },
+    -- Hub package-event load now requires exact owner+name subscriptions.
+    -- No admitted producer currently declares pr_merged, so this stays a
+    -- direct handler rather than a name-only event subscription.
+    { id = "pr_merged", kind = "hook", descriptor_id = "pr_merged", descriptor = { event = "pr_merged" }, call = handle_pr_merged },
   }
   for _, provider in ipairs(ENTITY_PROVIDER_FAMILIES) do
     local entity_type = "project-pipelines." .. provider.family

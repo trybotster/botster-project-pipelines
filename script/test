@@ -20,6 +20,21 @@ assert manifest["entrypoints"] == [{"runtime": "lua", "path": "plugin.lua", "boo
 assert {capability["surface"] for capability in manifest["capabilities"]} == {
     "surfaces", "mcp", "plugin_db", "session_actions"
 }
+emitted_events = manifest.get("events", {}).get("emitted", [])
+assert len(emitted_events) == 1, "package must declare exactly one emitted event"
+assert emitted_events[0]["name"] == "question.opened"
+assert set(emitted_events[0]["audience"]) == {"clients", "plugins"}
+payload_schema = emitted_events[0]["payload_schema"]
+assert payload_schema["type"] == "object"
+assert payload_schema["additionalProperties"] is False
+assert payload_schema["required"] == ["question_id", "kind", "notice"]
+assert payload_schema["properties"]["notice"]["maxLength"] == 280
+assert payload_schema["properties"]["kind"]["enum"] == ["human", "agent"]
+assert "events.on(" not in source
+assert 'events.emit("question.opened"' in source
+assert "utf8.offset" in source
+assert "utf8.len" in source
+assert "bounded_prompt" in source
 session_action = next(capability for capability in manifest["capabilities"] if capability["surface"] == "session_actions")
 assert session_action["scope"] == "session_type_managed_git_spawn"
 configuration_fields = {field["key"] for field in manifest["configuration"]["fields"]}
@@ -38,9 +53,9 @@ navigation_targets = {item["target"]["surface_id"] for item in manifest["navigat
 assert "project-pipelines.home" in navigation_targets
 readme = Path("README.md").read_text()
 domain_contract = Path("docs/domain-contract.md").read_text()
-for phrase in ["Public MCP Contract", "Drain-first Cold Cut", "plugin_db.batch", "entity_provider"]:
+for phrase in ["Public MCP Contract", "Drain-first Cold Cut", "plugin_db.batch", "entity_provider", "question.opened", "question_asked"]:
     assert phrase in readme
-for phrase in ["Persistence Boundaries", "entity_provider", "provider-specific merge execution"]:
+for phrase in ["Persistence Boundaries", "entity_provider", "provider-specific merge execution", "question.opened", "question_asked"]:
     assert phrase in domain_contract
 for dead_name in ["empty_schema", "repository_from", "show_project", "show_ticket", "update_ticket_status", "list_pipeline_definitions", "record_run", "run_status_tone"]:
     assert f"local function {dead_name}" not in source
@@ -198,6 +213,18 @@ botster = {
     },
   },
   register = function(spec) return spec end,
+}
+
+emit_stub = { events = {}, status = "accepted", throw = false }
+events = {
+  emit = function(name, payload)
+    if emit_stub.throw then error("injected emit throw") end
+    table.insert(emit_stub.events, { name = name, payload = copy(payload) })
+    return { status = emit_stub.status }
+  end,
+  on = function()
+    error("production plugin.lua must not subscribe")
+  end,
 }
 
 local plugin = dofile("plugin.lua")
@@ -1616,7 +1643,6 @@ local filter_rejected = handlers["project_pipelines.filter"]({
   payload = {},
 })
 assert(filter_rejected.state == "rejected")
-assert(filter_rejected.error_code == "validation_failed")
 assert(filter_rejected.error:find("filter", 1, true) or filter_rejected.error:find("Choose", 1, true))
 local spawn_missing = handlers["project_pipelines.spawn_ticket_session"]({
   request_id = "ux-spawn-missing-run",
@@ -1626,8 +1652,9 @@ local spawn_missing = handlers["project_pipelines.spawn_ticket_session"]({
   values = {},
 })
 assert(spawn_missing.state == "error" or spawn_missing.state == "rejected")
-assert(spawn_missing.error_code == "validation_failed" or spawn_missing.error_code == "not_found")
 assert(type(spawn_missing.error) == "string" and spawn_missing.error ~= "")
+local spawn_error = spawn_missing.payload and spawn_missing.payload.error
+assert(spawn_error and (spawn_error.code == "validation_failed" or spawn_error.code == "not_found"))
 local settings = handlers["project-pipelines.settings"]({})
 assert(find_node(settings, "project-pipelines-provider-dependency-status"), "settings must expose provider diagnostics")
 assert(find_node(settings, "project-pipelines-settings-count-sessions").props.label == "Agent spawns")
@@ -1916,6 +1943,182 @@ assert(durable_store["v4/pipeline_definitions/legacy-custom"].revision == settle
 for key in pairs(durable_store) do
   assert(key:sub(1, 3) ~= "v3/", "restart must not resurrect a legacy namespace record: " .. key)
 end
+
+;(function()
+local function reset_emits()
+  emit_stub.events = {}
+end
+local function last_opened_emit()
+  return emit_stub.events[#emit_stub.events]
+end
+
+local function question_opened_payload_valid(payload, question)
+  assert(payload.question_id == question.id, "question_id")
+  assert(payload.kind == question.kind, "kind")
+  assert(type(payload.notice) == "string" and payload.notice ~= "", "notice")
+  assert(utf8.len(payload.notice) <= 280, "notice length")
+  assert(payload.blocking == (question.blocking == true), "blocking")
+  if question.run_id then
+    assert(payload.run_id == question.run_id, "run_id")
+  else
+    assert(payload.run_id == nil, "run_id omitted")
+  end
+  if question.ticket_id then
+    assert(payload.ticket_id == question.ticket_id, "ticket_id")
+  else
+    assert(payload.ticket_id == nil, "ticket_id omitted")
+  end
+  if question.step_id then
+    assert(payload.step_id == question.step_id, "step_id")
+  else
+    assert(payload.step_id == nil, "step_id omitted")
+  end
+  assert(payload.emit_status == nil, "emit status must not be persisted on the payload")
+end
+
+assert(tools["project_pipelines.create_project"]({
+  id = "project-question-opened", name = "Question opened", target_id = "target-one",
+}).ok)
+assert(tools["project_pipelines.create_pipeline"]({
+  id = "pipeline-question-opened", name = "Question opened",
+  steps = {
+    { id = "step-one", name = "One", next_step_id = "step-two" },
+    { id = "step-two", name = "Two" },
+  },
+}).ok)
+assert(tools["project_pipelines.create_ticket"]({
+  id = "ticket-question-opened", project_id = "project-question-opened", title = "Question opened",
+}).ok)
+assert(tools["project_pipelines.start_run"]({
+  id = "run-question-opened", ticket_id = "ticket-question-opened", pipeline_id = "pipeline-question-opened",
+}).ok)
+
+reset_emits()
+local opened = tools["project_pipelines.ask_human"]({
+  run_id = "run-question-opened",
+  ticket_id = "ticket-question-opened",
+  step_id = "step-one",
+  blocking = true,
+  question = "Continue?",
+})
+assert(opened.ok)
+assert(#emit_stub.events == 1 and emit_stub.events[1].name == "question.opened")
+question_opened_payload_valid(emit_stub.events[1].payload, opened.question)
+assert(opened.question.question == "Continue?")
+assert(opened.question.emit_status == nil)
+local opened_context = tools["project_pipelines.current_context"]({ run_id = "run-question-opened" })
+assert(#opened_context.questions == 1 and opened_context.questions[1].id == opened.question.id)
+assert(count_events("run-question-opened", "question_asked") == 1)
+local opened_snapshot = entity_providers["project-pipelines.question"]({ entity_type = "project-pipelines.question" })
+local opened_row
+for _, item in ipairs(opened_snapshot.items) do
+  if item.id == opened.question.id then opened_row = item end
+end
+assert(opened_row and opened_row.question == "Continue?", "entity snapshot must keep the durable question")
+
+reset_emits()
+local agent_opened = tools["project_pipelines.ask_agent"]({
+  run_id = "run-question-opened",
+  ticket_id = "ticket-question-opened",
+  question = "Review?",
+})
+assert(agent_opened.ok)
+assert(#emit_stub.events == 1 and emit_stub.events[1].payload.kind == "agent")
+question_opened_payload_valid(emit_stub.events[1].payload, agent_opened.question)
+
+reset_emits()
+assert(tools["project_pipelines.escalate_question"]({ question_id = agent_opened.question.id }).question.kind == "human")
+assert(#emit_stub.events == 0, "escalate_question must not emit question.opened")
+reset_emits()
+assert(tools["project_pipelines.answer_question"]({
+  question_id = agent_opened.question.id, answer = "Reviewed",
+}).ok)
+assert(#emit_stub.events == 0, "answer_question must not emit question.opened")
+
+fail_batch_key_prefix = "v4/questions/"
+reset_emits()
+local persist_failed = tools["project_pipelines.ask_human"]({
+  id = "question-persist-fail",
+  run_id = "run-question-opened",
+  ticket_id = "ticket-question-opened",
+  question = "Must not emit",
+})
+fail_batch_key_prefix = nil
+assert(not persist_failed.ok and persist_failed.error.code == "persist_failed")
+assert(#emit_stub.events == 0, "failed persist must emit nothing")
+local after_persist_fail = tools["project_pipelines.current_context"]({ run_id = "run-question-opened" })
+for _, row in ipairs(after_persist_fail.questions) do
+  assert(row.id ~= "question-persist-fail", "failed persist must not leave a question row")
+end
+
+local function assert_nonfatal_emit(label, configure)
+  configure()
+  reset_emits()
+  local result = tools["project_pipelines.ask_human"]({
+    id = "question-" .. label,
+    run_id = "run-question-opened",
+    ticket_id = "ticket-question-opened",
+    question = "Non-fatal " .. label,
+  })
+  emit_stub.status = "accepted"
+  emit_stub.throw = false
+  assert(result.ok, label .. " must keep ask_human ok: " .. tostring(result and result.error and result.error.code))
+  assert(result.question and result.question.id == "question-" .. label, label .. " id mismatch")
+  assert(result.question.emit_status == nil, label .. " stored emit_status")
+  assert(result.question.event_status == nil, label .. " stored event_status")
+  local context = tools["project_pipelines.current_context"]({ run_id = "run-question-opened" })
+  local found
+  for _, row in ipairs(context.questions) do
+    if row.id == result.question.id then found = row end
+  end
+  assert(found and found.question == "Non-fatal " .. label, label .. " must keep the durable question")
+  local snapshot = entity_providers["project-pipelines.question"]({ entity_type = "project-pipelines.question" })
+  local snap_row
+  for _, item in ipairs(snapshot.items) do
+    if item.id == result.question.id then snap_row = item end
+  end
+  assert(snap_row, label .. " must remain visible through entity_provider")
+end
+
+assert_nonfatal_emit("shed-full", function() emit_stub.status = "shed_full" end)
+assert_nonfatal_emit("rejected-invalid", function() emit_stub.status = "rejected_invalid" end)
+assert_nonfatal_emit("throw", function() emit_stub.throw = true end)
+
+local accent = "\195\169"
+local long_question = string.rep("x", 279) .. accent .. string.rep("y", 40)
+local byte_cut = long_question:sub(1, 280)
+assert(utf8.len(byte_cut) == nil, "byte :sub(1,280) must be the wrong cut across U+00E9")
+reset_emits()
+local utf8_opened = tools["project_pipelines.ask_human"]({
+  id = "question-utf8-boundary",
+  run_id = "run-question-opened",
+  ticket_id = "ticket-question-opened",
+  question = long_question,
+})
+assert(utf8_opened.ok)
+assert(utf8_opened.question.question == long_question)
+assert(#emit_stub.events == 1)
+local notice = emit_stub.events[1].payload.notice
+assert(utf8.len(notice) == 280, "notice must be 280 Unicode characters")
+assert(notice == string.rep("x", 279) .. accent)
+question_opened_payload_valid(emit_stub.events[1].payload, utf8_opened.question)
+
+reset_emits()
+local invalid_question = "hello" .. string.char(0xC3)
+local invalid_opened = tools["project_pipelines.ask_human"]({
+  id = "question-invalid-utf8",
+  run_id = "run-question-opened",
+  ticket_id = "ticket-question-opened",
+  question = invalid_question,
+})
+assert(invalid_opened.ok)
+assert(invalid_opened.question.question == invalid_question)
+assert(#emit_stub.events == 1)
+assert(emit_stub.events[1].payload.notice == "?")
+assert(utf8.len(emit_stub.events[1].payload.notice) == 1)
+
+assert(last_opened_emit().name == "question.opened")
+end)()
 
 print("project-pipelines authoritative package checks passed")
 LUA

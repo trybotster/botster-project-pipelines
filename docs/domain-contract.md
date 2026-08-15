@@ -294,12 +294,23 @@ must not make standalone project, ticket, run, or provider records invalid.
 
 ## Event Boundaries
 
-Events are a bounded workflow audit window. The newest 256 records describe
-state changes and external observations; older event keys are deleted to keep
-the plugin namespace viable. Events never contain raw transcripts or
-secret-bearing payloads.
+This package uses two event planes. They are not interchangeable.
 
-Expected event kinds include:
+Durable audit events live in plugin persistence. The newest 256 records describe
+state changes and external observations; older event keys are deleted to keep
+the plugin namespace viable. `question_asked` is this plane: it is written in
+the same `save_state` batch as the question row, appears in
+`current_context.events`, and reconnects through the `project-pipelines.event`
+entity provider. Events never contain raw transcripts or secret-bearing
+payloads.
+
+Transient Hub events are a separate live-delivery plane. `question.opened` is
+declared on the package manifest and emitted only after the question row
+commits. It is a bounded notice for current subscribers. It is not stored in
+plugin_db, it is not an entity family, and reconnect must recover the question
+from `project-pipelines.question` rather than replaying the notice.
+
+Expected durable audit event kinds include:
 
 - `ticket_created`
 - `ticket_dependency_added`
