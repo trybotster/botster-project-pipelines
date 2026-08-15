@@ -2175,6 +2175,52 @@ end
 assert_merged_close_survives_emit("shed-full", function() emit_stub.status = "shed_full" end)
 assert_merged_close_survives_emit("rejected-invalid", function() emit_stub.status = "rejected_invalid" end)
 assert_merged_close_survives_emit("throw", function() emit_stub.throw = true end)
+
+assert(tools["project_pipelines.create_ticket"]({
+  id = "ticket-merge-two-links", project_id = "project-question-opened", title = "Two links",
+}).ok)
+assert(tools["project_pipelines.start_run"]({
+  id = "run-merge-two-links", ticket_id = "ticket-merge-two-links", pipeline_id = "pipeline-question-opened",
+}).ok)
+assert(tools["project_pipelines.link_pr"]({
+  run_id = "run-merge-two-links", url = "https://example.invalid/merge/first",
+}).ok)
+assert(tools["project_pipelines.link_pr"]({
+  run_id = "run-merge-two-links", url = "https://example.invalid/merge/second",
+}).ok)
+reset_emits()
+local second_merged = tools["project_pipelines.link_pr"]({
+  run_id = "run-merge-two-links",
+  url = "https://example.invalid/merge/second",
+  status = "merged",
+  merge_commit = "second-only",
+})
+assert(second_merged.ok)
+assert(second_merged.pr_link.url == "https://example.invalid/merge/second")
+assert(second_merged.pr_link.status == "merged")
+assert(second_merged.pr_link.merge_commit == "second-only")
+assert(second_merged.run.status == "closed")
+assert(second_merged.ticket.status == "closed")
+local two_links = tools["project_pipelines.list_pr_links"]({ run_id = "run-merge-two-links" }).pr_links
+local first_link, second_link
+for _, link in ipairs(two_links) do
+  if link.url == "https://example.invalid/merge/first" then first_link = link end
+  if link.url == "https://example.invalid/merge/second" then second_link = link end
+end
+assert(first_link and first_link.status ~= "merged", "the first link must stay open")
+assert(first_link.merge_commit == nil, "the first link must not receive the second merge_commit")
+assert(second_link and second_link.status == "merged" and second_link.merge_commit == "second-only")
+local missing_url = pr_merged_handler({
+  run_id = "run-merge-two-links",
+  pr_url = "https://example.invalid/merge/missing",
+})
+assert(not missing_url.ok and missing_url.error.code == "not_found")
+local after_miss = tools["project_pipelines.list_pr_links"]({ run_id = "run-merge-two-links" }).pr_links
+for _, link in ipairs(after_miss) do
+  if link.url == "https://example.invalid/merge/first" then
+    assert(link.status ~= "merged", "a missing URL must not mark another link merged")
+  end
+end
 end)()
 
 print("project-pipelines authoritative package checks passed")
