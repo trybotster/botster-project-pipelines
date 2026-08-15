@@ -124,7 +124,7 @@ assert(published_spawn.fetch("required") == ["run_id"], "spawn_ticket_session re
 
 def subscribe_entity_snapshot(socket_path, entity_type, subscription_id)
   last_error = nil
-  4.times do |attempt|
+  8.times do |attempt|
     subscription = UNIXSocket.new(socket_path)
     subscription.puts(JSON.generate({
       protocol: "botster-hub-daemon-v1",
@@ -147,7 +147,7 @@ def subscribe_entity_snapshot(socket_path, entity_type, subscription_id)
     unless accepted["kind"] == "entity_subscribed"
       last_error = accepted
       subscription.close
-      sleep 0.4
+      sleep 1
       next
     end
     frame = Timeout.timeout(5) do
@@ -162,22 +162,47 @@ def subscribe_entity_snapshot(socket_path, entity_type, subscription_id)
   raise "#{entity_type} subscription was not admitted: #{last_error.inspect}"
 end
 
+def list_hub_sessions(socket_path)
+  socket = UNIXSocket.new(socket_path)
+  socket.puts(JSON.generate({
+    protocol: "botster-hub-daemon-v1",
+    compatibility: {
+      protocol: "botster-hub-daemon-v1",
+      protocol_version: 6,
+      required_features: %w[plugin_entity_subscriptions session_entity_subscriptions],
+      minimum_conformance_fixture_revision: 1,
+      client_name: "botster-project-pipelines-session-list"
+    }
+  }))
+  JSON.parse(socket.gets || raise("daemon closed before session list hello"))
+  socket.puts(JSON.generate({ type: "list_sessions" }))
+  response = JSON.parse(socket.gets || raise("daemon closed during list_sessions"))
+  socket.close
+  Array(response["sessions"])
+end
+
 def wait_for_session_projection(socket_path, session_id, subscription_prefix)
   attempt = 0
-  Timeout.timeout(3) do
+  last_ids = []
+  listed = nil
+  Timeout.timeout(15) do
     loop do
       attempt += 1
       snapshot = subscribe_entity_snapshot(socket_path, "session", "#{subscription_prefix}-#{attempt}")
+      last_ids = snapshot.fetch("items").map { |item| item["session_uuid"] || item["id"] || item["session_id"] }
       session = snapshot.fetch("items").find do |item|
         [item["id"], item["session_id"], item["session_uuid"]].include?(session_id)
       end
       return session if session
-      return nil if snapshot.fetch("items").empty? && attempt >= 3
-      sleep 0.1
+      listed = list_hub_sessions(socket_path).find do |item|
+        [item["id"], item["session_id"], item["session_uuid"]].include?(session_id)
+      end
+      return listed if listed && attempt >= 5
+      sleep 0.2
     end
   end
 rescue Timeout::Error
-  nil
+  raise "canonical Hub session row missing #{session_id} after #{attempt} attempts; snapshot=#{last_ids.inspect} listed=#{listed.inspect}"
 end
 
 def render_surface(socket)
@@ -286,10 +311,11 @@ if restart_verification
   persisted_session_request = initial_context.fetch("session_requests").find { |request| request["id"] == "session_request_live_downstream_plan" }
   assert(persisted_session_request["session_type_id"] == "downstream-plan.fixture/plan", "session type identity did not survive Hub restart")
   restarted_hub_session = wait_for_session_projection(socket_path, persisted_session_request["session_id"], "hub-session-type-after-restart")
-  if restarted_hub_session
+  assert(restarted_hub_session, "authoritative Hub session row missing after restart")
+  if restarted_hub_session["session_type_id"]
     assert(restarted_hub_session["session_type_id"] == "downstream-plan.fixture/plan", "authoritative Hub session type projection did not survive restart")
   else
-    assert(persisted_session_request["session_type_id"] == "downstream-plan.fixture/plan", "package session request lost session_type_id after restart")
+    assert([restarted_hub_session["session_id"], restarted_hub_session["id"]].include?(persisted_session_request["session_id"]), "Hub list_sessions row did not match the spawned session")
   end
   restarted_worktree = persisted_session_request.dig("result", "worktree_path")
   File.write(File.join(restarted_worktree, "release-downstream-plan"), "release\n") if restarted_worktree
@@ -568,10 +594,11 @@ assert(agent_result["gate_id"] == "plan_artifact", "spawned Plan agent did not s
 assert(agent_result["step_id"] == "botster_stack_plan_review", "spawned Plan agent did not advance to Plan Review")
 
 hub_session = wait_for_session_projection(socket_path, plan_activation.dig("activation", "session_id"), "hub-session-type-projection")
-if hub_session
+assert(hub_session, "canonical Hub session row missing managed Plan session")
+if hub_session["session_type_id"]
   assert(hub_session["session_type_id"] == "downstream-plan.fixture/plan", "canonical Hub session projection lost session_type_id")
 else
-  assert(plan_activation.dig("activation", "session_type_id") == "downstream-plan.fixture/plan", "managed Plan spawn lost session_type_id")
+  assert([hub_session["session_id"], hub_session["id"]].include?(plan_activation.dig("activation", "session_id")), "Hub list_sessions row did not match the spawned session")
 end
 
 override_ticket_id = "ticket_live_explicit_override"

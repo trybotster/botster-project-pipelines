@@ -82,12 +82,12 @@ end
 def write_question_opened_sidecar(root)
   FileUtils.mkdir_p(root)
   File.write(File.join(root, "botster-package.json"), JSON.pretty_generate({
-    name: "question-opened-sidecar",
+    name: "botster-workspaces",
     version: "1.0.0",
     kind: "plugin",
     botster: ">=0.1.0",
     source: { type: "path", path: "." },
-    capabilities: [{ surface: "plugin_db", scope: "project-pipelines" }],
+    capabilities: [{ surface: "plugin_db", scope: "botster-workspaces" }],
     entrypoints: [{ runtime: "lua", path: "plugin.lua", bootstrap: false }]
   }))
   File.write(File.join(root, "plugin.lua"), <<~'LUA')
@@ -117,11 +117,9 @@ def write_question_opened_sidecar(root)
 
     events.on("project-pipelines", "question.opened", function(event)
       received[#received + 1] = event
-      local wrote = pcall(write_signal, "entered", { name = "question.opened" })
-      if wrote then
-        while not has_release() do
-          pause()
-        end
+      write_signal("entered", { name = "question.opened" })
+      while not has_release() do
+        pause()
       end
     end)
 
@@ -342,9 +340,9 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
     sidecar_root = File.join(data_dir, "question-opened-sidecar")
     write_question_opened_sidecar(sidecar_root)
     run!(hub, "packages", "install", "--data-dir", data_dir, "--path", sidecar_root)
-    run!(hub, "packages", "enable", "--data-dir", data_dir, "question-opened-sidecar")
+    run!(hub, "packages", "enable", "--data-dir", data_dir, "botster-workspaces")
 
-    sidecar_dir = File.join(data_dir, "plugin-data", "question-opened-sidecar")
+    sidecar_dir = File.join(data_dir, "plugin-data", "botster-workspaces")
     entered_path = File.join(sidecar_dir, "#{encode_plugin_store_key("entered")}.json")
     release_path = File.join(sidecar_dir, "#{encode_plugin_store_key("release")}.json")
     FileUtils.rm_f(entered_path)
@@ -367,25 +365,19 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
       elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
       raise "ask_human failed: #{opened.inspect}" unless opened["ok"]
       raise "ask_human took #{elapsed}s while the sidecar handler should not block it" unless elapsed <= 2.0
-      delivered = nil
       begin
         Timeout.timeout(5) do
           sleep 0.02 until File.file?(entered_path)
         end
       rescue Timeout::Error
-        entered_path = Dir.glob(File.join(data_dir, "plugin-data", "**", "#{encode_plugin_store_key("entered")}.json")).first
+        found = Dir.glob(File.join(data_dir, "**", "*.json")).first(40)
+        raise "sidecar entry signal was not written at #{entered_path}; data_dir=#{found.inspect}"
       end
-      if entered_path && File.file?(entered_path)
-        sidecar_dir = File.dirname(entered_path)
-        release_path = File.join(sidecar_dir, "#{encode_plugin_store_key("release")}.json")
-        raise "sidecar released before the return-before-release bound was observed" if File.file?(release_path)
-        entered = JSON.parse(File.read(entered_path))
-        File.write(release_path, JSON.pretty_generate(entered.merge(
-          "key" => "release",
-          "revision" => 1,
-          "payload" => { "released" => true }
-        )))
-      end
+      raise "sidecar released before the return-before-release bound was observed" if File.file?(release_path)
+      entered_json = File.read(entered_path)
+      raise "entered record is not a store row: #{entered_json}" unless entered_json.include?('"key"')
+      File.write(release_path, entered_json.gsub('"entered"', '"release"').gsub('"name": "question.opened"', '"released": true'))
+      delivered = nil
       Timeout.timeout(5) do
         loop do
           delivered = call_hub_tool(socket, "question_opened_sidecar.last_received", {})
@@ -393,16 +385,17 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
           sleep 0.02
         end
       end
-      raise "sidecar last_received missing after ask_human; plugin-data=#{Dir.glob(File.join(data_dir, "plugin-data", "**", "*")).inspect}" if delivered.nil?
       payload = delivered.fetch("last")
       raise "sidecar delivered the wrong owner payload: #{payload.inspect}" unless payload["question_id"] == "question_opened_live"
       raise "sidecar notice mismatch: #{payload.inspect}" unless payload["notice"] == "Is the transient question.opened notice live?"
       raise "sidecar kind mismatch: #{payload.inspect}" unless payload["kind"] == "human"
       raise "sidecar must record exactly one payload" unless delivered["count"] == 1
+
     ensure
       socket.close
     end
 
+    run!(hub, "packages", "disable", "--data-dir", data_dir, "botster-workspaces")
     run!(hub, "shutdown", "--data-dir", data_dir)
     Timeout.timeout(10) do
       Process.waitpid(hub_pid)
@@ -432,8 +425,9 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
         sleep 0.05
       end
     end
-    sleep 1
+    sleep 5
     run!(File.join(ROOT, "script", "hub_acceptance_smoke"), socket_path, "verify_restart", downstream_root)
+    run!(hub, "packages", "enable", "--data-dir", data_dir, "botster-workspaces")
 
     restart_socket = open_hub_socket(socket_path)
     begin
@@ -446,6 +440,36 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
       question_snapshot = subscribe_entity_snapshot(socket_path, "project-pipelines.question", "question-opened-restart")
       snapshot_row = question_snapshot.fetch("items").find { |item| item["id"] == "question_opened_live" }
       raise "entity_provider did not recover the durable question after restart" unless snapshot_row
+
+      project_id = restart_context.fetch("tickets").find { |ticket| ticket["id"] == restart_question["ticket_id"] }.fetch("project_id")
+      merge_ticket = call_hub_tool(restart_socket, "project_pipelines.create_ticket", {
+        id: "ticket_live_pr_merged",
+        project_id: project_id,
+        title: "Live provider merge"
+      })
+      raise "merge ticket failed: #{merge_ticket.inspect}" unless merge_ticket["ok"]
+      merge_run = call_hub_tool(restart_socket, "project_pipelines.start_run", {
+        id: "run_live_pr_merged",
+        ticket_id: "ticket_live_pr_merged",
+        pipeline_id: "botster_stack_delivery"
+      })
+      raise "merge run failed: #{merge_run.inspect}" unless merge_run["ok"]
+      linked = call_hub_tool(restart_socket, "project_pipelines.link_pr", {
+        run_id: "run_live_pr_merged",
+        url: "https://example.invalid/project-pipelines/pull/9",
+        status: "merged",
+        merge_commit: "cafef00d"
+      })
+      raise "merged link_pr failed: #{linked.inspect}" unless linked["ok"]
+      Timeout.timeout(5) do
+        loop do
+          merged_context = call_hub_tool(restart_socket, "project_pipelines.current_context", { run_id: "run_live_pr_merged" })
+          ticket = merged_context.fetch("tickets").find { |row| row["id"] == "ticket_live_pr_merged" }
+          run = merged_context.fetch("runs").find { |row| row["id"] == "run_live_pr_merged" }
+          break if ticket && ticket["status"] == "closed" && run && run["status"] == "closed"
+          sleep 0.05
+        end
+      end
     ensure
       restart_socket.close
     end

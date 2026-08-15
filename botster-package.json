@@ -112,6 +112,19 @@
   "events": {
     "emitted": [
       {
+        "name": "pr_merged",
+        "audience": ["plugins"],
+        "payload_schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "run_id": { "type": "string", "maxLength": 128 },
+            "pr_url": { "type": "string", "maxLength": 512 },
+            "merge_commit": { "type": "string", "maxLength": 128 }
+          }
+        }
+      },
+      {
         "name": "question.opened",
         "audience": ["clients", "plugins"],
         "payload_schema": {

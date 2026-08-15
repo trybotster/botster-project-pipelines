@@ -21,10 +21,11 @@ assert {capability["surface"] for capability in manifest["capabilities"]} == {
     "surfaces", "mcp", "plugin_db", "session_actions"
 }
 emitted_events = manifest.get("events", {}).get("emitted", [])
-assert len(emitted_events) == 1, "package must declare exactly one emitted event"
-assert emitted_events[0]["name"] == "question.opened"
-assert set(emitted_events[0]["audience"]) == {"clients", "plugins"}
-payload_schema = emitted_events[0]["payload_schema"]
+assert {event["name"] for event in emitted_events} == {"question.opened", "pr_merged"}
+question_opened = next(event for event in emitted_events if event["name"] == "question.opened")
+assert question_opened["name"] == "question.opened"
+assert set(question_opened["audience"]) == {"clients", "plugins"}
+payload_schema = question_opened["payload_schema"]
 assert payload_schema["type"] == "object"
 assert payload_schema["additionalProperties"] is False
 assert payload_schema["required"] == ["question_id", "kind", "notice"]
@@ -736,13 +737,20 @@ assert(#snapshot_context.run.waiting_transition.unmet_dependencies == 2,
   "adding a blocker to a waiting run must refresh its dependency snapshot")
 assert(#snapshot_context.run_steps == 1 and #spawned == snapshot_scenario.spawned_before)
 
--- A merged provider PR is a terminal lifecycle mutation delivered through the Hub event
--- handler rather than a public tool, so exercise the registered handler directly.
+-- A merged provider PR is delivered through the exact package event
+-- project-pipelines/pr_merged. The public producer is link_pr(status=merged).
 local pr_merged_handler
+local pr_merged_registration
 for _, handler in ipairs(plugin.handlers) do
-  if handler.id == "pr_merged" then pr_merged_handler = handler.call end
+  if handler.id == "pr_merged" then
+    pr_merged_handler = handler.call
+    pr_merged_registration = handler
+  end
 end
 assert(pr_merged_handler, "pr_merged event handler must be registered")
+assert(pr_merged_registration.kind == "event", "pr_merged must stay an event handler")
+assert(pr_merged_registration.event_owner == "project-pipelines", "pr_merged must subscribe to this package")
+assert(pr_merged_registration.event == "pr_merged")
 local merged_scenario = create_waiting_scenario("waiting-merged", 1)
 -- A merge closes its own ticket, so a different run blocked on that ticket must wake in
 -- the same atomic save. This is what the handler's reconcile call exists for.
@@ -769,9 +777,17 @@ assert(not merge_dependent_wait.ok and merge_dependent_wait.error.code == "ticke
 assert(tools["project_pipelines.link_pr"]({
   run_id = merged_scenario.run_id, url = "https://example.invalid/pull/1",
 }).ok)
-assert(pr_merged_handler({
-  run_id = merged_scenario.run_id, pr_url = "https://example.invalid/pull/1", merge_commit = "deadbeef",
+emit_stub.events = {}
+assert(tools["project_pipelines.link_pr"]({
+  run_id = merged_scenario.run_id,
+  url = "https://example.invalid/pull/1",
+  status = "merged",
+  merge_commit = "deadbeef",
 }).ok)
+assert(#emit_stub.events == 1 and emit_stub.events[1].name == "pr_merged")
+assert(emit_stub.events[1].payload.run_id == merged_scenario.run_id)
+assert(emit_stub.events[1].payload.pr_url == "https://example.invalid/pull/1")
+assert(pr_merged_handler(emit_stub.events[1].payload).ok)
 local merge_dependent_context = context_for("waiting-merge-dependent-run")
 assert(merge_dependent_context.run.current_step_id == "waiting-implement",
   "a merge that closes a blocking ticket must wake the run waiting on it")

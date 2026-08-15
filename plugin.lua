@@ -1864,7 +1864,18 @@ local function link_pr(arguments)
   local run = find_by_id(state.runs, run_id)
   if not run then return failure("not_found", "run not found: " .. run_id) end
   for _, existing in ipairs(state.pr_links) do
-    if existing.run_id == run_id and existing.url == url then return ok({ pr_link = existing }) end
+    if existing.run_id == run_id and existing.url == url then
+      if string_arg(arguments, "status") == "merged" then
+        local payload = { run_id = existing.run_id, pr_url = existing.url }
+        if type(arguments.merge_commit) == "string" and arguments.merge_commit ~= "" then
+          payload.merge_commit = arguments.merge_commit
+        end
+        pcall(function()
+          events.emit("pr_merged", payload)
+        end)
+      end
+      return ok({ pr_link = existing })
+    end
   end
   local link = {
     id = string_arg(arguments, "id") or next_id(state, "pr_link"),
@@ -1883,6 +1894,17 @@ local function link_pr(arguments)
   push_event(state, "pr_linked", run_id, link.id)
   local err = save_state(state)
   if err then return err end
+  if link.status == "merged" then
+    local payload = { run_id = link.run_id, pr_url = link.url }
+    if type(link.merge_commit) == "string" and link.merge_commit ~= "" then
+      payload.merge_commit = link.merge_commit
+    elseif type(arguments.merge_commit) == "string" and arguments.merge_commit ~= "" then
+      payload.merge_commit = arguments.merge_commit
+    end
+    pcall(function()
+      events.emit("pr_merged", payload)
+    end)
+  end
   return ok({ pr_link = link })
 end
 
@@ -6001,7 +6023,15 @@ local function authoritative_handlers()
     -- Hub package-event load now requires exact owner+name subscriptions.
     -- No admitted producer currently declares pr_merged, so this stays a
     -- direct handler rather than a name-only event subscription.
-    { id = "pr_merged", kind = "hook", descriptor_id = "pr_merged", descriptor = { event = "pr_merged" }, call = handle_pr_merged },
+    {
+      id = "pr_merged",
+      kind = "event",
+      event_owner = "project-pipelines",
+      event = "pr_merged",
+      descriptor_id = "pr_merged",
+      descriptor = { event = "pr_merged", event_owner = "project-pipelines" },
+      call = handle_pr_merged,
+    },
   }
   for _, provider in ipairs(ENTITY_PROVIDER_FAMILIES) do
     local entity_type = "project-pipelines." .. provider.family
