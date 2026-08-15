@@ -1856,12 +1856,14 @@ end
 
 function step_transitions.apply_merged_pr(state, arguments)
   arguments = arguments or {}
-  local run = string_arg(arguments, "run_id") and find_by_id(state.runs, arguments.run_id) or nil
+  local requested_run_id = string_arg(arguments, "run_id")
+  local run = requested_run_id and find_by_id(state.runs, requested_run_id) or nil
   local matched_link
   local has_exact_link = arguments.pr_url or arguments.pr_number
   for _, link in ipairs(state.pr_links) do
-    local url_match = arguments.pr_url and (link.url == arguments.pr_url or link.pr_url == arguments.pr_url)
-    local number_match = arguments.pr_number and link.pr_number == arguments.pr_number
+    local same_run = (not requested_run_id) or link.run_id == requested_run_id
+    local url_match = same_run and arguments.pr_url and (link.url == arguments.pr_url or link.pr_url == arguments.pr_url)
+    local number_match = same_run and arguments.pr_number and link.pr_number == arguments.pr_number
       and (not arguments.repo or link.repo == arguments.repo)
     local run_fallback = (not has_exact_link) and run and link.run_id == run.id
     if url_match or number_match or run_fallback then

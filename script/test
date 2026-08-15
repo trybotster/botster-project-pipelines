@@ -2221,6 +2221,48 @@ for _, link in ipairs(after_miss) do
     assert(link.status ~= "merged", "a missing URL must not mark another link merged")
   end
 end
+
+assert(tools["project_pipelines.create_ticket"]({
+  id = "ticket-merge-run-a", project_id = "project-question-opened", title = "Run A",
+}).ok)
+assert(tools["project_pipelines.create_ticket"]({
+  id = "ticket-merge-run-b", project_id = "project-question-opened", title = "Run B",
+}).ok)
+assert(tools["project_pipelines.start_run"]({
+  id = "run-merge-run-a", ticket_id = "ticket-merge-run-a", pipeline_id = "pipeline-question-opened",
+}).ok)
+assert(tools["project_pipelines.start_run"]({
+  id = "run-merge-run-b", ticket_id = "ticket-merge-run-b", pipeline_id = "pipeline-question-opened",
+}).ok)
+assert(tools["project_pipelines.link_pr"]({
+  run_id = "run-merge-run-a", url = "https://example.invalid/merge/shared",
+}).ok)
+assert(tools["project_pipelines.link_pr"]({
+  run_id = "run-merge-run-b", url = "https://example.invalid/merge/shared",
+}).ok)
+reset_emits()
+local second_run_merged = tools["project_pipelines.link_pr"]({
+  run_id = "run-merge-run-b",
+  url = "https://example.invalid/merge/shared",
+  status = "merged",
+  merge_commit = "run-b-only",
+})
+assert(second_run_merged.ok)
+assert(second_run_merged.pr_link.run_id == "run-merge-run-b")
+assert(second_run_merged.pr_link.url == "https://example.invalid/merge/shared")
+assert(second_run_merged.pr_link.status == "merged")
+assert(second_run_merged.pr_link.merge_commit == "run-b-only")
+assert(second_run_merged.run.id == "run-merge-run-b" and second_run_merged.run.status == "closed")
+assert(second_run_merged.ticket.id == "ticket-merge-run-b" and second_run_merged.ticket.status == "closed")
+local first_run_links = tools["project_pipelines.list_pr_links"]({ run_id = "run-merge-run-a" }).pr_links
+assert(#first_run_links == 1)
+assert(first_run_links[1].status ~= "merged")
+assert(first_run_links[1].merge_commit == nil)
+assert(tools["project_pipelines.current_context"]({ run_id = "run-merge-run-a" }).run.status == "active")
+local second_run_links = tools["project_pipelines.list_pr_links"]({ run_id = "run-merge-run-b" }).pr_links
+assert(#second_run_links == 1)
+assert(second_run_links[1].status == "merged" and second_run_links[1].merge_commit == "run-b-only")
+assert(tools["project_pipelines.current_context"]({ run_id = "run-merge-run-b" }).run.status == "closed")
 end)()
 
 print("project-pipelines authoritative package checks passed")
