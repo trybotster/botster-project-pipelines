@@ -1854,6 +1854,43 @@ local function add_checklist_item(arguments)
   return ok({ checklist_item = item })
 end
 
+function step_transitions.apply_merged_pr(state, arguments)
+  arguments = arguments or {}
+  local run = string_arg(arguments, "run_id") and find_by_id(state.runs, arguments.run_id) or nil
+  local matched_link
+  for _, link in ipairs(state.pr_links) do
+    if (arguments.pr_url and (link.url == arguments.pr_url or link.pr_url == arguments.pr_url))
+      or (arguments.pr_number and link.pr_number == arguments.pr_number and (not arguments.repo or link.repo == arguments.repo))
+      or (run and link.run_id == run.id)
+    then
+      matched_link = link
+      run = run or find_by_id(state.runs, link.run_id)
+      break
+    end
+  end
+  if not run then return nil, failure("not_found", "merged PR is not linked to a run") end
+  local ticket = find_by_id(state.tickets, run.ticket_id)
+  local run_step = find_by_id(state.run_steps, run.current_run_step_id)
+  local merge_commit = string_arg(arguments, "merge_commit")
+  local already_applied = run.status == "closed"
+    and (not ticket or ticket.status == "closed")
+    and (not matched_link or matched_link.status == "merged")
+  if matched_link then
+    matched_link.status = "merged"
+    if merge_commit then matched_link.merge_commit = merge_commit end
+  end
+  if already_applied then
+    return { run = run, run_step = run_step, ticket = ticket, pr_link = matched_link }
+  end
+  run.status = "closed"
+  if ticket then ticket.status = "closed" end
+  if run_step then run_step.status = "closed" end
+  step_transitions.clear_waiting(state, run, "provider_pr_merged")
+  push_event(state, "provider_pr_merged", run.id, matched_link and matched_link.id, { merge_commit = arguments.merge_commit })
+  step_transitions.reconcile_waiting(state)
+  return { run = run, run_step = run_step, ticket = ticket, pr_link = matched_link }
+end
+
 local function link_pr(arguments)
   arguments = arguments or {}
   local run_id = string_arg(arguments, "run_id")
@@ -1863,16 +1900,32 @@ local function link_pr(arguments)
   local state = load_state()
   local run = find_by_id(state.runs, run_id)
   if not run then return failure("not_found", "run not found: " .. run_id) end
+  local function persist_merged_close(link, merge_commit)
+    local applied, apply_err = step_transitions.apply_merged_pr(state, {
+      run_id = link.run_id,
+      pr_url = link.url or link.pr_url,
+      merge_commit = merge_commit,
+    })
+    if apply_err then return apply_err end
+    local persist_err = save_state(state)
+    if persist_err then return persist_err end
+    local payload = { run_id = link.run_id, pr_url = link.url or link.pr_url }
+    if type(merge_commit) == "string" and merge_commit ~= "" then
+      payload.merge_commit = merge_commit
+    end
+    pcall(function()
+      events.emit("pr_merged", payload)
+    end)
+    return ok({
+      pr_link = applied.pr_link or link,
+      run = applied.run,
+      ticket = applied.ticket,
+    })
+  end
   for _, existing in ipairs(state.pr_links) do
     if existing.run_id == run_id and existing.url == url then
       if string_arg(arguments, "status") == "merged" then
-        local payload = { run_id = existing.run_id, pr_url = existing.url }
-        if type(arguments.merge_commit) == "string" and arguments.merge_commit ~= "" then
-          payload.merge_commit = arguments.merge_commit
-        end
-        pcall(function()
-          events.emit("pr_merged", payload)
-        end)
+        return persist_merged_close(existing, arguments.merge_commit)
       end
       return ok({ pr_link = existing })
     end
@@ -1892,19 +1945,11 @@ local function link_pr(arguments)
   }
   table.insert(state.pr_links, link)
   push_event(state, "pr_linked", run_id, link.id)
+  if link.status == "merged" then
+    return persist_merged_close(link, arguments.merge_commit)
+  end
   local err = save_state(state)
   if err then return err end
-  if link.status == "merged" then
-    local payload = { run_id = link.run_id, pr_url = link.url }
-    if type(link.merge_commit) == "string" and link.merge_commit ~= "" then
-      payload.merge_commit = link.merge_commit
-    elseif type(arguments.merge_commit) == "string" and arguments.merge_commit ~= "" then
-      payload.merge_commit = arguments.merge_commit
-    end
-    pcall(function()
-      events.emit("pr_merged", payload)
-    end)
-  end
   return ok({ pr_link = link })
 end
 
@@ -2816,30 +2861,11 @@ end
 local function handle_pr_merged(arguments)
   arguments = arguments or {}
   local state = load_state()
-  local run = string_arg(arguments, "run_id") and find_by_id(state.runs, arguments.run_id) or nil
-  local matched_link
-  for _, link in ipairs(state.pr_links) do
-    if (arguments.pr_url and (link.url == arguments.pr_url or link.pr_url == arguments.pr_url))
-      or (arguments.pr_number and link.pr_number == arguments.pr_number and (not arguments.repo or link.repo == arguments.repo))
-      or (run and link.run_id == run.id)
-    then matched_link = link; run = run or find_by_id(state.runs, link.run_id); break end
-  end
-  if not run then return failure("not_found", "merged PR is not linked to a run") end
-  local ticket = find_by_id(state.tickets, run.ticket_id)
-  run.status = "closed"
-  if ticket then ticket.status = "closed" end
-  local run_step = find_by_id(state.run_steps, run.current_run_step_id)
-  if run_step then run_step.status = "closed" end
-  step_transitions.clear_waiting(state, run, "provider_pr_merged")
-  if matched_link then
-    matched_link.status = "merged"
-    matched_link.merge_commit = string_arg(arguments, "merge_commit")
-  end
-  push_event(state, "provider_pr_merged", run.id, matched_link and matched_link.id, { merge_commit = arguments.merge_commit })
-  step_transitions.reconcile_waiting(state)
-  local err = save_state(state)
+  local applied, err = step_transitions.apply_merged_pr(state, arguments)
   if err then return err end
-  return ok({ run = run, run_step = run_step, ticket = ticket, pr_link = matched_link })
+  local persist_err = save_state(state)
+  if persist_err then return persist_err end
+  return ok(applied)
 end
 
 local function retry_step_agent(arguments)
@@ -5028,7 +5054,7 @@ local TOOL_CONTRACTS = {
     },
   },
   ["link_pr"] = {
-    ["description"] = "Link a provider pull request to a ticket so provider-neutral pr_merged events can close the ticket after merge.",
+    ["description"] = "Link a provider pull request to a ticket. status=merged persists the durable close in the same save. The transient pr_merged Hub event is a notice only. An external pr_merged event still applies the same close.",
     ["input_schema"] = {
       ["properties"] = {
         ["base_branch"] = {
@@ -6020,9 +6046,8 @@ local function authoritative_handlers()
     { id = "spawn_ticket_session_action", kind = "ui_action", descriptor_id = "project_pipelines.spawn_ticket_session", descriptor = { action_id = "project_pipelines.spawn_ticket_session", surface_id = "project-pipelines.home" }, call = spawn_ticket_session_action },
     { id = "filter_action", kind = "ui_action", descriptor_id = "project_pipelines.filter", descriptor = { action_id = "project_pipelines.filter", surface_id = "project-pipelines.home" }, call = filter_action },
     { id = "select_row_action", kind = "ui_action", descriptor_id = "project_pipelines.select_row", descriptor = { action_id = "project_pipelines.select_row", surface_id = "project-pipelines.home" }, call = select_row_action },
-    -- Hub package-event load now requires exact owner+name subscriptions.
-    -- No admitted producer currently declares pr_merged, so this stays a
-    -- direct handler rather than a name-only event subscription.
+    -- External pr_merged notices still apply the same durable close.
+    -- link_pr(status=merged) persists that close itself; emit is not required.
     {
       id = "pr_merged",
       kind = "event",

@@ -51,32 +51,46 @@ def call_hub_tool(socket, name, arguments)
 end
 
 def subscribe_entity_snapshot(socket_path, entity_type, subscription_id)
-  subscription = UNIXSocket.new(socket_path)
-  subscription.puts(JSON.generate({
-    protocol: "botster-hub-daemon-v1",
-    compatibility: {
-      protocol: "botster-hub-daemon-v1",
-      protocol_version: 6,
-      required_features: ["plugin_entity_subscriptions"],
-      minimum_conformance_fixture_revision: 1,
-      client_name: "project-pipelines-question-opened-entity"
-    }
-  }))
-  JSON.parse(subscription.gets || raise("daemon closed before entity hello"))
-  subscription.puts(JSON.generate({
-    type: "subscribe_entities",
-    entity_type: entity_type,
-    subscription_id: subscription_id
-  }))
-  accepted = JSON.parse(subscription.gets || raise("daemon closed before entity subscription response"))
-  raise "#{entity_type} subscription was not admitted: #{accepted.inspect}" unless accepted["kind"] == "entity_subscribed"
-  frame = Timeout.timeout(5) do
-    JSON.parse(subscription.gets || raise("daemon closed before #{entity_type} snapshot"))
+  last_error = nil
+  8.times do |attempt|
+    subscription = UNIXSocket.new(socket_path)
+    begin
+      subscription.puts(JSON.generate({
+        protocol: "botster-hub-daemon-v1",
+        compatibility: {
+          protocol: "botster-hub-daemon-v1",
+          protocol_version: 6,
+          required_features: ["plugin_entity_subscriptions"],
+          minimum_conformance_fixture_revision: 1,
+          client_name: "project-pipelines-question-opened-entity"
+        }
+      }))
+      JSON.parse(subscription.gets || raise("daemon closed before entity hello"))
+      attempt_id = "#{subscription_id}-#{attempt}"
+      subscription.puts(JSON.generate({
+        type: "subscribe_entities",
+        entity_type: entity_type,
+        subscription_id: attempt_id
+      }))
+      accepted = JSON.parse(subscription.gets || raise("daemon closed before entity subscription response"))
+      unless accepted["kind"] == "entity_subscribed"
+        last_error = accepted
+        sleep 1
+        next
+      end
+      frame = Timeout.timeout(5) do
+        JSON.parse(subscription.gets || raise("daemon closed before #{entity_type} snapshot"))
+      end
+      raise "#{entity_type} did not return an authoritative snapshot: #{frame.inspect}" unless frame["type"] == "entity_snapshot"
+      return frame
+    rescue StandardError => error
+      last_error = error
+      sleep 1
+    ensure
+      subscription.close
+    end
   end
-  raise "#{entity_type} did not return an authoritative snapshot" unless frame["type"] == "entity_snapshot"
-  frame
-ensure
-  subscription&.close
+  raise "#{entity_type} subscription failed: #{last_error.inspect}"
 end
 
 def write_question_opened_sidecar(root)
@@ -427,12 +441,9 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
     end
     sleep 5
     run!(File.join(ROOT, "script", "hub_acceptance_smoke"), socket_path, "verify_restart", downstream_root)
-    run!(hub, "packages", "enable", "--data-dir", data_dir, "botster-workspaces")
 
     restart_socket = open_hub_socket(socket_path)
     begin
-      replayed = call_hub_tool(restart_socket, "question_opened_sidecar.last_received", {})
-      raise "sidecar replayed question.opened after Hub restart: #{replayed.inspect}" unless replayed["count"] == 0
       restart_context = call_hub_tool(restart_socket, "project_pipelines.current_context", {})
       restart_question = restart_context.fetch("questions").find { |question| question["id"] == "question_opened_live" }
       raise "question.opened subject did not survive Hub restart" unless restart_question
@@ -461,17 +472,23 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
         merge_commit: "cafef00d"
       })
       raise "merged link_pr failed: #{linked.inspect}" unless linked["ok"]
-      Timeout.timeout(5) do
-        loop do
-          merged_context = call_hub_tool(restart_socket, "project_pipelines.current_context", { run_id: "run_live_pr_merged" })
-          ticket = merged_context.fetch("tickets").find { |row| row["id"] == "ticket_live_pr_merged" }
-          run = merged_context.fetch("runs").find { |row| row["id"] == "run_live_pr_merged" }
-          break if ticket && ticket["status"] == "closed" && run && run["status"] == "closed"
-          sleep 0.05
-        end
-      end
+      raise "merged link_pr did not persist closed run: #{linked.inspect}" unless linked.dig("run", "status") == "closed"
+      raise "merged link_pr did not persist closed ticket: #{linked.inspect}" unless linked.dig("ticket", "status") == "closed"
+      merged_context = call_hub_tool(restart_socket, "project_pipelines.current_context", { run_id: "run_live_pr_merged" })
+      ticket = merged_context.fetch("tickets").find { |row| row["id"] == "ticket_live_pr_merged" }
+      run = merged_context.fetch("runs").find { |row| row["id"] == "run_live_pr_merged" }
+      raise "current_context did not show the durable merge close: #{merged_context.inspect}" unless ticket && ticket["status"] == "closed" && run && run["status"] == "closed"
     ensure
       restart_socket.close
+    end
+
+    run!(hub, "packages", "enable", "--data-dir", data_dir, "botster-workspaces")
+    sidecar_socket = open_hub_socket(socket_path)
+    begin
+      replayed = call_hub_tool(sidecar_socket, "question_opened_sidecar.last_received", {})
+      raise "sidecar replayed question.opened after Hub restart: #{replayed.inspect}" unless replayed["count"] == 0
+    ensure
+      sidecar_socket.close
     end
   rescue StandardError => error
     failure = error

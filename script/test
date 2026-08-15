@@ -737,8 +737,8 @@ assert(#snapshot_context.run.waiting_transition.unmet_dependencies == 2,
   "adding a blocker to a waiting run must refresh its dependency snapshot")
 assert(#snapshot_context.run_steps == 1 and #spawned == snapshot_scenario.spawned_before)
 
--- A merged provider PR is delivered through the exact package event
--- project-pipelines/pr_merged. The public producer is link_pr(status=merged).
+-- A merged link closes the ticket and run in the same persist. The transient
+-- pr_merged Hub event is a notice; the Event handler is not the closer.
 local pr_merged_handler
 local pr_merged_registration
 for _, handler in ipairs(plugin.handlers) do
@@ -778,12 +778,17 @@ assert(tools["project_pipelines.link_pr"]({
   run_id = merged_scenario.run_id, url = "https://example.invalid/pull/1",
 }).ok)
 emit_stub.events = {}
-assert(tools["project_pipelines.link_pr"]({
+local merged_link = tools["project_pipelines.link_pr"]({
   run_id = merged_scenario.run_id,
   url = "https://example.invalid/pull/1",
   status = "merged",
   merge_commit = "deadbeef",
-}).ok)
+})
+assert(merged_link.ok)
+assert(merged_link.pr_link.status == "merged")
+assert(merged_link.pr_link.merge_commit == "deadbeef")
+assert(merged_link.run and merged_link.run.status == "closed")
+assert(merged_link.ticket and merged_link.ticket.status == "closed")
 assert(#emit_stub.events == 1 and emit_stub.events[1].name == "pr_merged")
 assert(emit_stub.events[1].payload.run_id == merged_scenario.run_id)
 assert(emit_stub.events[1].payload.pr_url == "https://example.invalid/pull/1")
@@ -2134,6 +2139,42 @@ assert(emit_stub.events[1].payload.notice == "?")
 assert(utf8.len(emit_stub.events[1].payload.notice) == 1)
 
 assert(last_opened_emit().name == "question.opened")
+
+local function assert_merged_close_survives_emit(label, configure)
+  assert(tools["project_pipelines.create_ticket"]({
+    id = "ticket-merge-" .. label, project_id = "project-question-opened", title = "Merge " .. label,
+  }).ok)
+  assert(tools["project_pipelines.start_run"]({
+    id = "run-merge-" .. label, ticket_id = "ticket-merge-" .. label, pipeline_id = "pipeline-question-opened",
+  }).ok)
+  configure()
+  reset_emits()
+  local linked = tools["project_pipelines.link_pr"]({
+    run_id = "run-merge-" .. label,
+    url = "https://example.invalid/merge/" .. label,
+    status = "merged",
+    merge_commit = "commit-" .. label,
+  })
+  emit_stub.status = "accepted"
+  emit_stub.throw = false
+  assert(linked.ok, label .. " must keep link_pr ok")
+  assert(linked.pr_link.status == "merged", label .. " must persist merged link status")
+  assert(linked.run.status == "closed", label .. " must close the run without the Event handler")
+  assert(linked.ticket.status == "closed", label .. " must close the ticket without the Event handler")
+  local context = tools["project_pipelines.current_context"]({ run_id = "run-merge-" .. label })
+  assert(context.run.status == "closed", label .. " context run must stay closed")
+  local ticket
+  for _, row in ipairs(context.tickets) do
+    if row.id == "ticket-merge-" .. label then ticket = row end
+  end
+  assert(ticket and ticket.status == "closed", label .. " context ticket must stay closed")
+  local links = tools["project_pipelines.list_pr_links"]({ run_id = "run-merge-" .. label })
+  assert(links.ok and links.pr_links[1].status == "merged", label .. " must keep the durable link")
+end
+
+assert_merged_close_survives_emit("shed-full", function() emit_stub.status = "shed_full" end)
+assert_merged_close_survives_emit("rejected-invalid", function() emit_stub.status = "rejected_invalid" end)
+assert_merged_close_survives_emit("throw", function() emit_stub.throw = true end)
 end)()
 
 print("project-pipelines authoritative package checks passed")

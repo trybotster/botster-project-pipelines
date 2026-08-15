@@ -25,7 +25,8 @@ tickets, pipeline definitions, steps, gates, artifacts, findings,
 questions/answers, runs, PR links, provider lifecycle boundaries, events, and
 persistence ownership. Durable `question_asked` audit records stay in plugin
 state. Transient Hub `question.opened` notices are a separate live-delivery
-plane and are not used to reconstruct question state.
+plane and are not used to reconstruct question state. `link_pr(status=merged)`
+persists the durable close; the Hub `pr_merged` event is a notice only.
 
 The executable contract fixture is
 [`fixtures/project_pipelines/domain_contract.json`](fixtures/project_pipelines/domain_contract.json).

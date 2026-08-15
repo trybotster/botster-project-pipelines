@@ -310,6 +310,10 @@ commits. It is a bounded notice for current subscribers. It is not stored in
 plugin_db, it is not an entity family, and reconnect must recover the question
 from `project-pipelines.question` rather than replaying the notice.
 
+`link_pr(status=merged)` persists the durable close in the same `save_state`
+batch as the merged link. The transient Hub `pr_merged` event is a notice. It
+is not the closer. An external `pr_merged` Event still applies the same close.
+
 Expected durable audit event kinds include:
 
 - `ticket_created`
