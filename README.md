@@ -348,9 +348,15 @@ define a tiny standalone project/ticket/run using the real sourced Plan step,
 activate it without a session-type argument, then inspect
 `project_pipelines.current_context`. Persisted evidence should show
 `session_request.status="spawn_requested"`, `run.session_id`,
-`run.session_request_id`, a `session_type_spawn_requested` event, resolved
+`run.session_request_id`, the current `run_step.agent_session_uuid` equal to
+that hub session uuid, a `session_type_spawn_requested` event, resolved
 `session_type_id`, `target_id`, and request context
-metadata for `run_id`, `step_id`, and `ticket_id`. The negative case is a PTY
+metadata for `run_id`, `step_id`, and `ticket_id`. The same join is published
+on `project-pipelines.run_step` entity snapshots so `question.opened` consumers
+can match a viewed session to `run_id`, `step_id`, and `ticket_id`. The field
+stays optional for visits without an agent session. An upgraded 0.3.0 store
+publishes it on first read when the active visit already has a correlated
+`spawn_requested` session. The negative case is a PTY
 step declaring a missing provider dependency such as `github_auth`; activation
 should persist `status="blocked"`, a diagnostic naming the dependency/provider,
 and a `session_type_spawn_blocked` event without spawning a PTY session.

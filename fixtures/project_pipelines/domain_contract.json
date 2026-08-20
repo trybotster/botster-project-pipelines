@@ -328,7 +328,8 @@
       "run_id": "run_contract_standalone",
       "step_id": "step_implement",
       "status": "active",
-      "sequence": 2
+      "sequence": 2,
+      "agent_session_uuid": "session_contract_standalone"
     },
     {
       "id": "run_step_contract_workspace_plan",

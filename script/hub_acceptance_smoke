@@ -310,6 +310,14 @@ if restart_verification
   assert(restarted_plan["agent_name"] == "operator-selected", "source reconciliation overwrote the operator-selected agent")
   persisted_session_request = initial_context.fetch("session_requests").find { |request| request["id"] == "session_request_live_downstream_plan" }
   assert(persisted_session_request["session_type_id"] == "downstream-plan.fixture/plan", "session type identity did not survive Hub restart")
+  persisted_plan_visit = initial_context.fetch("run_steps").find { |step|
+    step["run_id"] == "run_live_authority" && step["step_id"] == "botster_stack_plan"
+  }
+  assert(persisted_plan_visit, "Plan run_step visit did not survive Hub restart")
+  assert(persisted_plan_visit["agent_session_uuid"] == persisted_session_request["session_id"], "run_step session join did not survive Hub restart")
+  restart_step_snapshot = subscribe_entity_snapshot(socket_path, "project-pipelines.run_step", "project-pipelines-run-step-after-restart")
+  restart_snapshot_visit = restart_step_snapshot.fetch("items").find { |step| step["id"] == persisted_plan_visit["id"] }
+  assert(restart_snapshot_visit && restart_snapshot_visit["agent_session_uuid"] == persisted_session_request["session_id"], "run_step entity snapshot lost the session join after restart")
   restarted_hub_session = wait_for_session_projection(socket_path, persisted_session_request["session_id"], "hub-session-type-after-restart")
   assert(restarted_hub_session, "authoritative Hub session row missing after restart")
   if restarted_hub_session["session_type_id"]
@@ -575,6 +583,15 @@ assert(plan_activation.dig("activation", "status") == "spawn_requested", "downst
 assert(plan_activation.dig("activation", "request", "target_id") == "tgt_71266a8d976d4535902ffed09c18a7ba", "downstream Plan used the wrong target")
 assert(plan_activation.dig("activation", "result", "worktree_path"), "downstream Plan did not create a managed worktree")
 assert(plan_activation.dig("activation", "result", "session_id"), "downstream Plan did not create a managed session")
+plan_session_id = plan_activation.dig("activation", "session_id") || plan_activation.dig("activation", "result", "session_id")
+plan_join_context = call_tool(socket, "project_pipelines.current_context", { run_id: run_id })
+plan_visit = plan_join_context.fetch("run_steps").find { |step| step["id"] == plan_join_context.dig("run", "current_run_step_id") }
+assert(plan_visit, "Plan activation did not publish a current run_step visit")
+assert(plan_visit["agent_session_uuid"] == plan_session_id, "active Plan run_step missing agent_session_uuid join")
+assert(plan_join_context.dig("run", "ticket_id") == ticket_id, "session join did not resolve through the run to ticket_id")
+plan_step_snapshot = subscribe_entity_snapshot(socket_path, "project-pipelines.run_step", "project-pipelines-run-step-after-plan")
+snapshot_visit = plan_step_snapshot.fetch("items").find { |step| step["id"] == plan_visit["id"] }
+assert(snapshot_visit && snapshot_visit["agent_session_uuid"] == plan_session_id, "run_step entity snapshot missing agent_session_uuid join")
 assert(plan_activation.dig("activation", "session_type_id") == "downstream-plan.fixture/plan", "sourced Plan did not consume configured session type")
 managed_prompt = plan_activation.dig("activation", "request", "context", "prompt")
 expected_repository_playbooks.each do |playbook|

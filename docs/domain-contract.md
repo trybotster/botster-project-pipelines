@@ -61,6 +61,17 @@ rejections are normalized into a failed session request before returning a
 structured activation error. Manual, human, command, and other non-PTY steps do
 not attempt a session-type spawn.
 
+The published `project-pipelines.run_step` entity is the client identity join
+for `question.opened` consumers. After a PTY-backed spawn persists a hub
+session uuid, the current visit carries `agent_session_uuid`. Clients join that
+uuid to `run_id` and `step_id`, then through the run record to `ticket_id`, and
+filter `question.opened` by those ids. The field is optional: visits exist
+before any spawn, non-PTY steps never gain a session, and a spawn response can
+omit a session id. A session-id-less retry clears a stale binding. Existing
+0.3.0 records that already have a correlated `spawn_requested` session on the
+active visit publish the join on first read after upgrade; the next mutation
+persists it. Done, closed, and cancelled visits are not backfilled.
+
 Ticket dependencies gate step activation independently of provider
 prerequisites. Durable `ticket_dependencies` rows are the sole link authority;
 tickets never persist an embedded dependency mirror. `create_ticket` accepts

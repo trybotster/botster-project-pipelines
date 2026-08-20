@@ -300,6 +300,8 @@ local RECORD_REQUIRED_FIELDS = {
   ticket_dependencies = { "id", "ticket_id", "depends_on_ticket_id" },
   pipeline_definitions = { "id", "name", "steps" },
   runs = { "id", "ticket_id", "pipeline_definition_id", "current_step_id", "status" },
+  -- agent_session_uuid stays optional: visits exist before any spawn, non-PTY
+  -- steps never gain a session, and a spawn response can omit a session id.
   run_steps = { "id", "run_id", "step_id", "status" },
   gate_results = { "id", "run_id", "step_id", "gate_id", "status" },
   reviews = { "id", "run_id", "step_id", "verdict" },
@@ -567,6 +569,30 @@ local function load_state()
   -- Normalized rows are the sole dependency shape. Remove non-authoritative
   -- ticket fields from projections and from the next atomic write.
   for _, ticket in ipairs(state.tickets) do ticket.dependency_ticket_ids = nil end
+  for _, run in ipairs(state.runs) do
+    local session_id = run.session_id
+    if type(session_id) == "string" and session_id ~= "" then
+      local run_step
+      local request
+      for _, candidate in ipairs(state.run_steps) do
+        if candidate.id == run.current_run_step_id then run_step = candidate end
+      end
+      for _, candidate in ipairs(state.session_requests) do
+        if candidate.id == run.session_request_id then request = candidate end
+      end
+      if run_step
+        and run_step.status == "active"
+        and run_step.agent_session_uuid == nil
+        and request
+        and request.run_id == run.id
+        and request.session_id == session_id
+        and request.status == "spawn_requested"
+        and request.step_id == run_step.step_id
+      then
+        run_step.agent_session_uuid = session_id
+      end
+    end
+  end
   return state
 end
 
@@ -1537,6 +1563,10 @@ local function activate_step(arguments)
   run.current_step_id = step.id
   run.session_request_id = session_request.id
   run.session_id = session_request.session_id
+  local bound_run_step = find_by_id(state.run_steps, run.current_run_step_id)
+  if bound_run_step and bound_run_step.run_id == run.id and bound_run_step.step_id == step.id then
+    bound_run_step.agent_session_uuid = session_request.session_id
+  end
   push_event(state, "step_started", run.id, step.id)
   local event_kind = status == "failed" and "session_type_spawn_failed" or "session_type_spawn_requested"
   push_event(state, event_kind, run.id, session_request.id, {

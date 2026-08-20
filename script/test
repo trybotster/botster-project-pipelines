@@ -15,7 +15,10 @@ manifest = json.loads(Path("botster-package.json").read_text())
 fixture = json.loads(Path("fixtures/project_pipelines/domain_contract.json").read_text())
 source = Path("plugin.lua").read_text()
 assert manifest["name"] == "project-pipelines"
-assert manifest["version"] == "0.3.0"
+assert manifest["version"] == "0.4.0"
+assert 'run_steps = { "id", "run_id", "step_id", "status" }' in source
+assert "agent_session_uuid stays optional" in source
+assert "agent_session_uuid" in source
 assert manifest["entrypoints"] == [{"runtime": "lua", "path": "plugin.lua", "bootstrap": False}]
 assert {capability["surface"] for capability in manifest["capabilities"]} == {
     "surfaces", "mcp", "plugin_db", "session_actions"
@@ -191,6 +194,7 @@ local function batch(args)
 end
 
 local spawned = {}
+local next_spawn_response = nil
 local default_session_type_id = nil
 botster = {
   capabilities = {
@@ -209,6 +213,11 @@ botster = {
     session_types = {
       ensure_worktree_and_spawn = function(args)
         table.insert(spawned, copy(args))
+        if next_spawn_response ~= nil then
+          local response = next_spawn_response
+          next_spawn_response = nil
+          return response
+        end
         return { session_id = "session-" .. tostring(#spawned), worktree_id = "worktree-" .. tostring(#spawned) }
       end,
     },
@@ -1612,6 +1621,222 @@ for _, family in ipairs(expected_entity_families) do
 end
 local run_snapshot = entity_providers["project-pipelines.run"]({ entity_type = "project-pipelines.run" })
 assert(#run_snapshot.items == #tools["project_pipelines.current_context"]({}).runs, "run snapshot must match committed context")
+
+do
+local function current_visit(run_id)
+  local context = tools["project_pipelines.current_context"]({ run_id = run_id })
+  local visit
+  for _, run_step in ipairs(context.run_steps) do
+    if run_step.id == context.run.current_run_step_id then visit = run_step end
+  end
+  return visit, context
+end
+
+local function entities_visit(run_step_id)
+  local frames = tools["project_pipelines.entities"]({}).frames
+  for _, frame in ipairs(frames) do
+    if frame.family == "project-pipelines.run_step" and frame.id == run_step_id then
+      return frame.record
+    end
+  end
+end
+
+local function provider_visit(run_step_id)
+  local snapshot = entity_providers["project-pipelines.run_step"]({ entity_type = "project-pipelines.run_step" })
+  for _, item in ipairs(snapshot.items) do
+    if item.id == run_step_id then return item end
+  end
+end
+
+local function assert_join_surfaces(run_id, expected_uuid, label)
+  local visit, context = current_visit(run_id)
+  assert(visit, label .. " missing current run_step")
+  assert(visit.agent_session_uuid == expected_uuid, label .. " current_context join mismatch")
+  local entity_record = entities_visit(visit.id)
+  assert(entity_record and entity_record.agent_session_uuid == expected_uuid, label .. " entities join mismatch")
+  local snapshot_record = provider_visit(visit.id)
+  assert(snapshot_record and snapshot_record.agent_session_uuid == expected_uuid, label .. " entity provider join mismatch")
+  if expected_uuid then
+    assert(context.run.id == visit.run_id, label .. " run_id join failed")
+    assert(context.ticket.id == context.run.ticket_id, label .. " ticket_id join failed")
+  end
+  return visit, context
+end
+
+do
+  local pre_visit = current_visit("run-durable-dependency")
+  assert(pre_visit and pre_visit.agent_session_uuid == nil, "pre-activation visit must omit agent_session_uuid")
+
+  local bound_visit = current_visit("run-step-type")
+  assert(bound_visit and bound_visit.agent_session_uuid == "session-2", "activated PTY visit must publish the hub session uuid")
+  assert_join_surfaces("run-step-type", "session-2", "activated PTY visit")
+
+  local blocked_visit = current_visit("run-missing-type")
+  -- repaired spawn on this run used request spawn-repaired-type and succeeded later
+  -- blocked visits are the provider-named-object run, not this repaired one
+  local command_visit = current_visit("run-command")
+  assert(command_visit and command_visit.agent_session_uuid == nil, "non-PTY visit must omit agent_session_uuid")
+
+  local provider_blocked_visit = current_visit("run-provider-named-object")
+  assert(provider_blocked_visit and provider_blocked_visit.agent_session_uuid == nil,
+    "blocked spawn visit must omit agent_session_uuid")
+end
+
+do
+  assert(tools["project_pipelines.create_pipeline"]({
+    id = "pipeline-session-join", name = "Session join",
+    steps = { { id = "join-step", name = "Join", kind = "pty", session_type_id = "join-session-type" } },
+  }).ok)
+  assert(tools["project_pipelines.create_ticket"]({
+    id = "ticket-session-join", project_id = "project-one", target_id = "target-one", title = "Session join",
+  }).ok)
+  assert(tools["project_pipelines.start_run"]({
+    id = "run-session-join", ticket_id = "ticket-session-join", pipeline_id = "pipeline-session-join",
+  }).ok)
+  local first = tools["project_pipelines.spawn_ticket_session"]({
+    run_id = "run-session-join", request_id = "join-first",
+  })
+  assert(first.ok)
+  assert_join_surfaces("run-session-join", first.activation.session_id, "first successful spawn")
+
+  local stored_request = durable_store["v4/session_requests/join-first"]
+  assert(stored_request, "join spawn must persist the correlated request")
+  stored_request.payload.status = "failed"
+  next_spawn_response = { worktree_id = "worktree-clear" }
+  local cleared = tools["project_pipelines.retry_step_agent"]({
+    run_id = "run-session-join", step_id = "join-step",
+  })
+  assert(cleared.ok)
+  assert_join_surfaces("run-session-join", nil, "session-id-less retry")
+
+  stored_request = nil
+  for key, record in pairs(durable_store) do
+    if key:find("^v4/session_requests/") and record.payload.run_id == "run-session-join"
+      and record.payload.status == "spawn_requested" then
+      record.payload.status = "failed"
+    end
+  end
+  next_spawn_response = { session_id = "session-replaced", worktree_id = "worktree-replaced" }
+  local replaced = tools["project_pipelines.retry_step_agent"]({
+    run_id = "run-session-join", step_id = "join-step", request_id = "join-replace",
+  })
+  assert(replaced.ok)
+  assert_join_surfaces("run-session-join", "session-replaced", "successful retry replacement")
+end
+
+local function seed_v4(family, payload)
+  local key = "v4/" .. family .. "/" .. payload.id
+  durable_store[key] = { key = key, schema_version = 4, revision = 1, payload = copy(payload) }
+end
+
+do
+  seed_v4("tickets", {
+    id = "ticket-rebind", project_id = "project-one", title = "Rebind", status = "open",
+  })
+  seed_v4("runs", {
+    id = "run-rebind", ticket_id = "ticket-rebind", pipeline_definition_id = "pipeline-two-step",
+    current_step_id = "step-one", status = "active", current_run_step_id = "run-step-rebind",
+    session_id = "session-rebind", session_request_id = "session-request-rebind",
+  })
+  seed_v4("session_requests", {
+    id = "session-request-rebind", run_id = "run-rebind", step_id = "step-one",
+    status = "spawn_requested", session_id = "session-rebind",
+  })
+  seed_v4("run_steps", {
+    id = "run-step-rebind", run_id = "run-rebind", step_id = "step-one", status = "active",
+  })
+  assert_join_surfaces("run-rebind", "session-rebind", "0.3.0-shaped v4 reconciliation")
+
+  seed_v4("tickets", {
+    id = "ticket-rebind-advanced", project_id = "project-one", title = "Advanced", status = "open",
+  })
+  seed_v4("runs", {
+    id = "run-rebind-advanced", ticket_id = "ticket-rebind-advanced",
+    pipeline_definition_id = "pipeline-two-step", current_step_id = "step-two", status = "active",
+    current_run_step_id = "run-step-rebind-advanced", session_id = "session-advanced",
+    session_request_id = "session-request-advanced",
+  })
+  seed_v4("session_requests", {
+    id = "session-request-advanced", run_id = "run-rebind-advanced", step_id = "step-one",
+    status = "spawn_requested", session_id = "session-advanced",
+  })
+  seed_v4("run_steps", {
+    id = "run-step-rebind-advanced", run_id = "run-rebind-advanced", step_id = "step-two", status = "active",
+  })
+  local advanced_visit = current_visit("run-rebind-advanced")
+  assert(advanced_visit.agent_session_uuid == nil, "step mismatch must not backfill")
+
+  seed_v4("tickets", {
+    id = "ticket-rebind-failed", project_id = "project-one", title = "Failed", status = "open",
+  })
+  seed_v4("runs", {
+    id = "run-rebind-failed", ticket_id = "ticket-rebind-failed",
+    pipeline_definition_id = "pipeline-two-step", current_step_id = "step-one", status = "active",
+    current_run_step_id = "run-step-rebind-failed", session_id = "session-failed",
+    session_request_id = "session-request-failed",
+  })
+  seed_v4("session_requests", {
+    id = "session-request-failed", run_id = "run-rebind-failed", step_id = "step-one",
+    status = "failed", session_id = "session-failed",
+  })
+  seed_v4("run_steps", {
+    id = "run-step-rebind-failed", run_id = "run-rebind-failed", step_id = "step-one", status = "active",
+  })
+  local failed_visit = current_visit("run-rebind-failed")
+  assert(failed_visit.agent_session_uuid == nil, "failed request must not backfill")
+
+  seed_v4("tickets", {
+    id = "ticket-rebind-keep", project_id = "project-one", title = "Keep", status = "open",
+  })
+  seed_v4("runs", {
+    id = "run-rebind-keep", ticket_id = "ticket-rebind-keep",
+    pipeline_definition_id = "pipeline-two-step", current_step_id = "step-one", status = "active",
+    current_run_step_id = "run-step-rebind-keep", session_id = "session-keep-new",
+    session_request_id = "session-request-keep",
+  })
+  seed_v4("session_requests", {
+    id = "session-request-keep", run_id = "run-rebind-keep", step_id = "step-one",
+    status = "spawn_requested", session_id = "session-keep-new",
+  })
+  seed_v4("run_steps", {
+    id = "run-step-rebind-keep", run_id = "run-rebind-keep", step_id = "step-one", status = "active",
+    agent_session_uuid = "session-keep-existing",
+  })
+  local kept_visit = current_visit("run-rebind-keep")
+  assert(kept_visit.agent_session_uuid == "session-keep-existing", "existing join must not be overwritten")
+
+  seed_v4("tickets", {
+    id = "ticket-rebind-done", project_id = "project-one", title = "Done", status = "open",
+  })
+  seed_v4("runs", {
+    id = "run-rebind-done", ticket_id = "ticket-rebind-done",
+    pipeline_definition_id = "pipeline-two-step", current_step_id = "step-one", status = "active",
+    current_run_step_id = "run-step-rebind-done", session_id = "session-done",
+    session_request_id = "session-request-done",
+  })
+  seed_v4("session_requests", {
+    id = "session-request-done", run_id = "run-rebind-done", step_id = "step-one",
+    status = "spawn_requested", session_id = "session-done",
+  })
+  seed_v4("run_steps", {
+    id = "run-step-rebind-done", run_id = "run-rebind-done", step_id = "step-one", status = "done",
+  })
+  local done_context = tools["project_pipelines.current_context"]({ run_id = "run-rebind-done" })
+  local done_visit
+  for _, run_step in ipairs(done_context.run_steps) do
+    if run_step.id == "run-step-rebind-done" then done_visit = run_step end
+  end
+  assert(done_visit and done_visit.agent_session_uuid == nil, "done visit must stay historical without a join")
+
+  assert(tools["project_pipelines.add_artifact"]({
+    run_id = "run-rebind", kind = "note", summary = "persist rebind",
+  }).ok)
+  assert(durable_store["v4/run_steps/run-step-rebind"].payload.agent_session_uuid == "session-rebind",
+    "reconciliation backfill must persist on the next mutation")
+  local reloaded_visit = current_visit("run-rebind")
+  assert(reloaded_visit.agent_session_uuid == "session-rebind", "persisted join must survive the next load")
+end
+end
 local merged = handlers["pr_merged"]({ repo = "example/repo", pr_number = 1, merge_commit = "abc123" })
 assert(merged.ok and merged.ticket.status == "closed" and merged.run.status == "closed")
 local home = handlers["project-pipelines.home"]({})
