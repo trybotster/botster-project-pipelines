@@ -420,40 +420,6 @@ function ENTITY_MUTATION.bounded_message(message)
   return message
 end
 
-function ENTITY_MUTATION.load_family_items(records)
-  local plugin_db = store()
-  local items = {}
-  if not plugin_db or type(plugin_db.list) ~= "function" or type(plugin_db.get) ~= "function" then
-    return items
-  end
-  local invoked, listed = pcall(plugin_db.list, { prefix = STORE_ROOT .. records .. "/" })
-  if not invoked or type(listed) ~= "table" then return items end
-  local entries = listed.entries
-  if type(entries) ~= "table" then return items end
-  for _, entry in ipairs(entries) do
-    if type(entry) == "table" and type(entry.key) == "string" then
-      local got, response = pcall(plugin_db.get, { key = entry.key })
-      local payload = got and type(response) == "table" and response.record and response.record.payload
-      if type(payload) == "table" then
-        items[#items + 1] = copy(payload)
-      end
-    end
-  end
-  table.sort(items, function(left, right)
-    local left_position = left._store_position
-    local right_position = right._store_position
-    if type(left_position) == "number" and type(right_position) == "number" then
-      return left_position < right_position
-    end
-    return tostring(left.id) < tostring(right.id)
-  end)
-  for _, item in ipairs(items) do
-    item._store_position = nil
-    item.dependency_ticket_ids = nil
-  end
-  return items
-end
-
 function ENTITY_MUTATION.provider_snapshot(spec, records)
   local plugin_db = store()
   local attempts = 0
@@ -528,6 +494,46 @@ local function validate_record(family, payload)
   end
   if type(payload.id) ~= "string" then return false, "id must be a string" end
   return true
+end
+
+function ENTITY_MUTATION.load_family_items(records)
+  local plugin_db = store()
+  if not plugin_db or type(plugin_db.list) ~= "function" or type(plugin_db.get) ~= "function" then
+    error("project-pipelines plugin_db capability is unavailable")
+  end
+  local listed = plugin_db.list({ prefix = STORE_ROOT .. records .. "/" })
+  if type(listed) ~= "table" or type(listed.entries) ~= "table" then
+    error("malformed plugin_db.list result for " .. records)
+  end
+  local items = {}
+  for _, entry in ipairs(listed.entries) do
+    if type(entry) ~= "table" or type(entry.key) ~= "string" then
+      error("malformed plugin_db.list entry for " .. records)
+    end
+    local response = plugin_db.get({ key = entry.key })
+    local payload = type(response) == "table" and response.record and response.record.payload
+    if type(payload) ~= "table" then
+      error("malformed plugin_db.get result for " .. entry.key)
+    end
+    local valid, reason = validate_record(records, payload)
+    if not valid then
+      error("invalid " .. records .. " record " .. entry.key .. ": " .. reason)
+    end
+    items[#items + 1] = copy(payload)
+  end
+  table.sort(items, function(left, right)
+    local left_position = left._store_position
+    local right_position = right._store_position
+    if type(left_position) == "number" and type(right_position) == "number" then
+      return left_position < right_position
+    end
+    return tostring(left.id) < tostring(right.id)
+  end)
+  for _, item in ipairs(items) do
+    item._store_position = nil
+    item.dependency_ticket_ids = nil
+  end
+  return items
 end
 
 local function validate_counters(counters)

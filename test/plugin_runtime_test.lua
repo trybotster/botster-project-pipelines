@@ -450,6 +450,77 @@ local second_artifact_snapshot = artifact_provider.call({})
 assert_eq(second_artifact_snapshot.snapshot_seq, first_artifact_snapshot.snapshot_seq + 1, "unpublished family keeps in-memory seq")
 assert_true(database[seq_key("artifact")] == nil, "unpublished family has no persisted seq key")
 
+local original_list = botster.capabilities.plugin_db.list
+local original_get = botster.capabilities.plugin_db.get
+local function assert_provider_fails(label, call)
+  local ok, err = pcall(call)
+  assert_eq(ok, false, label .. " must not emit a snapshot")
+  assert_true(type(err) == "string" and err ~= "", label .. " must throw")
+end
+
+botster.capabilities.plugin_db.list = function(request)
+  if request.prefix == "v4/questions/" then error("injected list failure") end
+  return original_list(request)
+end
+assert_provider_fails("question list throw", function()
+  return question_provider.call({})
+end)
+botster.capabilities.plugin_db.list = function(request)
+  if request.prefix == "v4/artifacts/" then error("injected artifact list failure") end
+  return original_list(request)
+end
+assert_provider_fails("artifact list throw", function()
+  return artifact_provider.call({})
+end)
+botster.capabilities.plugin_db.list = function(request)
+  if request.prefix == "v4/questions/" then return { not_entries = true } end
+  return original_list(request)
+end
+assert_provider_fails("malformed list result", function()
+  return question_provider.call({})
+end)
+botster.capabilities.plugin_db.list = original_list
+
+botster.capabilities.plugin_db.get = function(request)
+  if type(request.key) == "string" and request.key:find("^v4/questions/") then
+    error("injected get failure")
+  end
+  return original_get(request)
+end
+assert_provider_fails("question get throw", function()
+  return question_provider.call({})
+end)
+botster.capabilities.plugin_db.get = function(request)
+  if type(request.key) == "string" and request.key:find("^v4/questions/") then
+    return { record = { payload = "not-an-object" } }
+  end
+  return original_get(request)
+end
+assert_provider_fails("malformed get payload", function()
+  return question_provider.call({})
+end)
+botster.capabilities.plugin_db.get = original_get
+
+database["v4/questions/malformed-provider-row"] = {
+  schema_version = 4,
+  revision = 1,
+  payload = { id = "malformed-provider-row" },
+}
+assert_provider_fails("malformed question row", function()
+  return question_provider.call({})
+end)
+database["v4/questions/malformed-provider-row"] = nil
+
+local saved_plugin_db = botster.capabilities.plugin_db
+botster.capabilities.plugin_db = nil
+assert_provider_fails("missing plugin_db", function()
+  return question_provider.call({})
+end)
+botster.capabilities.plugin_db = saved_plugin_db
+local recovered = question_provider.call({})
+assert_eq(recovered.type, "entity_snapshot", "healthy provider still returns a complete snapshot")
+assert_true(#recovered.items >= 1, "healthy snapshot still includes durable rows")
+
 -- 7. Record deletion in a published family emits entity_remove.
 local ask_question = upvalue(ask_human, "ask_question")
 local record_question = upvalue(ask_question, "record_question")
