@@ -1697,6 +1697,15 @@ do
     run_id = "run-session-join", request_id = "join-first",
   })
   assert(first.ok)
+  local found_visit = false
+  for key, record in pairs(durable_store) do
+    if key:find("^v4/run_steps/") and record.payload and record.payload.run_id == "run-session-join" then
+      found_visit = true
+      assert(record.payload.agent_session_uuid == first.activation.session_id,
+        "activation must persist agent_session_uuid in the same save")
+    end
+  end
+  assert(found_visit, "join spawn must persist a run_step visit")
   assert_join_surfaces("run-session-join", first.activation.session_id, "first successful spawn")
 
   local stored_request = durable_store["v4/session_requests/join-first"]
@@ -1707,6 +1716,15 @@ do
     run_id = "run-session-join", step_id = "join-step",
   })
   assert(cleared.ok)
+  found_visit = false
+  for key, record in pairs(durable_store) do
+    if key:find("^v4/run_steps/") and record.payload and record.payload.run_id == "run-session-join" then
+      found_visit = true
+      assert(record.payload.agent_session_uuid == nil,
+        "session-id-less retry must clear the persisted join in the same save")
+    end
+  end
+  assert(found_visit, "session-id-less retry must persist a run_step visit")
   assert_join_surfaces("run-session-join", nil, "session-id-less retry")
 
   stored_request = nil
@@ -1721,6 +1739,15 @@ do
     run_id = "run-session-join", step_id = "join-step", request_id = "join-replace",
   })
   assert(replaced.ok)
+  found_visit = false
+  for key, record in pairs(durable_store) do
+    if key:find("^v4/run_steps/") and record.payload and record.payload.run_id == "run-session-join" then
+      found_visit = true
+      assert(record.payload.agent_session_uuid == "session-replaced",
+        "successful retry must persist the replacement join in the same save")
+    end
+  end
+  assert(found_visit, "replacement retry must persist a run_step visit")
   assert_join_surfaces("run-session-join", "session-replaced", "successful retry replacement")
 end
 
