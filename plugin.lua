@@ -277,6 +277,10 @@ local function default_state()
     _revisions = {},
     _counter_revision = 0,
     _store_key_count = 0,
+    _entity_seq = {
+      question = { next_seq = 0, revision = 0 },
+      session_request = { next_seq = 0, revision = 0 },
+    },
   }
 end
 
@@ -286,6 +290,170 @@ end
 
 local function record_key(family, id)
   return STORE_ROOT .. family .. "/" .. id
+end
+
+-- Live mutation publish for questions and session_requests. One table keeps
+-- the helpers off the chunk local budget (this file is at the 200-local cap).
+local ENTITY_MUTATION = {
+  reentry = false,
+  order = { "questions", "session_requests" },
+  families = {
+    questions = {
+      entity_type = "project-pipelines.question",
+      seq_family = "question",
+      seq_key = STORE_ROOT .. "meta/entity_seq/question",
+    },
+    session_requests = {
+      entity_type = "project-pipelines.session_request",
+      seq_family = "session_request",
+      seq_key = STORE_ROOT .. "meta/entity_seq/session_request",
+    },
+  },
+}
+
+function ENTITY_MUTATION.read_seq(plugin_db, spec)
+  if not plugin_db or type(plugin_db.get) ~= "function" then
+    return 0, 0
+  end
+  local invoked, result = pcall(plugin_db.get, { key = spec.seq_key })
+  if not invoked then
+    return nil, nil, "read_failed"
+  end
+  if type(result) ~= "table" or type(result.record) ~= "table" then
+    return 0, 0
+  end
+  local payload = result.record.payload
+  if type(payload) ~= "table"
+    or type(payload.next_seq) ~= "number"
+    or payload.next_seq < 0
+    or payload.next_seq ~= math.floor(payload.next_seq)
+  then
+    return nil, nil, "invalid"
+  end
+  return payload.next_seq, result.record.revision or 0
+end
+
+function ENTITY_MUTATION.seq_mutation(spec, last_seq, seq_revision, frame_count)
+  return {
+    operation = "set",
+    key = spec.seq_key,
+    schema_version = STORE_SCHEMA_VERSION,
+    expected_revision = seq_revision,
+    payload = { next_seq = last_seq + frame_count },
+  }
+end
+
+function ENTITY_MUTATION.publish_frame(frame)
+  local publish = type(botster) == "table" and botster.entity_publish or nil
+  if publish == nil then
+    return {
+      ok = false,
+      status = "publish_unavailable",
+      error = {
+        code = "entity_publish_unavailable",
+        message = "botster.entity_publish is nil (botster=" .. type(botster) .. ")",
+      },
+    }
+  end
+  local wire = {
+    type = frame.type,
+    entity_type = frame.entity_type,
+    snapshot_seq = frame.snapshot_seq,
+    id = frame.id,
+  }
+  if frame.entity ~= nil then wire.entity = frame.entity end
+  local invoked, result = pcall(function()
+    return publish(wire)
+  end)
+  if not invoked then
+    return {
+      ok = false,
+      status = "publish_failed",
+      error = {
+        code = "entity_publish_failed",
+        message = tostring(result),
+      },
+    }
+  end
+  if type(result) ~= "table" then
+    return {
+      ok = false,
+      status = "publish_failed",
+      error = {
+        code = "entity_publish_failed",
+        message = "entity_publish returned non-table: " .. type(result),
+      },
+    }
+  end
+  return result
+end
+
+function ENTITY_MUTATION.publish_admitted(result)
+  return type(result) == "table" and result.ok == true
+end
+
+function ENTITY_MUTATION.publish_frames(frames)
+  local results = {}
+  local degraded = false
+  for _, frame in ipairs(frames or {}) do
+    local result = ENTITY_MUTATION.publish_frame(frame)
+    if not ENTITY_MUTATION.publish_admitted(result) then
+      result = ENTITY_MUTATION.publish_frame(frame)
+    end
+    if not ENTITY_MUTATION.publish_admitted(result) then
+      degraded = true
+    end
+    results[#results + 1] = result
+  end
+  return results, degraded
+end
+
+function ENTITY_MUTATION.bounded_message(message)
+  message = tostring(message or "")
+  local measured, length = pcall(utf8.len, message)
+  if measured and type(length) == "number" then
+    if length <= 280 then return message end
+    local offset = utf8.offset(message, 281)
+    if type(offset) == "number" then return message:sub(1, offset - 1) end
+  end
+  if #message > 280 then return message:sub(1, 280) end
+  return message
+end
+
+function ENTITY_MUTATION.provider_snapshot(spec, records)
+  local plugin_db = store()
+  local attempts = 0
+  while attempts < 8 do
+    attempts = attempts + 1
+    local last_seq, seq_revision, seq_error = ENTITY_MUTATION.read_seq(plugin_db, spec)
+    if seq_error == "invalid" then
+      error("invalid project-pipelines entity sequence payload for " .. spec.seq_key)
+    end
+    if seq_error then
+      error("failed to read project-pipelines entity sequence " .. spec.seq_key)
+    end
+    local items = ENTITY_MUTATION.load_family_items(records)
+    local current_seq, current_revision, current_error = ENTITY_MUTATION.read_seq(plugin_db, spec)
+    if current_error or current_seq ~= last_seq or current_revision ~= seq_revision then
+      -- A concurrent mutator advanced the floor; retry with a fresh read.
+    else
+      local invoked, response = pcall(plugin_db.batch, {
+        mutations = { ENTITY_MUTATION.seq_mutation(spec, last_seq, seq_revision, 1) },
+      })
+      if invoked and type(response) == "table" and response.ok == true then
+        return {
+          type = "entity_snapshot",
+          entity_type = spec.entity_type,
+          snapshot_seq = last_seq + 1,
+          items = items,
+        }
+      end
+      if not (type(response) == "table" and response.error_kind == "revision_conflict") then
+        error("failed to allocate project-pipelines entity sequence for " .. spec.entity_type)
+      end
+    end
+  end
+  error("entity sequence CAS retries exhausted for " .. spec.entity_type)
 end
 
 local function record_payload(response)
@@ -328,6 +496,74 @@ local function validate_record(family, payload)
   end
   if type(payload.id) ~= "string" then return false, "id must be a string" end
   return true
+end
+
+function ENTITY_MUTATION.load_family_items(records)
+  local plugin_db = store()
+  if not plugin_db or type(plugin_db.list) ~= "function" or type(plugin_db.get) ~= "function" then
+    error("project-pipelines plugin_db capability is unavailable")
+  end
+  local listed = plugin_db.list({ prefix = STORE_ROOT .. records .. "/" })
+  if type(listed) ~= "table" or type(listed.entries) ~= "table" then
+    error("malformed plugin_db.list result for " .. records)
+  end
+  local items = {}
+  for _, entry in ipairs(listed.entries) do
+    if type(entry) ~= "table" or type(entry.key) ~= "string" then
+      error("malformed plugin_db.list entry for " .. records)
+    end
+    local response = plugin_db.get({ key = entry.key })
+    local payload = type(response) == "table" and response.record and response.record.payload
+    if type(payload) ~= "table" then
+      error("malformed plugin_db.get result for " .. entry.key)
+    end
+    local valid, reason = validate_record(records, payload)
+    if not valid then
+      error("invalid " .. records .. " record " .. entry.key .. ": " .. reason)
+    end
+    items[#items + 1] = copy(payload)
+  end
+  table.sort(items, function(left, right)
+    local left_position = left._store_position
+    local right_position = right._store_position
+    if type(left_position) == "number" and type(right_position) == "number" then
+      return left_position < right_position
+    end
+    return tostring(left.id) < tostring(right.id)
+  end)
+  for _, item in ipairs(items) do
+    item._store_position = nil
+    item.dependency_ticket_ids = nil
+  end
+  return items
+end
+
+function ENTITY_MUTATION.reconcile_run_step_session_bindings(runs, run_steps, session_requests)
+  for _, run in ipairs(runs) do
+    local session_id = run.session_id
+    if type(session_id) == "string" and session_id ~= "" then
+      local run_step
+      local request
+      for _, candidate in ipairs(run_steps) do
+        if candidate.id == run.current_run_step_id then run_step = candidate end
+      end
+      for _, candidate in ipairs(session_requests) do
+        if candidate.id == run.session_request_id then request = candidate end
+      end
+      if run_step
+        and run_step.status == "active"
+        and run_step.agent_session_uuid == nil
+        and request
+        and request.run_id == run.id
+        and request.session_id == session_id
+        and request.status == "spawn_requested"
+        and request.step_id == run_step.step_id
+      then
+        run_step.agent_session_uuid = session_id
+      end
+    end
+  end
+  return run_steps
 end
 
 local function validate_counters(counters)
@@ -569,29 +805,17 @@ local function load_state()
   -- Normalized rows are the sole dependency shape. Remove non-authoritative
   -- ticket fields from projections and from the next atomic write.
   for _, ticket in ipairs(state.tickets) do ticket.dependency_ticket_ids = nil end
-  for _, run in ipairs(state.runs) do
-    local session_id = run.session_id
-    if type(session_id) == "string" and session_id ~= "" then
-      local run_step
-      local request
-      for _, candidate in ipairs(state.run_steps) do
-        if candidate.id == run.current_run_step_id then run_step = candidate end
-      end
-      for _, candidate in ipairs(state.session_requests) do
-        if candidate.id == run.session_request_id then request = candidate end
-      end
-      if run_step
-        and run_step.status == "active"
-        and run_step.agent_session_uuid == nil
-        and request
-        and request.run_id == run.id
-        and request.session_id == session_id
-        and request.status == "spawn_requested"
-        and request.step_id == run_step.step_id
-      then
-        run_step.agent_session_uuid = session_id
-      end
+  ENTITY_MUTATION.reconcile_run_step_session_bindings(state.runs, state.run_steps, state.session_requests)
+  for _, family in ipairs(ENTITY_MUTATION.order) do
+    local spec = ENTITY_MUTATION.families[family]
+    local next_seq, revision, seq_error = ENTITY_MUTATION.read_seq(plugin_db, spec)
+    if seq_error == "invalid" then
+      error("invalid project-pipelines entity sequence payload for " .. spec.seq_key)
     end
+    if seq_error then
+      error("failed to read project-pipelines entity sequence " .. spec.seq_key)
+    end
+    state._entity_seq[spec.seq_family] = { next_seq = next_seq, revision = revision }
   end
   return state
 end
@@ -685,6 +909,71 @@ local function save_state(state)
   end
 
   if #mutations == 0 then return nil end
+
+  local reserved_frames = {}
+  local seq_updates = {}
+  if not ENTITY_MUTATION.reentry then
+    local drafts_by_family = {}
+    for _, metadata in ipairs(mutation_records) do
+      local spec = ENTITY_MUTATION.families[metadata.family]
+      if spec then
+        drafts_by_family[metadata.family] = drafts_by_family[metadata.family] or {}
+        if metadata.kind == "delete" then
+          local original = state._originals[metadata.family] and state._originals[metadata.family][metadata.id]
+          table.insert(drafts_by_family[metadata.family], {
+            type = "entity_remove",
+            id = metadata.id,
+            run_id = original and original.run_id,
+          })
+        elseif metadata.kind == "record" then
+          table.insert(drafts_by_family[metadata.family], {
+            type = "entity_upsert",
+            id = metadata.id,
+            run_id = metadata.record and metadata.record.run_id,
+            entity = copy(metadata.record),
+          })
+        end
+      end
+    end
+    local seq_first_writes = 0
+    for _, family in ipairs(ENTITY_MUTATION.order) do
+      local drafts = drafts_by_family[family]
+      if drafts and #drafts > 0 then
+        local spec = ENTITY_MUTATION.families[family]
+        local seq_state = state._entity_seq[spec.seq_family]
+        local last_seq = seq_state.next_seq
+        local seq_revision = seq_state.revision
+        if seq_revision == 0 then seq_first_writes = seq_first_writes + 1 end
+        table.insert(mutations, ENTITY_MUTATION.seq_mutation(spec, last_seq, seq_revision, #drafts))
+        table.insert(seq_updates, {
+          seq_family = spec.seq_family,
+          next_seq = last_seq + #drafts,
+        })
+        for index, draft in ipairs(drafts) do
+          local frame = {
+            type = draft.type,
+            entity_type = spec.entity_type,
+            snapshot_seq = last_seq + index,
+            id = draft.id,
+            run_id = draft.run_id,
+          }
+          if draft.entity ~= nil then frame.entity = draft.entity end
+          table.insert(reserved_frames, frame)
+        end
+      end
+    end
+    if seq_first_writes > 0 then
+      projected_keys = projected_keys + seq_first_writes
+      if projected_keys > MAX_STORE_KEYS - STORE_KEY_HEADROOM then
+        return failure("store_capacity_exhausted", "project-pipelines store has reached its reserved key ceiling", {
+          projected_keys = projected_keys,
+          maximum_keys = MAX_STORE_KEYS,
+          reserved_headroom = STORE_KEY_HEADROOM,
+        })
+      end
+    end
+  end
+
   local invoked, response = pcall(plugin_db.batch, { mutations = mutations })
   if not invoked then
     return failure("persist_failed", "atomic plugin_db batch failed", { reason = tostring(response) })
@@ -714,7 +1003,43 @@ local function save_state(state)
       state._positions[metadata.family][metadata.id] = metadata.payload._store_position
     end
   end
+  for index, update in ipairs(seq_updates) do
+    local result = type(response.results) == "table" and response.results[#mutation_records + index] or nil
+    local revision = result and result.record and result.record.revision
+    state._entity_seq[update.seq_family] = {
+      next_seq = update.next_seq,
+      revision = revision or ((state._entity_seq[update.seq_family] and state._entity_seq[update.seq_family].revision) or 0) + 1,
+    }
+  end
   state._store_key_count = projected_keys
+  if ENTITY_MUTATION.reentry or #reserved_frames == 0 then return nil end
+  local publish_results, publish_degraded = ENTITY_MUTATION.publish_frames(reserved_frames)
+  if not publish_degraded then return nil end
+  ENTITY_MUTATION.reentry = true
+  for index, result in ipairs(publish_results) do
+    if not ENTITY_MUTATION.publish_admitted(result) then
+      local frame = reserved_frames[index]
+      local err = type(result.error) == "table" and result.error or {}
+      -- Inline next_id/push_event: both locals are declared after save_state.
+      state.counters.event = (state.counters.event or 0) + 1
+      table.insert(state.events, {
+        id = "event_" .. state.counters.event,
+        kind = "entity_publish_degraded",
+        run_id = frame.run_id,
+        subject_id = frame.id,
+        payload = {
+          family = frame.entity_type,
+          id = frame.id,
+          snapshot_seq = frame.snapshot_seq,
+          code = err.code or result.status or "entity_publish_failed",
+          message = ENTITY_MUTATION.bounded_message(err.message or result.status or "entity publish failed"),
+        },
+      })
+      while #state.events > MAX_EVENTS do table.remove(state.events, 1) end
+    end
+  end
+  pcall(save_state, state)
+  ENTITY_MUTATION.reentry = false
   return nil
 end
 
@@ -3306,14 +3631,28 @@ local entity_snapshot_sequences = {}
 
 local function entity_provider_handler(family, records)
   local entity_type = "project-pipelines." .. family
+  local spec = ENTITY_MUTATION.families[records]
+  if spec then
+    return function(_request)
+      return ENTITY_MUTATION.provider_snapshot(spec, records)
+    end
+  end
   return function(_request)
     local sequence = (entity_snapshot_sequences[family] or 0) + 1
     entity_snapshot_sequences[family] = sequence
+    local items = ENTITY_MUTATION.load_family_items(records)
+    if records == "run_steps" then
+      items = ENTITY_MUTATION.reconcile_run_step_session_bindings(
+        ENTITY_MUTATION.load_family_items("runs"),
+        items,
+        ENTITY_MUTATION.load_family_items("session_requests")
+      )
+    end
     return {
       type = "entity_snapshot",
       entity_type = entity_type,
       snapshot_seq = sequence,
-      items = load_state()[records],
+      items = items,
     }
   end
 end

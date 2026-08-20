@@ -131,6 +131,19 @@ database ABI and generic package-owned `entity_provider` admission. The
 package never simulates atomicity with sequential writes. Each package entity
 family has an explicit provider returning a fresh authoritative whole-family
 snapshot from committed state for initial subscription and reconnect hydration.
+`question` and `session_request` also publish live mutations. After
+`plugin_db.batch` succeeds, `save_state` publishes one `entity_upsert` per
+changed row and one `entity_remove` per deleted row on
+`project-pipelines.question` / `project-pipelines.session_request` through
+`botster.entity_publish`. Sequence values come from persisted counters
+`v4/meta/entity_seq/question` and `v4/meta/entity_seq/session_request`,
+reserved in the same atomic batch as the row mutation and shared with those
+two families' snapshot providers. Hub `ok=true` statuses (`accepted`,
+`pending_gap`, `resync_scheduled`) are admitted. A missing, throwing, or
+`ok=false` publish is retried once; the durable mutation and tool result stay
+successful, and one bounded `entity_publish_degraded` event is recorded.
+The other 17 families stay snapshot-only. The transient `question.opened`
+notice is unchanged.
 Diagnostic events retain the newest 256 records, and mutations fail with
 `store_capacity_exhausted` before any write when the Hub's 1,024-key namespace
 reaches the package's 64-key safety reserve.
