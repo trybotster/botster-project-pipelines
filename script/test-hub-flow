@@ -93,6 +93,73 @@ def subscribe_entity_snapshot(socket_path, entity_type, subscription_id)
   raise "#{entity_type} subscription failed: #{last_error.inspect}"
 end
 
+def open_held_entity_subscription(socket_path, entity_type, subscription_id)
+  last_error = nil
+  8.times do |attempt|
+    subscription = UNIXSocket.new(socket_path)
+    begin
+      subscription.puts(JSON.generate({
+        protocol: "botster-hub-daemon-v1",
+        compatibility: {
+          protocol: "botster-hub-daemon-v1",
+          protocol_version: 6,
+          required_features: ["plugin_entity_subscriptions"],
+          minimum_conformance_fixture_revision: 1,
+          client_name: "project-pipelines-held-entity"
+        }
+      }))
+      JSON.parse(subscription.gets || raise("daemon closed before held entity hello"))
+      attempt_id = "#{subscription_id}-#{attempt}"
+      subscription.puts(JSON.generate({
+        type: "subscribe_entities",
+        entity_type: entity_type,
+        subscription_id: attempt_id
+      }))
+      accepted = JSON.parse(subscription.gets || raise("daemon closed before held entity subscription response"))
+      unless accepted["kind"] == "entity_subscribed"
+        last_error = accepted
+        subscription.close
+        sleep 1
+        next
+      end
+      snapshot = Timeout.timeout(5) do
+        JSON.parse(subscription.gets || raise("daemon closed before #{entity_type} held snapshot"))
+      end
+      unless snapshot["type"] == "entity_snapshot"
+        last_error = snapshot
+        subscription.close
+        sleep 1
+        next
+      end
+      return [subscription, snapshot]
+    rescue StandardError => error
+      last_error = error
+      subscription.close
+      sleep 1
+    end
+  end
+  raise "#{entity_type} held subscription failed: #{last_error.inspect}"
+end
+
+def wait_entity_frame(subscription, timeout: 8)
+  Timeout.timeout(timeout) do
+    JSON.parse(subscription.gets || raise("held entity subscription closed"))
+  end
+end
+
+def wait_entity_upsert(subscription, entity_type, id, timeout: 8)
+  deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+  loop do
+    remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    raise "#{entity_type} #{id} upsert did not arrive" if remaining <= 0
+    frame = wait_entity_frame(subscription, timeout: remaining)
+    next unless frame["type"] == "entity_upsert"
+    next unless frame["entity_type"] == entity_type || frame["family"] == entity_type
+    next unless frame["id"] == id
+    return frame
+  end
+end
+
 def write_question_opened_sidecar(root)
   FileUtils.mkdir_p(root)
   File.write(File.join(root, "botster-package.json"), JSON.pretty_generate({
@@ -408,6 +475,98 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
     ensure
       socket.close
     end
+
+    question_sub = nil
+    session_sub = nil
+    published_question_seq = nil
+    published_session_seq = nil
+    question_sub, = open_held_entity_subscription(socket_path, "project-pipelines.question", "question-live-mutation")
+    session_sub, = open_held_entity_subscription(socket_path, "project-pipelines.session_request", "session-request-live-mutation")
+    begin
+      live_socket = open_hub_socket(socket_path)
+      begin
+        live_context = call_hub_tool(live_socket, "project_pipelines.current_context", {})
+        live_run = live_context.fetch("runs").find { |run| run["id"] == "run_live_authority" }
+        raise "live run missing before mutation publish proof" unless live_run
+        published_question = call_hub_tool(live_socket, "project_pipelines.ask_human", {
+          id: "question_live_mutation_publish",
+          run_id: live_run.fetch("id"),
+          ticket_id: live_run.fetch("ticket_id"),
+          step_id: "botster_stack_implement",
+          blocking: false,
+          question: "Does a held question subscription receive the upsert?"
+        })
+        raise "live mutation ask_human failed: #{published_question.inspect}" unless published_question["ok"]
+        opened_frame = wait_entity_upsert(question_sub, "project-pipelines.question", "question_live_mutation_publish")
+        opened_row = opened_frame["entity"] || opened_frame["record"] || opened_frame
+        raise "held question upsert missing question text: #{opened_frame.inspect}" unless opened_row["question"] == "Does a held question subscription receive the upsert?"
+        raise "held question upsert was not open: #{opened_frame.inspect}" unless opened_row["status"] == "open"
+
+        answered = call_hub_tool(live_socket, "project_pipelines.answer_question", {
+          question_id: "question_live_mutation_publish",
+          answer: "Yes; the held subscription stayed open."
+        })
+        raise "live mutation answer_question failed: #{answered.inspect}" unless answered["ok"]
+        answered_frame = wait_entity_upsert(question_sub, "project-pipelines.question", "question_live_mutation_publish")
+        answered_row = answered_frame["entity"] || answered_frame["record"] || answered_frame
+        raise "held question status upsert missing: #{answered_frame.inspect}" unless answered_row["status"] == "answered"
+
+        mutation_ticket = call_hub_tool(live_socket, "project_pipelines.create_ticket", {
+          id: "ticket_live_mutation_publish",
+          project_id: live_context.fetch("tickets").find { |ticket| ticket["id"] == live_run.fetch("ticket_id") }.fetch("project_id"),
+          title: "Live session_request mutation publish"
+        })
+        raise "mutation ticket failed: #{mutation_ticket.inspect}" unless mutation_ticket["ok"]
+        mutation_run = call_hub_tool(live_socket, "project_pipelines.start_run", {
+          id: "run_live_mutation_publish",
+          ticket_id: "ticket_live_mutation_publish",
+          pipeline_id: "botster_stack_delivery",
+          spawn_target_id: "tgt_71266a8d976d4535902ffed09c18a7ba",
+          branch: "project-pipelines/live-mutation-publish",
+          base_ref: "main"
+        })
+        raise "mutation run failed: #{mutation_run.inspect}" unless mutation_run["ok"]
+        spawned = call_hub_tool(live_socket, "project_pipelines.spawn_ticket_session", {
+          run_id: "run_live_mutation_publish",
+          step_id: "botster_stack_plan",
+          request_id: "session_request_live_mutation_publish"
+        })
+        raise "mutation spawn failed: #{spawned.inspect}" unless spawned["ok"]
+        spawned_worktree = spawned.dig("activation", "result", "worktree_path")
+        File.write(File.join(spawned_worktree, "release-downstream-plan"), "release\n") if spawned_worktree
+        session_frame = nil
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 12
+        loop do
+          remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          raise "held session_request upsert with session_id did not arrive: last=#{session_frame.inspect}" if remaining <= 0
+          session_frame = wait_entity_frame(session_sub, timeout: remaining)
+          next unless session_frame["type"] == "entity_upsert"
+          next unless session_frame["entity_type"] == "project-pipelines.session_request" || session_frame["family"] == "project-pipelines.session_request"
+          next unless session_frame["id"] == "session_request_live_mutation_publish"
+          session_row = session_frame["entity"] || session_frame["record"] || session_frame
+          break if session_row["session_id"]
+        end
+        published_question_seq = [opened_frame["snapshot_seq"], answered_frame["snapshot_seq"]].compact.max
+        published_session_seq = session_frame["snapshot_seq"]
+      ensure
+        live_socket.close
+      end
+    ensure
+      question_sub.close if question_sub
+      session_sub.close if session_sub
+      question_sub = nil
+      session_sub = nil
+    end
+
+    fresh_question = subscribe_entity_snapshot(socket_path, "project-pipelines.question", "question-live-mutation-floor")
+    raise "fresh question snapshot_seq #{fresh_question["snapshot_seq"]} is behind published floor #{published_question_seq}" if published_question_seq && fresh_question["snapshot_seq"].to_i < published_question_seq.to_i
+    fresh_question_row = fresh_question.fetch("items").find { |item| item["id"] == "question_live_mutation_publish" }
+    raise "fresh question snapshot omitted the mutated row" unless fresh_question_row && fresh_question_row["status"] == "answered"
+
+    fresh_session = subscribe_entity_snapshot(socket_path, "project-pipelines.session_request", "session-request-live-mutation-floor")
+    raise "fresh session_request snapshot_seq #{fresh_session["snapshot_seq"]} is behind published floor #{published_session_seq}" if published_session_seq && fresh_session["snapshot_seq"].to_i < published_session_seq.to_i
+    fresh_session_row = fresh_session.fetch("items").find { |item| item["id"] == "session_request_live_mutation_publish" }
+    raise "fresh session_request snapshot omitted session_id" unless fresh_session_row && fresh_session_row["session_id"]
 
     run!(hub, "packages", "disable", "--data-dir", data_dir, "botster-workspaces")
     run!(hub, "shutdown", "--data-dir", data_dir)

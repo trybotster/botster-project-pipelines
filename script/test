@@ -54,7 +54,7 @@ navigation_targets = {item["target"]["surface_id"] for item in manifest["navigat
 assert "project-pipelines.home" in navigation_targets
 readme = Path("README.md").read_text()
 domain_contract = Path("docs/domain-contract.md").read_text()
-for phrase in ["Public MCP Contract", "Drain-first Cold Cut", "plugin_db.batch", "entity_provider", "question.opened", "question_asked"]:
+for phrase in ["Public MCP Contract", "Drain-first Cold Cut", "plugin_db.batch", "entity_provider", "entity_publish", "question.opened", "question_asked"]:
     assert phrase in readme
 for phrase in ["Persistence Boundaries", "entity_provider", "provider-specific merge execution", "question.opened", "question_asked"]:
     assert phrase in domain_contract
@@ -98,6 +98,7 @@ scan_paths = [
     "script/test", "script/cutover", "script/test-cutover", "script/test-hub-flow",
     "script/hub_acceptance_smoke", "docs/domain-contract.md",
     "fixtures/project_pipelines/domain_contract.json",
+    "test/plugin_runtime_test.lua",
 ]
 pii_pattern = re.compile(
     r"/" + r"Users/|/" + r"home/|jason" + r"conigliari|"
@@ -193,6 +194,14 @@ end
 local spawned = {}
 local default_session_type_id = nil
 botster = {
+  entity_publish = function(frame)
+    return {
+      ok = true,
+      status = "accepted",
+      last_accepted_seq = frame.snapshot_seq,
+      high_water_seq = frame.snapshot_seq,
+    }
+  end,
   capabilities = {
     plugin_db = {
       get = function(args)
@@ -2269,4 +2278,5 @@ print("project-pipelines authoritative package checks passed")
 LUA
 
 lua "$lua_test"
+lua test/plugin_runtime_test.lua
 script/test-cutover

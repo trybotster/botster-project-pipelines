@@ -57,7 +57,7 @@ Runtime-teardown class: **does not apply**. This ticket changes durable-state pu
    - First-write key accounting mirrors the existing `meta/counters` handling in the `projected_keys` computation.
    - `mutation_records` already contains only changed rows (deep-equal diff), so "publish only changed records" holds structurally. No snapshot republish on mutation.
 3. **Failure policy (parity with event admission failure).** `result.ok == true` (`accepted`, `pending_gap`, `resync_scheduled`) is admitted. On `botster.entity_publish` missing, pcall error, or `ok == false`: retry that frame once; if still failing, keep the durable mutation committed, keep `save_state` returning success, and record one bounded `entity_publish_degraded` event in the durable `events` family (MAX_EVENTS = 256 cap) with `{family, id, snapshot_seq, code, bounded message}` through one guarded follow-up batch. A re-entry guard keeps the diagnostic save from publishing or recursing. If the diagnostic save itself fails, drop it silently. Tool results never change shape and never fail because of publish.
-4. **Provider sequence coordination for the two published families only.** The `question` and `session_request` providers allocate `snapshot_seq` from the same persisted counter via CAS advance-by-one with retry (the workspaces `membership_entity_provider` pattern: read counter, load rows, re-read counter, CAS, retry on conflict). The other 17 providers keep the in-memory counter and stay byte-unchanged.
+4. **Provider sequence coordination for the two published families only.** The `question` and `session_request` providers allocate `snapshot_seq` from the same persisted counter via CAS advance-by-one with retry (the workspaces `membership_entity_provider` pattern: read counter, load family rows, re-read counter, CAS, retry on conflict). The other 17 providers keep the in-memory counter. Every provider snapshot loads only its family prefix so Hub's one-second provider dispatch bound still holds; they do not call full `load_state()`.
 5. **Docs.** Document the live-mutation publish contract for the two families in `README.md`.
 6. **Tests.** New stub-loaded `test/plugin_runtime_test.lua` wired into `script/test`; live-path extension of `script/test-hub-flow` (details under acceptance checks).
 
@@ -157,6 +157,7 @@ Capture after Implement/Verify:
 | Publish seam | Inside `save_state` after batch success — every mutation path covered once |
 | Sequence source | Persisted per-family counter, same-batch reservation, CAS |
 | Provider seq for published families | Shared persisted counter via CAS advance-by-one |
+| Provider row load | Family-prefix list/get for every provider, including the 17 in-memory-seq families, so snapshots stay inside the 1s Hub dispatch bound |
 | Failure policy | One retry per frame, then committed + success + bounded durable `entity_publish_degraded` event |
 | Remove frames | Published for the two families (free via the shared helper) |
 | Other families | Not published; explicit set, not manifest-driven |
