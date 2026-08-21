@@ -158,7 +158,9 @@ advancing the run, so the lane uses a session type that never advances.
    It starts at Plan.
 3. Call `project_pipelines.spawn_ticket_session` for `botster_stack_plan` with an explicit
    `session_type_id` of `notice-subject.fixture/hold` and the same explicit admitted
-   `spawn_target_id` the smoke lane uses. Wait for the ready file with a bounded timeout.
+   `spawn_target_id` the smoke lane uses. Capture the returned session id immediately and
+   arm a panic-safe cleanup owner before later assertions. Wait for the ready file with a
+   bounded timeout.
 4. At the exact ask point, call `project_pipelines.current_context` for that run. Require
    `run.current_run_step_id` to name the Plan visit and that visit's `agent_session_uuid` to be
    a nonempty string. Bind it as `expected_subject`. Fail the lane when either condition is
@@ -178,7 +180,10 @@ advancing the run, so the lane uses a session type that never advances.
    sidecar must receive that event, proving emission still happened, and its payload must have
    no `subject` key. Ordered after that sidecar observation, subscription A must stay silent for
    3 seconds.
-10. Release the held fixture session in an `ensure` block so the managed process exits.
+10. On unwind, the cleanup owner writes the release file, then uses the production
+    `botster-hub sessions shutdown` path and `remove_session`. It waits for the logical
+    session and observed descendants to be absent. It disarms only after that succeeds.
+    A negative control fails after readiness and proves the same absence.
 
 ## Convention supersession ownership
 
@@ -312,8 +317,10 @@ status, or a surviving `subjects: []` charter rule blocks the merge request.
    addresses, and retired selector vocabulary. New documentation and this plan must avoid those
    patterns.
 7. **Held fixture session leak.** The live lane keeps one managed session waiting on a release
-   file. An early failure could leave that process running. Mitigation: write the release file
-   from an `ensure` block, so every exit path releases the held session.
+   file. An early failure or Hub shutdown alone can leave the session worker running.
+   Mitigation: capture the session id at spawn, arm a cleanup owner immediately, shut the
+   session down through the production Hub path, wait for logical-session and descendant
+   absence, and prove a post-readiness failure path.
 8. **Bounded negatives are timing claims.** A negative subscription assertion proves only that
    nothing arrived inside its window. Mitigation: order each negative check after a positive
    delivery on another subscription, so the router has demonstrably already dispatched.
@@ -342,6 +349,8 @@ status, or a surviving `subjects: []` charter rule blocks the merge request.
    - a run with no current session binding still emits the event to the plugin-audience sidecar
      with no `subject` key, while the session-filtered subscription stays silent for a bounded
      3 seconds;
+   - the held fixture session is shut down through the production Hub session path, and a
+     post-readiness failure proves the logical session and its descendants are gone;
    - the plugin-audience sidecar still receives the original smoke-lane event.
 4. Production-path proof: the changed code path is `record_question`, which every
    `project_pipelines.ask_human` and `project_pipelines.ask_agent` call reaches. The live lane

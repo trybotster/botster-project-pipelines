@@ -213,6 +213,158 @@ def resolve_notice_text(payload, pointer)
   text
 end
 
+def daemon_request(socket_path, payload)
+  socket = open_hub_socket(socket_path)
+  begin
+    socket.puts(JSON.generate(payload))
+    JSON.parse(socket.gets || raise("daemon closed during #{payload[:type] || payload["type"]}"))
+  ensure
+    socket.close
+  end
+end
+
+def list_hub_sessions(socket_path)
+  response = daemon_request(socket_path, { type: "list_sessions" })
+  Array(response["sessions"])
+end
+
+def session_row_matches?(row, session_id)
+  [row["id"], row["session_id"], row["session_uuid"]].include?(session_id)
+end
+
+def logical_session_present?(socket_path, session_id)
+  list_hub_sessions(socket_path).any? { |row| session_row_matches?(row, session_id) }
+end
+
+def process_alive?(pid)
+  return false unless pid.is_a?(Integer) && pid.positive?
+
+  Process.kill(0, pid)
+  true
+rescue Errno::ESRCH, Errno::EPERM
+  false
+end
+
+def parent_pid(pid)
+  output = `ps -o ppid= -p #{pid}`
+  return nil unless $?.success?
+
+  value = output.strip.to_i
+  value.positive? ? value : nil
+end
+
+def child_pids(pid)
+  `pgrep -P #{pid}`.split.map(&:to_i)
+rescue StandardError
+  []
+end
+
+class HeldSessionCleanup
+  attr_accessor :worktree
+  attr_reader :session_id, :armed, :descendant_pids
+
+  def initialize(hub:, data_dir:, socket_path:, session_id:)
+    @hub = hub
+    @data_dir = data_dir
+    @socket_path = socket_path
+    @session_id = session_id
+    @worktree = nil
+    @descendant_pids = []
+    @armed = true
+  end
+
+  def observe_descendants!
+    return @descendant_pids unless @worktree
+
+    ready_path = File.join(@worktree, "notice-subject-ready.json")
+    return @descendant_pids unless File.file?(ready_path)
+
+    ready = JSON.parse(File.read(ready_path))
+    hold_pid = ready["pid"].to_i
+    pids = []
+    if hold_pid.positive?
+      pids << hold_pid
+      parent = parent_pid(hold_pid)
+      pids << parent if parent
+      pids.concat(child_pids(hold_pid))
+      pids.concat(child_pids(parent)) if parent
+    end
+    @descendant_pids = pids.uniq.select { |pid| process_alive?(pid) }
+  end
+
+  def shutdown_and_wait!
+    return unless @armed
+    return if @session_id.to_s.empty?
+
+    write_release_file
+    shutdown_session
+    remove_session_when_terminal
+    wait_until_absent
+    wait_until_descendants_absent
+  end
+
+  def disarm
+    @armed = false
+  end
+
+  private
+
+  def write_release_file
+    return unless @worktree
+
+    File.write(File.join(@worktree, "release-notice-subject"), "release\n")
+  rescue StandardError
+    nil
+  end
+
+  def shutdown_session
+    system(
+      @hub, "sessions", "shutdown", "--data-dir", @data_dir, @session_id,
+      out: File::NULL, err: File::NULL
+    )
+  end
+
+  def remove_session_when_terminal
+    Timeout.timeout(8) do
+      loop do
+        return unless logical_session_present?(@socket_path, @session_id)
+
+        response = daemon_request(@socket_path, { type: "remove_session", session_id: @session_id })
+        return if response["kind"] == "session_removed"
+        code = response.dig("error", "code")
+        if code == "session_not_terminal"
+          sleep 0.05
+          next
+        end
+        return unless logical_session_present?(@socket_path, @session_id)
+
+        raise "remove_session failed for #{@session_id}: #{response.inspect}"
+      end
+    end
+  rescue Timeout::Error
+    listed = list_hub_sessions(@socket_path).select { |row| session_row_matches?(row, @session_id) }
+    raise "session #{@session_id} did not become removable: #{listed.inspect}"
+  end
+
+  def wait_until_absent
+    Timeout.timeout(8) do
+      sleep 0.05 while logical_session_present?(@socket_path, @session_id)
+    end
+  rescue Timeout::Error
+    listed = list_hub_sessions(@socket_path).map { |row| row["session_id"] || row["id"] }
+    raise "logical session #{@session_id} remained after production shutdown: #{listed.inspect}"
+  end
+
+  def wait_until_descendants_absent
+    Timeout.timeout(8) do
+      sleep 0.05 while @descendant_pids.any? { |pid| process_alive?(pid) }
+    end
+  rescue Timeout::Error
+    survivors = @descendant_pids.select { |pid| process_alive?(pid) }
+    raise "held session descendants remained after production shutdown: #{survivors.inspect}"
+  end
+end
+
 def write_notice_subject_hold_fixture(root)
   FileUtils.mkdir_p(File.join(root, "bin"))
   File.write(File.join(root, "plugin.lua"), "return botster.register({})\n")
@@ -226,7 +378,8 @@ def write_notice_subject_hold_fixture(root)
 
     File.write("notice-subject-ready.json", JSON.generate({
       ready: true,
-      session_id: ENV.fetch("BOTSTER_SESSION_ID")
+      session_id: ENV.fetch("BOTSTER_SESSION_ID"),
+      pid: Process.pid
     }))
     Timeout.timeout(300) do
       sleep 0.05 until File.file?("release-notice-subject")
@@ -600,7 +753,7 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
       socket.close
     end
 
-    hold_worktree = nil
+    hold_cleanup = nil
     matching_events = nil
     mismatch_events = nil
     begin
@@ -637,12 +790,23 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
           request_id: "session_request_notice_subject"
         })
         raise "notice subject spawn failed: #{spawned.inspect}" unless spawned["ok"]
+        hold_session_id = spawned.dig("activation", "session_id") || spawned.dig("activation", "result", "session_id")
+        raise "notice subject spawn did not return a session id: #{spawned.inspect}" unless hold_session_id.is_a?(String) && !hold_session_id.empty?
+        hold_cleanup = HeldSessionCleanup.new(
+          hub: hub,
+          data_dir: data_dir,
+          socket_path: socket_path,
+          session_id: hold_session_id
+        )
         hold_worktree = spawned.dig("activation", "result", "worktree_path")
         raise "notice subject spawn did not return a worktree" unless hold_worktree
+        hold_cleanup.worktree = hold_worktree
         ready_path = File.join(hold_worktree, "notice-subject-ready.json")
         Timeout.timeout(20) do
           sleep 0.05 until File.file?(ready_path)
         end
+        hold_cleanup.observe_descendants!
+        raise "held fixture produced no live descendants" if hold_cleanup.descendant_pids.empty?
         ask_context = call_hub_tool(subject_socket, "project_pipelines.current_context", { run_id: "run_notice_subject" })
         ask_run = ask_context.fetch("run")
         raise "notice subject run left Plan" unless ask_run["current_step_id"] == "botster_stack_plan"
@@ -707,16 +871,72 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
         raise "sidecar missed the unbound question: #{unbound_payload.inspect}" unless unbound_payload["question_id"] == "question_notice_unbound"
         raise "unbound payload must omit subject: #{unbound_payload.inspect}" if unbound_payload.key?("subject")
         assert_no_package_event(matching_events, timeout: 3, label: "session-filtered subscription after unbound emit")
+        hold_cleanup.shutdown_and_wait!
+        hold_cleanup.disarm
       ensure
         subject_socket.close
       end
     ensure
-      if hold_worktree
-        File.write(File.join(hold_worktree, "release-notice-subject"), "release\n")
-      end
+      hold_cleanup.shutdown_and_wait! if hold_cleanup&.armed
       matching_events.close if matching_events
       mismatch_events.close if mismatch_events
     end
+
+    cleanup_fail = nil
+    begin
+      fail_socket = open_hub_socket(socket_path)
+      begin
+        fail_context = call_hub_tool(fail_socket, "project_pipelines.current_context", {})
+        fail_run_ticket = fail_context.fetch("runs").find { |run| run["id"] == "run_live_authority" }.fetch("ticket_id")
+        fail_run = call_hub_tool(fail_socket, "project_pipelines.start_run", {
+          id: "run_notice_cleanup_fail",
+          ticket_id: fail_run_ticket,
+          pipeline_id: "botster_stack_delivery",
+          spawn_target_id: "tgt_71266a8d976d4535902ffed09c18a7ba",
+          branch: "project-pipelines/notice-cleanup-fail",
+          base_ref: "main"
+        })
+        raise "cleanup-fail run failed: #{fail_run.inspect}" unless fail_run["ok"]
+        fail_spawned = call_hub_tool(fail_socket, "project_pipelines.spawn_ticket_session", {
+          run_id: "run_notice_cleanup_fail",
+          step_id: "botster_stack_plan",
+          session_type_id: "notice-subject.fixture/hold",
+          spawn_target_id: "tgt_71266a8d976d4535902ffed09c18a7ba",
+          request_id: "session_request_notice_cleanup_fail"
+        })
+        raise "cleanup-fail spawn failed: #{fail_spawned.inspect}" unless fail_spawned["ok"]
+        fail_session_id = fail_spawned.dig("activation", "session_id") || fail_spawned.dig("activation", "result", "session_id")
+        raise "cleanup-fail spawn did not return a session id" unless fail_session_id.is_a?(String) && !fail_session_id.empty?
+        cleanup_fail = HeldSessionCleanup.new(
+          hub: hub,
+          data_dir: data_dir,
+          socket_path: socket_path,
+          session_id: fail_session_id
+        )
+        fail_worktree = fail_spawned.dig("activation", "result", "worktree_path")
+        raise "cleanup-fail spawn did not return a worktree" unless fail_worktree
+        cleanup_fail.worktree = fail_worktree
+        fail_ready = File.join(fail_worktree, "notice-subject-ready.json")
+        Timeout.timeout(20) do
+          sleep 0.05 until File.file?(fail_ready)
+        end
+        cleanup_fail.observe_descendants!
+        raise "cleanup-fail fixture produced no live descendants" if cleanup_fail.descendant_pids.empty?
+        raise "logical session missing before deliberate failure" unless logical_session_present?(socket_path, fail_session_id)
+        raise "deliberate held-session cleanup failure after readiness"
+      ensure
+        fail_socket.close if fail_socket
+      end
+    rescue RuntimeError => error
+      raise error unless error.message == "deliberate held-session cleanup failure after readiness"
+    ensure
+      cleanup_fail.shutdown_and_wait! if cleanup_fail&.armed
+    end
+    raise "cleanup-fail session owner was not armed" unless cleanup_fail
+    raise "cleanup-fail logical session remained" if logical_session_present?(socket_path, cleanup_fail.session_id)
+    survivors = cleanup_fail.descendant_pids.select { |pid| process_alive?(pid) }
+    raise "cleanup-fail descendants remained: #{survivors.inspect}" unless survivors.empty?
+    cleanup_fail.disarm
 
     question_sub = nil
     session_sub = nil
