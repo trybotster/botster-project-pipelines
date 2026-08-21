@@ -6,6 +6,7 @@ require "tmpdir"
 require "fileutils"
 require "json"
 require "socket"
+require "open3"
 
 ROOT = File.expand_path("..", __dir__)
 # This pin is the merged Hub revision for the contract proven by this package.
@@ -213,6 +214,8 @@ def resolve_notice_text(payload, pointer)
   text
 end
 
+class ObservationError < RuntimeError; end
+
 def daemon_request(socket_path, payload)
   socket = open_hub_socket(socket_path)
   begin
@@ -223,9 +226,22 @@ def daemon_request(socket_path, payload)
   end
 end
 
+def sessions_from_daemon_response(response)
+  if response["error"]
+    raise ObservationError, "list_sessions error: #{response["error"].inspect}"
+  end
+  unless response["kind"] == "sessions"
+    raise ObservationError, "list_sessions kind mismatch: #{response.inspect}"
+  end
+  sessions = response["sessions"]
+  unless sessions.is_a?(Array)
+    raise ObservationError, "list_sessions missing sessions array: #{response.inspect}"
+  end
+  sessions
+end
+
 def list_hub_sessions(socket_path)
-  response = daemon_request(socket_path, { type: "list_sessions" })
-  Array(response["sessions"])
+  sessions_from_daemon_response(daemon_request(socket_path, { type: "list_sessions" }))
 end
 
 def session_row_matches?(row, session_id)
@@ -236,27 +252,178 @@ def logical_session_present?(socket_path, session_id)
   list_hub_sessions(socket_path).any? { |row| session_row_matches?(row, session_id) }
 end
 
+def process_liveness_from_signal_error(error)
+  case error
+  when Errno::ESRCH
+    false
+  when Errno::EPERM
+    true
+  else
+    raise ObservationError, "process liveness observation failed: #{error.class}: #{error.message}"
+  end
+end
+
 def process_alive?(pid)
-  return false unless pid.is_a?(Integer) && pid.positive?
+  unless pid.is_a?(Integer) && pid.positive?
+    raise ObservationError, "process liveness requires a positive pid: #{pid.inspect}"
+  end
 
   Process.kill(0, pid)
   true
-rescue Errno::ESRCH, Errno::EPERM
-  false
+rescue Errno::ESRCH, Errno::EPERM => error
+  process_liveness_from_signal_error(error)
 end
 
-def parent_pid(pid)
-  output = `ps -o ppid= -p #{pid}`
-  return nil unless $?.success?
-
-  value = output.strip.to_i
-  value.positive? ? value : nil
+def capture_command(*args)
+  Open3.capture3(*args)
 end
 
-def child_pids(pid)
-  `pgrep -P #{pid}`.split.map(&:to_i)
-rescue StandardError
-  []
+def parent_pid(pid, capture: method(:capture_command))
+  stdout, stderr, status = capture.call("ps", "-o", "ppid=", "-p", pid.to_s)
+  unless status.success?
+    raise ObservationError, "ps parent lookup failed pid=#{pid} status=#{status.exitstatus} stderr=#{stderr}"
+  end
+  value = stdout.strip.to_i
+  unless value.positive?
+    raise ObservationError, "ps parent lookup returned no pid pid=#{pid} stdout=#{stdout.inspect}"
+  end
+  value
+end
+
+def child_pids(pid, capture: method(:capture_command))
+  stdout, stderr, status = capture.call("pgrep", "-P", pid.to_s)
+  return [] if status.exitstatus == 1 && stdout.strip.empty?
+  unless status.success?
+    raise ObservationError, "pgrep children lookup failed pid=#{pid} status=#{status.exitstatus} stderr=#{stderr}"
+  end
+  stdout.split.map(&:to_i)
+end
+
+def process_command(pid, capture: method(:capture_command))
+  stdout, stderr, status = capture.call("ps", "-p", pid.to_s, "-o", "command=")
+  unless status.success?
+    raise ObservationError, "ps command lookup failed pid=#{pid} status=#{status.exitstatus} stderr=#{stderr}"
+  end
+  command = stdout.strip
+  if command.empty?
+    raise ObservationError, "ps command lookup returned empty pid=#{pid} stdout=#{stdout.inspect}"
+  end
+  command
+end
+
+def session_worker_command?(command)
+  argv0 = command.split.first.to_s
+  File.basename(argv0) == "botster-session-worker"
+end
+
+def session_worker_ancestor(pid, capture: method(:capture_command))
+  current = pid
+  8.times do
+    unless current.positive?
+      raise ObservationError, "held session worker identity is missing for command pid #{pid}"
+    end
+    command = process_command(current, capture: capture)
+    return current if session_worker_command?(command)
+    parent = parent_pid(current, capture: capture)
+    if parent <= 1
+      raise ObservationError, "held session worker identity is missing for command pid #{pid}"
+    end
+    current = parent
+  end
+  raise ObservationError, "held session worker identity is missing for command pid #{pid}"
+end
+
+def assert_raises_observation(label)
+  begin
+    yield
+  rescue ObservationError
+    return
+  end
+  raise "#{label} did not fail closed"
+end
+
+def assert_observation_errors_fail_closed
+  assert_raises_observation("list_sessions error frame") do
+    sessions_from_daemon_response({ "error" => { "code" => "boom" }, "sessions" => [] })
+  end
+  assert_raises_observation("list_sessions kind mismatch") do
+    sessions_from_daemon_response({ "kind" => "status" })
+  end
+  assert_raises_observation("list_sessions missing sessions array") do
+    sessions_from_daemon_response({ "kind" => "sessions" })
+  end
+  empty = sessions_from_daemon_response({ "kind" => "sessions", "sessions" => [] })
+  raise "empty sessions array must remain a valid absence result" unless empty == []
+
+  raise "EPERM must count as alive" unless process_liveness_from_signal_error(Errno::EPERM.new)
+  raise "ESRCH must count as absent" if process_liveness_from_signal_error(Errno::ESRCH.new)
+  assert_raises_observation("unknown kill error") do
+    process_liveness_from_signal_error(RuntimeError.new("kill failed"))
+  end
+  assert_raises_observation("non-positive pid") { process_alive?(0) }
+
+  failed = Open3.capture3("sh", "-c", "exit 2")[2]
+  none = Open3.capture3("sh", "-c", "exit 1")[2]
+  success = Open3.capture3("true")[2]
+  assert_raises_observation("ps failure") do
+    parent_pid(1, capture: ->(*) { ["", "ps: failed", failed] })
+  end
+  assert_raises_observation("ps empty parent") do
+    parent_pid(1, capture: ->(*) { ["", "", success] })
+  end
+  assert_raises_observation("pgrep command failure") do
+    child_pids(1, capture: ->(*) { ["", "pgrep: failed", failed] })
+  end
+  none_children = child_pids(1, capture: ->(*) { ["", "", none] })
+  raise "pgrep status 1 must mean no children" unless none_children == []
+  assert_raises_observation("ps command lookup failure") do
+    process_command(1, capture: ->(*) { ["", "ps: failed", failed] })
+  end
+  assert_raises_observation("ps empty command") do
+    process_command(1, capture: ->(*) { ["", "", success] })
+  end
+
+  cleanup = HeldSessionCleanup.new(hub: "hub", data_dir: "data", socket_path: "sock", session_id: "sess")
+  assert_raises_observation("missing worktree") { cleanup.observe_descendants! }
+  Dir.mktmpdir("bpp-obs-") do |dir|
+    cleanup.worktree = dir
+    assert_raises_observation("missing ready file") { cleanup.observe_descendants! }
+    File.write(File.join(dir, "notice-subject-ready.json"), JSON.generate({ ready: true, pid: 0 }))
+    assert_raises_observation("missing hold pid") { cleanup.observe_descendants! }
+
+    dummy = spawn("sleep", "30")
+    begin
+      File.write(File.join(dir, "notice-subject-ready.json"), JSON.generate({ ready: true, pid: dummy }))
+      injected = lambda do |*args|
+        if args == ["ps", "-p", dummy.to_s, "-o", "command="]
+          ["sleep 30", "", success]
+        elsif args == ["ps", "-o", "ppid=", "-p", dummy.to_s]
+          ["1", "", success]
+        elsif args == ["pgrep", "-P", dummy.to_s]
+          ["", "", none]
+        else
+          raise "unexpected observation capture #{args.inspect}"
+        end
+      end
+      assert_raises_observation("missing worker identity") do
+        cleanup.observe_descendants!(capture: injected)
+      end
+      assert_raises_observation("ps command lookup during observe") do
+        cleanup.observe_descendants!(capture: ->(*) { ["", "ps: failed", failed] })
+      end
+    ensure
+      begin
+        Process.kill("TERM", dummy)
+      rescue Errno::ESRCH
+        nil
+      end
+      begin
+        Process.wait(dummy)
+      rescue Errno::ECHILD
+        nil
+      end
+    end
+  end
 end
 
 class HeldSessionCleanup
@@ -273,23 +440,38 @@ class HeldSessionCleanup
     @armed = true
   end
 
-  def observe_descendants!
-    return @descendant_pids unless @worktree
+  def observe_descendants!(capture: method(:capture_command))
+    unless @worktree
+      raise ObservationError, "held session worktree is missing"
+    end
 
     ready_path = File.join(@worktree, "notice-subject-ready.json")
-    return @descendant_pids unless File.file?(ready_path)
+    unless File.file?(ready_path)
+      raise ObservationError, "held session ready file is missing: #{ready_path}"
+    end
 
     ready = JSON.parse(File.read(ready_path))
     hold_pid = ready["pid"].to_i
-    pids = []
-    if hold_pid.positive?
-      pids << hold_pid
-      parent = parent_pid(hold_pid)
-      pids << parent if parent
-      pids.concat(child_pids(hold_pid))
-      pids.concat(child_pids(parent)) if parent
+    unless hold_pid.positive?
+      raise ObservationError, "held session ready file has no pid: #{ready.inspect}"
     end
+    unless process_alive?(hold_pid)
+      raise ObservationError, "held session command pid is not alive: #{hold_pid}"
+    end
+
+    worker_pid = session_worker_ancestor(hold_pid, capture: capture)
+    unless process_alive?(worker_pid)
+      raise ObservationError, "held session worker pid is not alive: #{worker_pid}"
+    end
+
+    pids = [hold_pid, worker_pid]
+    pids.concat(child_pids(hold_pid, capture: capture))
+    pids.concat(child_pids(worker_pid, capture: capture))
     @descendant_pids = pids.uniq.select { |pid| process_alive?(pid) }
+    unless @descendant_pids.include?(hold_pid) && @descendant_pids.include?(worker_pid)
+      raise ObservationError, "held session identities were not live after capture hold=#{hold_pid} worker=#{worker_pid} pids=#{@descendant_pids.inspect}"
+    end
+    @descendant_pids
   end
 
   def shutdown_and_wait!
@@ -364,6 +546,8 @@ class HeldSessionCleanup
     raise "held session descendants remained after production shutdown: #{survivors.inspect}"
   end
 end
+
+assert_observation_errors_fail_closed
 
 def write_notice_subject_hold_fixture(root)
   FileUtils.mkdir_p(File.join(root, "bin"))
