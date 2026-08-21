@@ -186,12 +186,14 @@ advancing the run, so the lane uses a session type that never advances.
    sidecar must receive that event, proving emission still happened, and its payload must have
    no `subject` key. Ordered after that sidecar observation, subscription A must stay silent for
    3 seconds.
-10. On unwind, the cleanup owner writes the release file, then uses the production
-    `botster-hub sessions shutdown` path and `remove_session`. It waits for the logical
-    session and observed descendants to be absent. Observation errors during those waits
-    fail the gate. It disarms only after that succeeds. A negative control fails after
-    readiness and proves the same absence. Injected observation-error controls run before
-    the live Hub build and must fail closed.
+10. On unwind, the cleanup owner writes the release file and waits for the hold command
+    pid to exit, then uses the production `botster-hub sessions shutdown` path. It keeps
+    shutdown status and stdout/stderr. It waits for a terminal lifecycle or absence before
+    `remove_session`, with a 20 second hang bound. It then waits for logical-session and
+    observed descendant absence. Observation errors and shutdown failures fail the gate.
+    It disarms only after that succeeds. A negative control fails after readiness and
+    proves the same absence. Injected observation-error controls run before the live Hub
+    build and must fail closed.
 
 ## Convention supersession ownership
 
@@ -326,10 +328,11 @@ status, or a surviving `subjects: []` charter rule blocks the merge request.
    patterns.
 7. **Held fixture session leak.** The live lane keeps one managed session waiting on a release
    file. An early failure or Hub shutdown alone can leave the session worker running.
-   Mitigation: capture the session id at spawn, arm a cleanup owner immediately, shut the
-   session down through the production Hub path, wait for logical-session and descendant
-   absence, require worker identity before descendant proof, fail closed on observation
-   errors, and prove a post-readiness failure path.
+   Mitigation: capture the session id at spawn, arm a cleanup owner immediately, write the
+   release file and wait for the hold command to exit before shutdown, keep shutdown
+   diagnostics, wait for a terminal lifecycle before `remove_session`, wait for
+   logical-session and descendant absence, require worker identity before descendant
+   proof, fail closed on observation errors, and prove a post-readiness failure path.
 8. **Bounded negatives are timing claims.** A negative subscription assertion proves only that
    nothing arrived inside its window. Mitigation: order each negative check after a positive
    delivery on another subscription, so the router has demonstrably already dispatched.
@@ -365,8 +368,10 @@ status, or a surviving `subjects: []` charter rule blocks the merge request.
    - a run with no current session binding still emits the event to the plugin-audience sidecar
      with no `subject` key, while the session-filtered subscription stays silent for a bounded
      3 seconds;
-   - the held fixture session is shut down through the production Hub session path, and a
-     post-readiness failure proves the logical session and its descendants are gone;
+   - the held fixture session is shut down through the production Hub session path after
+     the hold command has left its input gate; shutdown status is preserved; a 20 second
+     hang bound waits for terminal lifecycle before `remove_session`; a post-readiness
+     failure proves the logical session and its descendants are gone;
    - observation helpers reject typed daemon errors, missing session arrays, `EPERM` as
      death, failed `ps`/`pgrep`, missing hold pid, and missing session-worker identity;
      injected controls for those errors run before `cargo build` and fail the gate;
@@ -375,7 +380,7 @@ status, or a surviving `subjects: []` charter rule blocks the merge request.
      is the ordering that `ask_human` returned while the entered file exists and the
      release file does not; elapsed is recorded and is not a 2.0s fail;
    - `script/test-hub-flow` is green on three consecutive runs at the evidence commit,
-     with every sidecar `ask_human` elapsed value recorded.
+     with every sidecar `ask_human` elapsed value and held-session cleanup result recorded.
 4. Production-path proof: the changed code path is `record_question`, which every
    `project_pipelines.ask_human` and `project_pipelines.ask_agent` call reaches. The live lane
    exercises that public tool through the real Hub daemon socket, not a Lua stub.

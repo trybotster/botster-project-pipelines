@@ -428,7 +428,12 @@ end
 
 class HeldSessionCleanup
   attr_accessor :worktree
-  attr_reader :session_id, :armed, :descendant_pids
+  attr_reader :session_id, :armed, :descendant_pids, :hold_pid
+
+  TERMINAL_LIFECYCLES = %w[exited failed stopped].freeze
+  # Stopping means Core is still reaping the worker. Review saw that exceed 8s.
+  # 20s is hang protection after the fixture has left its input gate, not a sleep.
+  TERMINAL_WAIT_SECONDS = 20
 
   def initialize(hub:, data_dir:, socket_path:, session_id:)
     @hub = hub
@@ -437,7 +442,13 @@ class HeldSessionCleanup
     @session_id = session_id
     @worktree = nil
     @descendant_pids = []
+    @hold_pid = nil
     @armed = true
+    @shutdown_status = nil
+    @shutdown_stdout = ""
+    @shutdown_stderr = ""
+    @release_error = nil
+    @hold_still_alive_after_release = false
   end
 
   def observe_descendants!(capture: method(:capture_command))
@@ -467,6 +478,7 @@ class HeldSessionCleanup
     pids = [hold_pid, worker_pid]
     pids.concat(child_pids(hold_pid, capture: capture))
     pids.concat(child_pids(worker_pid, capture: capture))
+    @hold_pid = hold_pid
     @descendant_pids = pids.uniq.select { |pid| process_alive?(pid) }
     unless @descendant_pids.include?(hold_pid) && @descendant_pids.include?(worker_pid)
       raise ObservationError, "held session identities were not live after capture hold=#{hold_pid} worker=#{worker_pid} pids=#{@descendant_pids.inspect}"
@@ -479,10 +491,13 @@ class HeldSessionCleanup
     return if @session_id.to_s.empty?
 
     write_release_file
+    wait_until_hold_command_exits
     shutdown_session
+    wait_until_terminal
     remove_session_when_terminal
     wait_until_absent
     wait_until_descendants_absent
+    puts "script/test-hub-flow: held-session cleanup ok session=#{@session_id}"
   end
 
   def disarm
@@ -495,21 +510,56 @@ class HeldSessionCleanup
     return unless @worktree
 
     File.write(File.join(@worktree, "release-notice-subject"), "release\n")
-  rescue StandardError
-    nil
+  rescue StandardError => error
+    @release_error = error
+  end
+
+  def wait_until_hold_command_exits
+    return unless @hold_pid
+
+    Timeout.timeout(8) do
+      sleep 0.05 while process_alive?(@hold_pid)
+    end
+  rescue Timeout::Error
+    @hold_still_alive_after_release = true
   end
 
   def shutdown_session
-    system(
-      @hub, "sessions", "shutdown", "--data-dir", @data_dir, @session_id,
-      out: File::NULL, err: File::NULL
+    stdout, stderr, status = Open3.capture3(
+      @hub, "sessions", "shutdown", "--data-dir", @data_dir, @session_id
     )
+    @shutdown_status = status.exitstatus
+    @shutdown_stdout = stdout
+    @shutdown_stderr = stderr
+    return if status.success?
+    return if shutdown_already_gone?(stdout, stderr)
+
+    raise "sessions shutdown failed for #{@session_id} status=#{status.exitstatus} stdout=#{stdout} stderr=#{stderr}"
+  end
+
+  def shutdown_already_gone?(stdout, stderr)
+    "#{stdout} #{stderr}".match?(/unknown_session|not found|already_exited/i)
+  end
+
+  def wait_until_terminal
+    Timeout.timeout(TERMINAL_WAIT_SECONDS) do
+      loop do
+        listed = matching_session_rows
+        return if listed.empty?
+        lifecycle = listed.first["lifecycle"].to_s
+        return if terminal_lifecycle?(lifecycle)
+        sleep 0.05
+      end
+    end
+  rescue Timeout::Error
+    raise "session #{@session_id} did not become terminal after production shutdown: #{cleanup_diagnostics}"
   end
 
   def remove_session_when_terminal
     Timeout.timeout(8) do
       loop do
-        return unless logical_session_present?(@socket_path, @session_id)
+        listed = matching_session_rows
+        return if listed.empty?
 
         response = daemon_request(@socket_path, { type: "remove_session", session_id: @session_id })
         return if response["kind"] == "session_removed"
@@ -518,14 +568,35 @@ class HeldSessionCleanup
           sleep 0.05
           next
         end
-        return unless logical_session_present?(@socket_path, @session_id)
+        return if matching_session_rows.empty?
 
-        raise "remove_session failed for #{@session_id}: #{response.inspect}"
+        raise "remove_session failed for #{@session_id}: #{response.inspect} #{cleanup_diagnostics}"
       end
     end
   rescue Timeout::Error
-    listed = list_hub_sessions(@socket_path).select { |row| session_row_matches?(row, @session_id) }
-    raise "session #{@session_id} did not become removable: #{listed.inspect}"
+    raise "session #{@session_id} did not become removable: #{cleanup_diagnostics}"
+  end
+
+  def matching_session_rows
+    list_hub_sessions(@socket_path).select { |row| session_row_matches?(row, @session_id) }
+  end
+
+  def terminal_lifecycle?(lifecycle)
+    TERMINAL_LIFECYCLES.include?(lifecycle) || lifecycle.include?("exit")
+  end
+
+  def cleanup_diagnostics
+    hold_alive = @hold_pid && process_alive?(@hold_pid)
+    {
+      lifecycle_rows: matching_session_rows,
+      shutdown_status: @shutdown_status,
+      shutdown_stdout: @shutdown_stdout,
+      shutdown_stderr: @shutdown_stderr,
+      release_error: @release_error && "#{@release_error.class}: #{@release_error.message}",
+      hold_pid: @hold_pid,
+      hold_alive: hold_alive,
+      hold_still_alive_after_release: @hold_still_alive_after_release
+    }.inspect
   end
 
   def wait_until_absent
