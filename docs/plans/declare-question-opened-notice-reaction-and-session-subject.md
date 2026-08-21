@@ -18,9 +18,12 @@ Base: `origin/main` at `cd7c2f926fcead78e15e7a9c713ad26dfe883914`
 
 - Revision 1 (`f90f856`) returned by Plan Review `review_1787299729_447587` with verdict
   `changes_required`.
-- Revision 2 (this document) answers `finding_1787299729_681476` (race-free live subject proof),
+- Revision 2 (`fabdc13`) answered `finding_1787299729_681476` (race-free live subject proof),
   `finding_1787299729_445118` (recorded Botster context), and `finding_1787299729_131016`
-  (owned convention supersession).
+  (owned convention supersession). Plan Review `review_1787300188_975210` accepted the first
+  two and returned one product finding.
+- Revision 3 (this document) answers `finding_1787300188_619787`: the supersession now requires
+  the durable note and charter edits with vault validation, not only an inbox capture.
 
 ## Other role and surface playbooks and atomic notes loaded
 
@@ -132,7 +135,8 @@ on `payload.subject` ([[Package-event subject filters are exact strings compiled
    - Record the superseded client rule: a client no longer needs `subjects: []` plus local
      workflow filtering to receive a session-scoped `question.opened` notice.
 6. Vault convention supersession (owned, not deferred)
-   - Verify owns the supersession of [[question opened clients subscribe with empty subjects]].
+   - Verify supersedes [[question opened clients subscribe with empty subjects]] and edits both
+     conflicting [[project-pipelines-playbook]] entries, then runs vault validation.
      See "Convention supersession ownership" below.
 
 ## Live subject proof (replaces the revision 1 design)
@@ -182,14 +186,40 @@ The ticket requires this work to update or supersede
 [[question opened clients subscribe with empty subjects]]. Revision 1 left it as a post-merge
 capture candidate with no owning stage, so no gate could fail if it never happened.
 
+Revision 2 required only a vault inbox capture. That is not enough. An inbox file is raw input
+under the vault workflow. It leaves the note at `status: current` and leaves two conflicting
+rules live in the Project Pipelines charter. Revision 3 requires the durable edits themselves.
+
 - Implement owns the in-repository half: `README.md` and `docs/domain-contract.md` record the
   session-subject targeting rule and mark the subjectless rule historical.
-- Verify owns the vault half. Before requesting merge, Verify writes the supersession to the
-  vault inbox, sets vault checklist item 4 to `done`, and attaches the capture path as evidence.
-  The note must keep the subjectless rule as superseded historical context, name the human
-  decision `question_1787278509_823001`, and state the new rule.
-- Completion condition: the Verify gate evidence carries the capture path and the vault
-  checklist item is `done`. A pending item 4 blocks the merge request.
+- Verify owns the vault half, in this run. The vault is a separate target
+  (`tgt_74d58fdf4c2341619ea8d879b3833193`), but the ticket states the supersession is part of
+  this work, so it is not registered as a dependency prerequisite.
+
+Verify performs all of the following before requesting merge:
+
+1. Write the inbox capture first, following the vault workflow.
+2. Promote it to a durable replacement note that states the new rule: a client targets a
+   `question.opened` notice with the session subject supplied by the package declaration, and
+   needs no Project Pipelines entity or field knowledge. The note names the human decision
+   `question_1787278509_823001` and links to
+   [[client notice reactions belong to package declarations not client constants]].
+3. Edit `notes/question opened clients subscribe with empty subjects.md`: set
+   `status: superseded` and add a `superseded_by` wiki link to the replacement note. Keep its
+   body as historical context, including why the subjectless rule was true before the payload
+   schema declared `subject`.
+4. Edit `notes/project-pipelines-playbook.md` at both conflicting entries:
+   - line 67, the Must Load entry that tells consumers to use no subject filter;
+   - line 103, the Required Gates entry that requires `subjects: []` and rejects nonempty
+     subject filters.
+   Both must state the new rule and mark the old one superseded.
+5. Run `ops/scripts/validate-schema.sh` and `ops/scripts/dangling-links.sh`, and keep their
+   output as evidence. The `superseded_by` link and both charter edits must resolve.
+6. Set vault checklist item 4 to `done`.
+
+Completion condition: Verify gate evidence carries the changed note paths, the two validation
+command outputs, and a `done` vault checklist item 4. A pending item 4, an unchanged note
+status, or a surviving `subjects: []` charter rule blocks the merge request.
 
 ## Non-scope
 
@@ -318,13 +348,19 @@ capture candidate with no owning stage, so no gate could fail if it never happen
    exercises that public tool through the real Hub daemon socket, not a Lua stub.
 5. Evidence discipline: record the commit and clean tracked state before and after each gate
    command, per [[verification evidence is scoped to a stable commit and clean tree]].
+6. Convention supersession, checked before the merge request: the superseded note carries
+   `status: superseded` with a resolving `superseded_by` link; neither
+   [[project-pipelines-playbook]] entry still requires `subjects: []`;
+   `ops/scripts/validate-schema.sh` and `ops/scripts/dangling-links.sh` pass; vault checklist
+   item 4 is `done`.
 
 ## Vault gaps worth capturing
 
-1. Supersede [[question opened clients subscribe with empty subjects]]. Its rule (empty subject
-   set plus client-side workflow filtering) is replaced by session-subject targeting for the
-   notice path. This one is owned, not deferred: see "Convention supersession ownership".
-   Verify performs it before requesting merge.
+1. Supersede [[question opened clients subscribe with empty subjects]] and correct both
+   conflicting [[project-pipelines-playbook]] entries. Its rule (empty subject set plus
+   client-side workflow filtering) is replaced by session-subject targeting for the notice path.
+   This one is owned, not deferred: see "Convention supersession ownership". Verify performs the
+   durable note and charter edits, with validation output, before requesting merge.
 2. Capture that Hub supplies no caller session identity to plugin MCP tool calls, so a package
    must derive agent session identity from its own durable records. This finding is not in the
    vault today and it decided the design.
