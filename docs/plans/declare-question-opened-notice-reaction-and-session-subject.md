@@ -14,10 +14,24 @@ Base: `origin/main` at `cd7c2f926fcead78e15e7a9c713ad26dfe883914`
 
 - [[project-pipelines-playbook]] (Project Pipelines package paths are the whole scope).
 
+## Revision history
+
+- Revision 1 (`f90f856`) returned by Plan Review `review_1787299729_447587` with verdict
+  `changes_required`.
+- Revision 2 (this document) answers `finding_1787299729_681476` (race-free live subject proof),
+  `finding_1787299729_445118` (recorded Botster context), and `finding_1787299729_131016`
+  (owned convention supersession).
+
 ## Other role and surface playbooks and atomic notes loaded
 
 - [[planner-playbook]]
 - [[botster-planner-playbook]]
+- [[botster-architecture]]
+- [[project pipeline orchestration belongs in a device-level botster plugin]]
+- [[project pipelines needs an operator workbench not more primitives]]
+- [[project pipelines ui contract belongs in the plugin readme]]
+- [[botster orchestration should spawn agents with explicit target ids]]
+- [[botster orchestration prompts must bind agents to explicit worktrees]]
 - [[client notice reactions belong to package declarations not client constants]]
 - [[generic botster clients must not hardcode package event reactions]]
 - [[event plane client proof uses library contract fixtures]]
@@ -25,6 +39,21 @@ Base: `origin/main` at `cd7c2f926fcead78e15e7a9c713ad26dfe883914`
 - [[Package-event subject filters are exact strings compiled at admission]]
 - [[web package event notices are transient and entity state is durable]]
 - [[project pipelines mcp create calls can time out after committing]]
+
+How the Botster overlay notes constrain this work:
+
+- [[botster-architecture]] places the change at the package boundary. Hub owns admission and
+  projection; the package owns its emitted contract; clients own rendering.
+- [[project pipeline orchestration belongs in a device-level botster plugin]] keeps the workflow
+  policy, including the subject source, inside this plugin instead of core or client code.
+- [[project pipelines needs an operator workbench not more primitives]] rules out a new
+  configuration primitive for TTL or severity. One fixed declaration is enough.
+- [[project pipelines ui contract belongs in the plugin readme]] places the notice contract text
+  in this repository's `README.md`, next to the manifest it governs.
+- [[botster orchestration should spawn agents with explicit target ids]] and
+  [[botster orchestration prompts must bind agents to explicit worktrees]] govern the live lane:
+  its spawn uses the explicit admitted target id already used by `script/hub_acceptance_smoke`,
+  and the held fixture session stays in its own managed worktree.
 
 Runtime-teardown class does not apply. This ticket changes one manifest declaration, one
 emitted payload field, and test lanes. It does not touch WebRTC, peer lifecycle,
@@ -95,17 +124,72 @@ on `payload.subject` ([[Package-event subject filters are exact strings compiled
      assert `notice_reactions` for package `project-pipelines` contains
      `owner: "project-pipelines"`, `name: "question.opened"`, `subject_scope: "session"`,
      `text_pointer: "/notice"`, `ttl_ms: 10000`, `severity: "warning"`.
-   - Prove client-audience subject targeting on the existing live run whose Plan step already
-     has a spawned session: open one `subscribe_events` subscription for owner
-     `project-pipelines`, name `question.opened`, `subjects: [<spawned session uuid>]`, and a
-     second subscription with `subjects: ["not-this-session"]`. Ask one question on that run.
-     The matching subscription receives one `package_event` frame whose `payload.subject`
-     equals the spawned session uuid and whose `payload.notice` resolves through `/notice`.
-     The non-matching subscription receives none.
+   - Add a race-free subject-targeting lane. See "Live subject proof" below.
    - Keep the existing plugin-audience sidecar proof unchanged.
 5. `README.md` and `docs/domain-contract.md`
    - Document the notice reaction, the `subject` payload field, the subject source, and the
      new Hub checkout commit in the pin instructions.
+   - Record the superseded client rule: a client no longer needs `subjects: []` plus local
+     workflow filtering to receive a session-scoped `question.opened` notice.
+6. Vault convention supersession (owned, not deferred)
+   - Verify owns the supersession of [[question opened clients subscribe with empty subjects]].
+     See "Convention supersession ownership" below.
+
+## Live subject proof (replaces the revision 1 design)
+
+Revision 1 planned to subscribe with the Plan session uuid of `run_live_authority`. That is
+wrong. `script/hub_acceptance_smoke` drives `run_live_authority` past Plan before
+`script/test-hub-flow` reaches its `question.opened` section at line 421. At that ask point the
+run's current run step is a later step with no session binding, so the planned subject would be
+absent and the subscription would prove nothing.
+
+The corrected lane creates its own deterministic window. `project_pipelines.spawn_ticket_session`
+returns the session id synchronously and binds the current run step before the tool returns;
+`script/hub_acceptance_smoke` already asserts that join. The only race is the fixture agent
+advancing the run, so the lane uses a session type that never advances.
+
+1. Install a second fixture session type, `notice-subject.fixture/hold`. Its entry script writes
+   a ready file and then waits for a release file. It calls no pipeline tool.
+2. Create run `run_notice_subject` on the live ticket with `project_pipelines.start_run`.
+   It starts at Plan.
+3. Call `project_pipelines.spawn_ticket_session` for `botster_stack_plan` with an explicit
+   `session_type_id` of `notice-subject.fixture/hold` and the same explicit admitted
+   `spawn_target_id` the smoke lane uses. Wait for the ready file with a bounded timeout.
+4. At the exact ask point, call `project_pipelines.current_context` for that run. Require
+   `run.current_run_step_id` to name the Plan visit and that visit's `agent_session_uuid` to be
+   a nonempty string. Bind it as `expected_subject`. Fail the lane when either condition is
+   false, rather than proceeding with a stale or empty identity.
+5. Open subscription A (`subjects: [expected_subject]`) and subscription B
+   (`subjects: ["not-this-session"]`) for owner `project-pipelines`, name `question.opened`.
+   Wait for both `event_subscribed` acknowledgements. Package events are live-only, so both
+   subscriptions must exist before the ask.
+6. Call `project_pipelines.ask_human` on `run_notice_subject`.
+7. A receives exactly one `package_event` frame within a 5 second bound. Assert
+   `payload.subject == expected_subject` and that the notice text resolves through `/notice`.
+8. Bounded negative, ordered after A already delivered: `IO.select` on B for 3 seconds must
+   return nil. Ordering the check after A's frame makes B's silence meaningful instead of a
+   timing artifact.
+9. No-binding case: create run `run_notice_unbound` and never spawn its session, so its current
+   Plan visit carries no `agent_session_uuid`. Ask one question on it. The plugin-audience
+   sidecar must receive that event, proving emission still happened, and its payload must have
+   no `subject` key. Ordered after that sidecar observation, subscription A must stay silent for
+   3 seconds.
+10. Release the held fixture session in an `ensure` block so the managed process exits.
+
+## Convention supersession ownership
+
+The ticket requires this work to update or supersede
+[[question opened clients subscribe with empty subjects]]. Revision 1 left it as a post-merge
+capture candidate with no owning stage, so no gate could fail if it never happened.
+
+- Implement owns the in-repository half: `README.md` and `docs/domain-contract.md` record the
+  session-subject targeting rule and mark the subjectless rule historical.
+- Verify owns the vault half. Before requesting merge, Verify writes the supersession to the
+  vault inbox, sets vault checklist item 4 to `done`, and attaches the capture path as evidence.
+  The note must keep the subjectless rule as superseded historical context, name the human
+  decision `question_1787278509_823001`, and state the new rule.
+- Completion condition: the Verify gate evidence carries the capture path and the vault
+  checklist item is `done`. A pending item 4 blocks the merge request.
 
 ## Non-scope
 
@@ -169,8 +253,9 @@ on `payload.subject` ([[Package-event subject filters are exact strings compiled
 - `plugin.lua` -- `record_question` only (near the existing `events.emit("question.opened", ...)`
   call around line 1979).
 - `script/test` -- manifest guards plus the inline Lua harness assertions.
-- `script/test-hub-flow` -- `EXPECTED_HUB_COMMIT`, the packages-frame descriptor assertion, and
-  the client `subscribe_events` subject proof.
+- `script/test-hub-flow` -- `EXPECTED_HUB_COMMIT`, the packages-frame descriptor assertion, the
+  held `notice-subject.fixture/hold` session type, and the client `subscribe_events` subject
+  proof with its bounded negative cases.
 - `README.md` -- notice reaction contract text and the Hub checkout commit in the pin block.
 - `docs/domain-contract.md` -- `question.opened` payload description.
 - `docs/plans/declare-question-opened-notice-reaction-and-session-subject.md` -- this plan.
@@ -196,6 +281,12 @@ on `payload.subject` ([[Package-event subject filters are exact strings compiled
 6. **Repository text guards.** `script/test` scans every tracked file for operator paths, mail
    addresses, and retired selector vocabulary. New documentation and this plan must avoid those
    patterns.
+7. **Held fixture session leak.** The live lane keeps one managed session waiting on a release
+   file. An early failure could leave that process running. Mitigation: write the release file
+   from an `ensure` block, so every exit path releases the held session.
+8. **Bounded negatives are timing claims.** A negative subscription assertion proves only that
+   nothing arrived inside its window. Mitigation: order each negative check after a positive
+   delivery on another subscription, so the router has demonstrably already dispatched.
 
 ## Acceptance checks and tests
 
@@ -212,10 +303,16 @@ on `payload.subject` ([[Package-event subject filters are exact strings compiled
    - Hub admits and enables this package with the notice declaration present;
    - the packages frame projects `notice_reactions` with `owner: "project-pipelines"` and the
      declared values;
-   - the client subscription whose `subjects` list holds the spawned Plan session uuid receives
-     one `question.opened` frame with `payload.subject` equal to that uuid;
-   - a subscription with a different subject receives nothing;
-   - the plugin-audience sidecar still receives the same event.
+   - at the ask point, the run's current run step carries a nonempty `agent_session_uuid`, and
+     the lane fails closed when it does not;
+   - the subscription whose `subjects` list holds that exact current-run-step session uuid
+     receives one `question.opened` frame within 5 seconds, with `payload.subject` equal to it;
+   - a mismatched-subject subscription stays silent for a bounded 3 seconds, checked after the
+     matching subscription already delivered;
+   - a run with no current session binding still emits the event to the plugin-audience sidecar
+     with no `subject` key, while the session-filtered subscription stays silent for a bounded
+     3 seconds;
+   - the plugin-audience sidecar still receives the original smoke-lane event.
 4. Production-path proof: the changed code path is `record_question`, which every
    `project_pipelines.ask_human` and `project_pipelines.ask_agent` call reaches. The live lane
    exercises that public tool through the real Hub daemon socket, not a Lua stub.
@@ -226,7 +323,8 @@ on `payload.subject` ([[Package-event subject filters are exact strings compiled
 
 1. Supersede [[question opened clients subscribe with empty subjects]]. Its rule (empty subject
    set plus client-side workflow filtering) is replaced by session-subject targeting for the
-   notice path. Capture the replacement after merge.
+   notice path. This one is owned, not deferred: see "Convention supersession ownership".
+   Verify performs it before requesting merge.
 2. Capture that Hub supplies no caller session identity to plugin MCP tool calls, so a package
    must derive agent session identity from its own durable records. This finding is not in the
    vault today and it decided the design.
