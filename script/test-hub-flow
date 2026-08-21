@@ -837,10 +837,6 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
 
     run!(hub, "packages", "install", "--data-dir", data_dir, "--path", template_root)
     run!(hub, "packages", "enable", "--data-dir", data_dir, "downstream-plan.fixture")
-    hold_root = File.join(data_dir, "notice-subject-hold")
-    write_notice_subject_hold_fixture(hold_root)
-    run!(hub, "packages", "install", "--data-dir", data_dir, "--path", hold_root)
-    run!(hub, "packages", "enable", "--data-dir", data_dir, "notice-subject.fixture")
     run!(hub, "packages", "install", "--data-dir", data_dir, "--path", ROOT)
     # An upgraded install reaches the enabled worker with no effective default: the Hub only
     # exposes configuration fields the installed manifest declares, and 0.3.0 renamed the key.
@@ -896,17 +892,23 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
       live_run = context.fetch("runs").find { |run| run["id"] == "run_live_authority" }
       raise "live run missing before question.opened proof" unless live_run
       started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      opened = call_hub_tool(socket, "project_pipelines.ask_human", {
-        id: "question_opened_live",
-        run_id: live_run.fetch("id"),
-        ticket_id: live_run.fetch("ticket_id"),
-        step_id: "botster_stack_review",
-        blocking: true,
-        question: "Is the transient question.opened notice live?"
-      })
+      opened = begin
+        Timeout.timeout(8) do
+          call_hub_tool(socket, "project_pipelines.ask_human", {
+            id: "question_opened_live",
+            run_id: live_run.fetch("id"),
+            ticket_id: live_run.fetch("ticket_id"),
+            step_id: "botster_stack_review",
+            blocking: true,
+            question: "Is the transient question.opened notice live?"
+          })
+        end
+      rescue Timeout::Error
+        raise "ask_human did not return; sidecar handler blocked the caller"
+      end
       elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
       raise "ask_human failed: #{opened.inspect}" unless opened["ok"]
-      raise "ask_human took #{elapsed}s while the sidecar handler should not block it" unless elapsed <= 2.0
+      puts "script/test-hub-flow: ask_human elapsed=#{elapsed}s sidecar-nonblock-ordering"
       begin
         Timeout.timeout(5) do
           sleep 0.02 until File.file?(entered_path)
@@ -936,6 +938,15 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
     ensure
       socket.close
     end
+
+    hold_root = File.join(data_dir, "notice-subject-hold")
+    write_notice_subject_hold_fixture(hold_root)
+    run!(hub, "packages", "install", "--data-dir", data_dir, "--path", hold_root)
+    run!(hub, "packages", "enable", "--data-dir", data_dir, "notice-subject.fixture")
+    run!(hub, "packages", "disable", "--data-dir", data_dir, "project-pipelines")
+    run!(hub, "packages", "enable", "--data-dir", data_dir, "project-pipelines")
+    run!(hub, "packages", "disable", "--data-dir", data_dir, "botster-workspaces")
+    run!(hub, "packages", "enable", "--data-dir", data_dir, "botster-workspaces")
 
     hold_cleanup = nil
     matching_events = nil

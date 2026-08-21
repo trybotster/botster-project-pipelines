@@ -152,8 +152,11 @@ returns the session id synchronously and binds the current run step before the t
 `script/hub_acceptance_smoke` already asserts that join. The only race is the fixture agent
 advancing the run, so the lane uses a session type that never advances.
 
-1. Install a second fixture session type, `notice-subject.fixture/hold`. Its entry script writes
-   a ready file and then waits for a release file. It calls no pipeline tool.
+1. After the smoke lane and the sidecar non-blocking proof, install a second fixture session
+   type, `notice-subject.fixture/hold`. Reload the Project Pipelines worker so it admits the
+   new session type, then re-enable the sidecar so later sidecar observations still run.
+   Do not install this package during shared setup. Its entry script writes a ready file and
+   then waits for a release file. It calls no pipeline tool.
 2. Create run `run_notice_subject` on the live ticket with `project_pipelines.start_run`.
    It starts at Plan.
 3. Call `project_pipelines.spawn_ticket_session` for `botster_stack_plan` with an explicit
@@ -330,6 +333,13 @@ status, or a surviving `subjects: []` charter rule blocks the merge request.
 8. **Bounded negatives are timing claims.** A negative subscription assertion proves only that
    nothing arrived inside its window. Mitigation: order each negative check after a positive
    delivery on another subscription, so the router has demonstrably already dispatched.
+9. **Extra fixture worker perturbs the sidecar non-blocking proof.** Installing
+   `notice-subject.fixture` in shared setup put another enabled plugin worker in the same
+   daemon as the pre-existing sidecar `ask_human` measurement. A 2.0s wall-clock bound then
+   failed on the tail even when the median was unchanged. Mitigation: install and enable
+   that fixture only after the sidecar proof, and prove non-blocking by order:
+   `ask_human` returns, the entered file exists, and the release file is still absent.
+   Record elapsed. Do not fail on a 2.0s clock.
 
 ## Acceptance checks and tests
 
@@ -360,7 +370,12 @@ status, or a surviving `subjects: []` charter rule blocks the merge request.
    - observation helpers reject typed daemon errors, missing session arrays, `EPERM` as
      death, failed `ps`/`pgrep`, missing hold pid, and missing session-worker identity;
      injected controls for those errors run before `cargo build` and fail the gate;
-   - the plugin-audience sidecar still receives the original smoke-lane event.
+   - the plugin-audience sidecar still receives the original smoke-lane event;
+   - that sidecar proof runs before `notice-subject.fixture` is installed, and non-blocking
+     is the ordering that `ask_human` returned while the entered file exists and the
+     release file does not; elapsed is recorded and is not a 2.0s fail;
+   - `script/test-hub-flow` is green on three consecutive runs at the evidence commit,
+     with every sidecar `ask_human` elapsed value recorded.
 4. Production-path proof: the changed code path is `record_question`, which every
    `project_pipelines.ask_human` and `project_pipelines.ask_agent` call reaches. The live lane
    exercises that public tool through the real Hub daemon socket, not a Lua stub.
