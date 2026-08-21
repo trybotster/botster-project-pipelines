@@ -34,6 +34,16 @@ assert payload_schema["additionalProperties"] is False
 assert payload_schema["required"] == ["question_id", "kind", "notice"]
 assert payload_schema["properties"]["notice"]["maxLength"] == 280
 assert payload_schema["properties"]["kind"]["enum"] == ["human", "agent"]
+assert payload_schema["properties"]["subject"] == {"type": "string", "maxLength": 128}
+notices = manifest.get("events", {}).get("notices", [])
+assert notices == [{
+    "name": "question.opened",
+    "subject_scope": "session",
+    "text_pointer": "/notice",
+    "ttl_ms": 10000,
+    "severity": "warning",
+}]
+assert "owner" not in notices[0]
 assert "events.on(" not in source
 assert 'events.emit("question.opened"' in source
 assert "utf8.offset" in source
@@ -234,10 +244,13 @@ botster = {
   register = function(spec) return spec end,
 }
 
-emit_stub = { events = {}, status = "accepted", throw = false }
+emit_stub = { events = {}, status = "accepted", throw = false, store_present_at_emit = nil }
 events = {
   emit = function(name, payload)
     if emit_stub.throw then error("injected emit throw") end
+    if name == "question.opened" and type(payload) == "table" and type(payload.question_id) == "string" then
+      emit_stub.store_present_at_emit = durable_store["v4/questions/" .. payload.question_id] ~= nil
+    end
     table.insert(emit_stub.events, { name = name, payload = copy(payload) })
     return { status = emit_stub.status }
   end,
@@ -2229,12 +2242,13 @@ end
 ;(function()
 local function reset_emits()
   emit_stub.events = {}
+  emit_stub.store_present_at_emit = nil
 end
 local function last_opened_emit()
   return emit_stub.events[#emit_stub.events]
 end
 
-local function question_opened_payload_valid(payload, question)
+local function question_opened_payload_valid(payload, question, expected_subject)
   assert(payload.question_id == question.id, "question_id")
   assert(payload.kind == question.kind, "kind")
   assert(type(payload.notice) == "string" and payload.notice ~= "", "notice")
@@ -2254,6 +2268,11 @@ local function question_opened_payload_valid(payload, question)
     assert(payload.step_id == question.step_id, "step_id")
   else
     assert(payload.step_id == nil, "step_id omitted")
+  end
+  if expected_subject then
+    assert(payload.subject == expected_subject, "subject")
+  else
+    assert(payload.subject == nil, "subject omitted")
   end
   assert(payload.emit_status == nil, "emit status must not be persisted on the payload")
 end
@@ -2285,6 +2304,7 @@ local opened = tools["project_pipelines.ask_human"]({
 })
 assert(opened.ok)
 assert(#emit_stub.events == 1 and emit_stub.events[1].name == "question.opened")
+assert(emit_stub.store_present_at_emit == true, "durable question must exist before emit")
 question_opened_payload_valid(emit_stub.events[1].payload, opened.question)
 assert(opened.question.question == "Continue?")
 assert(opened.question.emit_status == nil)
@@ -2297,6 +2317,52 @@ for _, item in ipairs(opened_snapshot.items) do
   if item.id == opened.question.id then opened_row = item end
 end
 assert(opened_row and opened_row.question == "Continue?", "entity snapshot must keep the durable question")
+
+assert(tools["project_pipelines.create_pipeline"]({
+  id = "pipeline-question-subject", name = "Question subject",
+  steps = { { id = "subject-step", name = "Subject", kind = "pty", session_type_id = "subject-session-type" } },
+}).ok)
+assert(tools["project_pipelines.create_ticket"]({
+  id = "ticket-question-subject", project_id = "project-question-opened", title = "Question subject",
+}).ok)
+assert(tools["project_pipelines.start_run"]({
+  id = "run-question-subject", ticket_id = "ticket-question-subject", pipeline_id = "pipeline-question-subject",
+}).ok)
+local bound_spawn = tools["project_pipelines.spawn_ticket_session"]({
+  run_id = "run-question-subject", request_id = "question-subject-spawn",
+})
+assert(bound_spawn.ok)
+local bound_session = bound_spawn.activation.session_id
+assert(type(bound_session) == "string" and bound_session ~= "", "bound spawn must return a session id")
+reset_emits()
+local bound_opened = tools["project_pipelines.ask_human"]({
+  run_id = "run-question-subject",
+  ticket_id = "ticket-question-subject",
+  question = "Bound subject?",
+})
+assert(bound_opened.ok)
+assert(#emit_stub.events == 1 and emit_stub.events[1].name == "question.opened")
+assert(emit_stub.store_present_at_emit == true, "bound durable question must exist before emit")
+question_opened_payload_valid(emit_stub.events[1].payload, bound_opened.question, bound_session)
+
+local bound_visit_id
+for key, record in pairs(durable_store) do
+  if key:find("^v4/run_steps/") and record.payload and record.payload.run_id == "run-question-subject" then
+    bound_visit_id = record.payload.id
+    record.payload.agent_session_uuid = ""
+  end
+end
+assert(bound_visit_id, "bound spawn must persist a run_step visit")
+reset_emits()
+local empty_subject_opened = tools["project_pipelines.ask_human"]({
+  run_id = "run-question-subject",
+  ticket_id = "ticket-question-subject",
+  question = "Empty subject?",
+})
+assert(empty_subject_opened.ok)
+assert(#emit_stub.events == 1)
+assert(emit_stub.events[1].payload.subject == nil, "empty session uuid must omit subject")
+question_opened_payload_valid(emit_stub.events[1].payload, empty_subject_opened.question)
 
 reset_emits()
 local agent_opened = tools["project_pipelines.ask_agent"]({

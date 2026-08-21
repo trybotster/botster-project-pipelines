@@ -61,16 +61,26 @@ rejections are normalized into a failed session request before returning a
 structured activation error. Manual, human, command, and other non-PTY steps do
 not attempt a session-type spawn.
 
-The published `project-pipelines.run_step` entity is the client identity join
-for `question.opened` consumers. After a PTY-backed spawn persists a hub
-session uuid, the current visit carries `agent_session_uuid`. Clients join that
-uuid to `run_id` and `step_id`, then through the run record to `ticket_id`, and
-filter `question.opened` by those ids. The field is optional: visits exist
-before any spawn, non-PTY steps never gain a session, and a spawn response can
-omit a session id. A session-id-less retry clears a stale binding. Existing
-0.3.0 records that already have a correlated `spawn_requested` session on the
-active visit publish the join on first read after upgrade; the next mutation
-persists it. Done, closed, and cancelled visits are not backfilled.
+The published `project-pipelines.run_step` entity remains the durable client
+identity join. After a PTY-backed spawn persists a hub session uuid, the
+current visit carries `agent_session_uuid`. Clients join that uuid to
+`run_id` and `step_id`, then through the run record to `ticket_id`.
+The field is optional: visits exist before any spawn, non-PTY steps never
+gain a session, and a spawn response can omit a session id. A session-id-less
+retry clears a stale binding. Existing 0.3.0 records that already have a
+correlated `spawn_requested` session on the active visit publish the join on
+first read after upgrade; the next mutation persists it. Done, closed, and
+cancelled visits are not backfilled.
+
+Transient `question.opened` notices are a separate targeting path. The
+package declares one `events.notices` reaction for `question.opened` with
+session subject scope, text pointer `/notice`, TTL 10000 ms, and warning
+severity. After the durable question commits, the plugin sets
+`payload.subject` to the current run step's nonempty `agent_session_uuid`.
+It omits the key when that binding is missing. A client targets the notice
+with that exact session subject from the projected descriptor. It does not
+need an empty subject set plus local workflow filtering for this
+session-scoped notice. The old subjectless subscription rule is historical.
 
 Ticket dependencies gate step activation independently of provider
 prerequisites. Durable `ticket_dependencies` rows are the sole link authority;
@@ -316,10 +326,12 @@ entity provider. Events never contain raw transcripts or secret-bearing
 payloads.
 
 Transient Hub events are a separate live-delivery plane. `question.opened` is
-declared on the package manifest and emitted only after the question row
-commits. It is a bounded notice for current subscribers. It is not stored in
-plugin_db, it is not an entity family, and reconnect must recover the question
-from `project-pipelines.question` rather than replaying the notice.
+declared on the package manifest, including one `events.notices` reaction,
+and emitted only after the question row commits. The payload may include
+`subject` when the current run step has a nonempty session binding. It is a
+bounded notice for current subscribers. It is not stored in plugin_db, it is
+not an entity family, and reconnect must recover the question from
+`project-pipelines.question` rather than replaying the notice.
 
 `link_pr(status=merged)` persists the durable close in the same `save_state`
 batch as the merged link. The transient Hub `pr_merged` event is a notice. It

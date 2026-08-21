@@ -137,10 +137,20 @@
             "blocking": { "type": "boolean" },
             "run_id": { "type": "string", "maxLength": 128 },
             "step_id": { "type": "string", "maxLength": 128 },
-            "ticket_id": { "type": "string", "maxLength": 128 }
+            "ticket_id": { "type": "string", "maxLength": 128 },
+            "subject": { "type": "string", "maxLength": 128 }
           },
           "required": ["question_id", "kind", "notice"]
         }
+      }
+    ],
+    "notices": [
+      {
+        "name": "question.opened",
+        "subject_scope": "session",
+        "text_pointer": "/notice",
+        "ttl_ms": 10000,
+        "severity": "warning"
       }
     ]
   }

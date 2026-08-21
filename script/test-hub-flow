@@ -10,7 +10,7 @@ require "socket"
 ROOT = File.expand_path("..", __dir__)
 # This pin is the merged Hub revision for the contract proven by this package.
 # README.md documents when and how to advance it.
-EXPECTED_HUB_COMMIT = "d52c3ebc4190286c4b7c3812f8c65251c646ade5"
+EXPECTED_HUB_COMMIT = "12e0cc6994be18024e4bdfffb22947526a652204"
 
 def required_executable(name)
   path = File.expand_path(ENV.fetch(name) { raise "#{name} must point at an executable" }, ROOT)
@@ -158,6 +158,105 @@ def wait_entity_upsert(subscription, entity_type, id, timeout: 8)
     next unless frame["id"] == id
     return frame
   end
+end
+
+def open_event_socket(socket_path, client_name)
+  socket = UNIXSocket.new(socket_path)
+  socket.puts(JSON.generate({
+    protocol: "botster-hub-daemon-v1",
+    compatibility: {
+      protocol: "botster-hub-daemon-v1",
+      protocol_version: 6,
+      required_features: ["package_event_subscriptions"],
+      minimum_conformance_fixture_revision: 1,
+      client_name: client_name
+    }
+  }))
+  JSON.parse(socket.gets || raise("daemon closed before event hello"))
+  socket
+end
+
+def subscribe_package_event(socket, subscription_id, owner, name, subjects)
+  socket.puts(JSON.generate({
+    type: "subscribe_events",
+    subscription_id: subscription_id,
+    owner: owner,
+    name: name,
+    subjects: subjects
+  }))
+  accepted = JSON.parse(socket.gets || raise("daemon closed before event subscription"))
+  raise "event subscribe failed: #{accepted.inspect}" unless accepted["kind"] == "event_subscribed"
+  accepted
+end
+
+def wait_package_event(socket, timeout:)
+  Timeout.timeout(timeout) do
+    loop do
+      frame = JSON.parse(socket.gets || raise("event socket closed"))
+      return frame if frame["type"] == "package_event"
+    end
+  end
+end
+
+def assert_no_package_event(socket, timeout:, label:)
+  readable, = IO.select([socket], nil, nil, timeout)
+  return unless readable
+  frame = JSON.parse(socket.gets || raise("#{label} closed during negative wait"))
+  raise "#{label} received #{frame.inspect}"
+end
+
+def resolve_notice_text(payload, pointer)
+  raise "notice pointer must be one top-level pointer: #{pointer.inspect}" unless pointer.match?(%r{\A/[^/]+\z})
+  property = pointer[1..]
+  text = payload[property]
+  raise "notice text missing at #{pointer}: #{payload.inspect}" unless text.is_a?(String) && !text.empty?
+  text
+end
+
+def write_notice_subject_hold_fixture(root)
+  FileUtils.mkdir_p(File.join(root, "bin"))
+  File.write(File.join(root, "plugin.lua"), "return botster.register({})\n")
+  hold_script = File.join(root, "bin", "hold.rb")
+  File.write(hold_script, <<~'RUBY')
+    #!/usr/bin/env ruby
+    # frozen_string_literal: true
+
+    require "json"
+    require "timeout"
+
+    File.write("notice-subject-ready.json", JSON.generate({
+      ready: true,
+      session_id: ENV.fetch("BOTSTER_SESSION_ID")
+    }))
+    Timeout.timeout(300) do
+      sleep 0.05 until File.file?("release-notice-subject")
+    end
+  RUBY
+  File.chmod(0o755, hold_script)
+  File.write(
+    File.join(root, "botster-package.json"),
+    JSON.pretty_generate({
+      name: "notice-subject.fixture",
+      version: "1.0.0",
+      kind: "plugin",
+      botster: ">=0.1.0",
+      source: { type: "path", path: "." },
+      capabilities: [{ surface: "surfaces" }],
+      entrypoints: [{ runtime: "lua", path: "plugin.lua", bootstrap: false }],
+      session_types: [{
+        id: "hold",
+        label: "Held notice subject",
+        description: "Session that waits so the Plan visit keeps its session binding.",
+        role: "botster.agent",
+        interaction: "interactive",
+        traits: ["pipeline-step", "worktree-aware"],
+        lifecycle: "task",
+        command: "bin/hold.rb",
+        target_id: "tgt_71266a8d976d4535902ffed09c18a7ba",
+        context: ["prompt", "ticket_id", "metadata.run_id"]
+      }]
+    })
+  )
 end
 
 def write_question_opened_sidecar(root)
@@ -401,6 +500,10 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
 
     run!(hub, "packages", "install", "--data-dir", data_dir, "--path", template_root)
     run!(hub, "packages", "enable", "--data-dir", data_dir, "downstream-plan.fixture")
+    hold_root = File.join(data_dir, "notice-subject-hold")
+    write_notice_subject_hold_fixture(hold_root)
+    run!(hub, "packages", "install", "--data-dir", data_dir, "--path", hold_root)
+    run!(hub, "packages", "enable", "--data-dir", data_dir, "notice-subject.fixture")
     run!(hub, "packages", "install", "--data-dir", data_dir, "--path", ROOT)
     # An upgraded install reaches the enabled worker with no effective default: the Hub only
     # exposes configuration fields the installed manifest declares, and 0.3.0 renamed the key.
@@ -417,6 +520,27 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
     run!(hub, "packages", "disable", "--data-dir", data_dir, "project-pipelines")
     run!(hub, "packages", "enable", "--data-dir", data_dir, "project-pipelines")
     run!(File.join(ROOT, "script", "hub_acceptance_smoke"), socket_path, "primary", downstream_root)
+
+    packages_socket = open_hub_socket(socket_path)
+    begin
+      packages_socket.puts(JSON.generate({ type: "list_packages" }))
+      packages_response = JSON.parse(packages_socket.gets || raise("daemon closed during list_packages"))
+      raise "list_packages failed: #{packages_response.inspect}" unless packages_response["kind"] == "packages"
+      pipeline_package = packages_response.fetch("packages").find { |pkg| pkg["package_name"] == "project-pipelines" }
+      raise "project-pipelines missing from packages frame" unless pipeline_package
+      expected_reaction = {
+        "owner" => "project-pipelines",
+        "name" => "question.opened",
+        "subject_scope" => "session",
+        "text_pointer" => "/notice",
+        "ttl_ms" => 10_000,
+        "severity" => "warning"
+      }
+      reactions = pipeline_package["notice_reactions"]
+      raise "notice_reactions mismatch: #{reactions.inspect}" unless reactions == [expected_reaction]
+    ensure
+      packages_socket.close
+    end
 
     sidecar_root = File.join(data_dir, "question-opened-sidecar")
     write_question_opened_sidecar(sidecar_root)
@@ -474,6 +598,124 @@ Dir.mktmpdir("bpp-", temporary_root) do |data_dir|
 
     ensure
       socket.close
+    end
+
+    hold_worktree = nil
+    matching_events = nil
+    mismatch_events = nil
+    begin
+      subject_socket = open_hub_socket(socket_path)
+      begin
+        live_context = call_hub_tool(subject_socket, "project_pipelines.current_context", {})
+        live_run = live_context.fetch("runs").find { |run| run["id"] == "run_live_authority" }
+        raise "live run missing before notice subject proof" unless live_run
+        live_ticket_id = live_run.fetch("ticket_id")
+        notice_run = call_hub_tool(subject_socket, "project_pipelines.start_run", {
+          id: "run_notice_subject",
+          ticket_id: live_ticket_id,
+          pipeline_id: "botster_stack_delivery",
+          spawn_target_id: "tgt_71266a8d976d4535902ffed09c18a7ba",
+          branch: "project-pipelines/notice-subject-hold",
+          base_ref: "main"
+        })
+        raise "notice subject run failed: #{notice_run.inspect}" unless notice_run["ok"]
+        subject_socket.puts(JSON.generate({
+          type: "list_session_types_for_target",
+          target_id: "tgt_71266a8d976d4535902ffed09c18a7ba"
+        }))
+        types_response = JSON.parse(subject_socket.gets || raise("daemon closed during list_session_types_for_target"))
+        raise "list_session_types_for_target failed: #{types_response.inspect}" if types_response["error"]
+        type_ids = Array(types_response["session_types"]).map { |row| row["session_type_id"] || row["id"] }
+        unless type_ids.include?("notice-subject.fixture/hold")
+          raise "held session type missing at admitted target: #{type_ids.inspect}"
+        end
+        spawned = call_hub_tool(subject_socket, "project_pipelines.spawn_ticket_session", {
+          run_id: "run_notice_subject",
+          step_id: "botster_stack_plan",
+          session_type_id: "notice-subject.fixture/hold",
+          spawn_target_id: "tgt_71266a8d976d4535902ffed09c18a7ba",
+          request_id: "session_request_notice_subject"
+        })
+        raise "notice subject spawn failed: #{spawned.inspect}" unless spawned["ok"]
+        hold_worktree = spawned.dig("activation", "result", "worktree_path")
+        raise "notice subject spawn did not return a worktree" unless hold_worktree
+        ready_path = File.join(hold_worktree, "notice-subject-ready.json")
+        Timeout.timeout(20) do
+          sleep 0.05 until File.file?(ready_path)
+        end
+        ask_context = call_hub_tool(subject_socket, "project_pipelines.current_context", { run_id: "run_notice_subject" })
+        ask_run = ask_context.fetch("run")
+        raise "notice subject run left Plan" unless ask_run["current_step_id"] == "botster_stack_plan"
+        plan_visit = ask_context.fetch("run_steps").find { |step| step["id"] == ask_run["current_run_step_id"] }
+        raise "notice subject Plan visit missing: #{ask_context.inspect}" unless plan_visit && plan_visit["step_id"] == "botster_stack_plan"
+        expected_subject = plan_visit["agent_session_uuid"]
+        raise "notice subject Plan visit has no session binding: #{plan_visit.inspect}" unless expected_subject.is_a?(String) && !expected_subject.empty?
+
+        matching_events = open_event_socket(socket_path, "project-pipelines-notice-match")
+        mismatch_events = open_event_socket(socket_path, "project-pipelines-notice-mismatch")
+        subscribe_package_event(matching_events, "sub-notice-match", "project-pipelines", "question.opened", [expected_subject])
+        subscribe_package_event(mismatch_events, "sub-notice-mismatch", "project-pipelines", "question.opened", ["not-this-session"])
+
+        bound_question = "Does the session subject target this notice?"
+        opened = call_hub_tool(subject_socket, "project_pipelines.ask_human", {
+          id: "question_notice_subject",
+          run_id: "run_notice_subject",
+          ticket_id: live_ticket_id,
+          question: bound_question
+        })
+        raise "notice subject ask_human failed: #{opened.inspect}" unless opened["ok"]
+        matched = wait_package_event(matching_events, timeout: 5)
+        raise "matching subscription owner mismatch: #{matched.inspect}" unless matched["owner"] == "project-pipelines"
+        raise "matching subscription name mismatch: #{matched.inspect}" unless matched["name"] == "question.opened"
+        matched_payload = matched.fetch("payload")
+        raise "matching subject mismatch: #{matched_payload.inspect}" unless matched_payload["subject"] == expected_subject
+        raise "matching notice text mismatch" unless resolve_notice_text(matched_payload, "/notice") == bound_question
+        assert_no_package_event(mismatch_events, timeout: 3, label: "mismatched-subject subscription")
+
+        unbound_run = call_hub_tool(subject_socket, "project_pipelines.start_run", {
+          id: "run_notice_unbound",
+          ticket_id: live_ticket_id,
+          pipeline_id: "botster_stack_delivery",
+          spawn_target_id: "tgt_71266a8d976d4535902ffed09c18a7ba",
+          branch: "project-pipelines/notice-unbound",
+          base_ref: "main"
+        })
+        raise "unbound notice run failed: #{unbound_run.inspect}" unless unbound_run["ok"]
+        unbound_context = call_hub_tool(subject_socket, "project_pipelines.current_context", { run_id: "run_notice_unbound" })
+        unbound_visit = unbound_context.fetch("run_steps").find { |step| step["id"] == unbound_context.dig("run", "current_run_step_id") }
+        raise "unbound Plan visit missing" unless unbound_visit && unbound_visit["step_id"] == "botster_stack_plan"
+        raise "unbound Plan visit must have no session binding: #{unbound_visit.inspect}" unless unbound_visit["agent_session_uuid"].to_s.empty?
+
+        sidecar_before = call_hub_tool(subject_socket, "question_opened_sidecar.last_received", {})
+        unbound_question = "Does an unbound question omit subject?"
+        unbound_opened = call_hub_tool(subject_socket, "project_pipelines.ask_human", {
+          id: "question_notice_unbound",
+          run_id: "run_notice_unbound",
+          ticket_id: live_ticket_id,
+          question: unbound_question
+        })
+        raise "unbound ask_human failed: #{unbound_opened.inspect}" unless unbound_opened["ok"]
+        sidecar_after = nil
+        Timeout.timeout(5) do
+          loop do
+            sidecar_after = call_hub_tool(subject_socket, "question_opened_sidecar.last_received", {})
+            break if sidecar_after["count"].to_i == sidecar_before["count"].to_i + 1
+            sleep 0.02
+          end
+        end
+        unbound_payload = sidecar_after.fetch("last")
+        raise "sidecar missed the unbound question: #{unbound_payload.inspect}" unless unbound_payload["question_id"] == "question_notice_unbound"
+        raise "unbound payload must omit subject: #{unbound_payload.inspect}" if unbound_payload.key?("subject")
+        assert_no_package_event(matching_events, timeout: 3, label: "session-filtered subscription after unbound emit")
+      ensure
+        subject_socket.close
+      end
+    ensure
+      if hold_worktree
+        File.write(File.join(hold_worktree, "release-notice-subject"), "release\n")
+      end
+      matching_events.close if matching_events
+      mismatch_events.close if mismatch_events
     end
 
     question_sub = nil

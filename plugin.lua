@@ -1975,6 +1975,10 @@ local function record_question(arguments)
   if type(question.run_id) == "string" and question.run_id ~= "" then payload.run_id = question.run_id end
   if type(question.ticket_id) == "string" and question.ticket_id ~= "" then payload.ticket_id = question.ticket_id end
   if type(question.step_id) == "string" and question.step_id ~= "" then payload.step_id = question.step_id end
+  local run = question.run_id and find_by_id(state.runs, question.run_id) or nil
+  local run_step = run and find_by_id(state.run_steps, run.current_run_step_id) or nil
+  local subject = run_step and run_step.agent_session_uuid
+  if type(subject) == "string" and subject ~= "" then payload.subject = subject end
   pcall(function()
     events.emit("question.opened", payload)
   end)

@@ -123,10 +123,10 @@ and before writes. Each state transition uses one capability-gated
 atomically activates its ticket and creates the run/current run-step; advance,
 cancel, merge request, and close atomically reconcile ticket/run/run-step state
 before entity or surface projection. This release requires Hub commit
-`d52c3ebc4190286c4b7c3812f8c65251c646ade5` or newer. Upgrade Hub before
-installing this package release; older Hubs do not admit the authoritative
-session-type capability scope or the package event router used by
-`question.opened`. The minimum Hub also contains the atomic plugin
+`12e0cc6994be18024e4bdfffb22947526a652204` or newer. Upgrade Hub before
+installing this package release; older Hubs do not admit `events.notices`,
+the authoritative session-type capability scope, or the package event router
+used by `question.opened`. The minimum Hub also contains the atomic plugin
 database ABI and generic package-owned `entity_provider` admission. The
 package never simulates atomicity with sequential writes. Each package entity
 family has an explicit provider returning a fresh authoritative whole-family
@@ -143,7 +143,18 @@ two families' snapshot providers. Hub `ok=true` statuses (`accepted`,
 `ok=false` publish is retried once; the durable mutation and tool result stay
 successful, and one bounded `entity_publish_degraded` event is recorded.
 The other 17 families stay snapshot-only. The transient `question.opened`
-notice is unchanged.
+notice is a package-declared client reaction. The manifest declares one
+`events.notices` entry for `question.opened` with `subject_scope: "session"`,
+`text_pointer: "/notice"`, `ttl_ms: 10000`, and `severity: "warning"`. The
+emitted payload includes optional `subject`. When the question names a run
+whose current run step has a nonempty `agent_session_uuid`, that uuid is the
+subject. Otherwise the plugin omits the `subject` key. A client targets the
+notice with that exact session subject from the projected
+`notice_reactions` descriptor. It does not need `subjects: []` plus local
+workflow filtering for this session-scoped notice. A question with no run,
+or a run with no current session binding, still emits to plugin-audience
+subscribers and to an empty client subject set. It does not match a nonempty
+subject filter.
 Diagnostic events retain the newest 256 records, and mutations fail with
 `store_capacity_exhausted` before any write when the Hub's 1,024-key namespace
 reaches the package's 64-key safety reserve.
@@ -365,9 +376,10 @@ activate it without a session-type argument, then inspect
 that hub session uuid, a `session_type_spawn_requested` event, resolved
 `session_type_id`, `target_id`, and request context
 metadata for `run_id`, `step_id`, and `ticket_id`. The same join is published
-on `project-pipelines.run_step` entity snapshots so `question.opened` consumers
-can match a viewed session to `run_id`, `step_id`, and `ticket_id`. The field
-stays optional for visits without an agent session. An upgraded 0.3.0 store
+on `project-pipelines.run_step` entity snapshots. Durable client identity
+joins still use that field. Session-scoped `question.opened` notices use
+`payload.subject` instead. The field stays optional for visits without an
+agent session. An upgraded 0.3.0 store
 publishes it on first read when the active visit already has a correlated
 `spawn_requested` session. The negative case is a PTY
 step declaring a missing provider dependency such as `github_auth`; activation
@@ -389,7 +401,7 @@ proof.
 
 ```sh
 git clone https://github.com/trybotster/botster-hub.git /private/tmp/botster-hub-ui-contract
-git -C /private/tmp/botster-hub-ui-contract checkout d52c3ebc4190286c4b7c3812f8c65251c646ade5
+git -C /private/tmp/botster-hub-ui-contract checkout 12e0cc6994be18024e4bdfffb22947526a652204
 cargo build --locked --manifest-path /private/tmp/botster-hub-ui-contract/Cargo.toml
 cargo build --locked --manifest-path /private/tmp/botster-hub-ui-contract/Cargo.toml -p botster-core-daemon --bin botster-session-worker
 BOTSTER_HUB_SOURCE=/private/tmp/botster-hub-ui-contract \
