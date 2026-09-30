@@ -45,7 +45,7 @@ assert notices == [{
 }]
 assert "owner" not in notices[0]
 assert "events.on(" not in source
-assert 'events.emit("question.opened"' in source
+assert 'botster.events.emit({ name = "question.opened"' in source
 assert "utf8.offset" in source
 assert "utf8.len" in source
 assert "bounded_prompt" in source
@@ -245,14 +245,15 @@ botster = {
 }
 
 emit_stub = { events = {}, status = "accepted", throw = false, store_present_at_emit = nil }
-events = {
-  emit = function(name, payload)
+botster.events = {
+  emit = function(spec)
+    local name, payload = spec.name, spec.payload
     if emit_stub.throw then error("injected emit throw") end
     if name == "question.opened" and type(payload) == "table" and type(payload.question_id) == "string" then
       emit_stub.store_present_at_emit = durable_store["v4/questions/" .. payload.question_id] ~= nil
     end
     table.insert(emit_stub.events, { name = name, payload = copy(payload) })
-    return { status = emit_stub.status }
+    return { ok = emit_stub.status == "accepted", value = { status = emit_stub.status } }
   end,
   on = function()
     error("production plugin.lua must not subscribe")
@@ -2597,4 +2598,8 @@ LUA
 
 lua "$lua_test"
 lua test/plugin_runtime_test.lua
+
+# Behaviour specs run in the Botster plugin test kit against the real Hub runtime
+# (see README, "Testing"). BOTSTER_PLUGIN_TEST names the runner binary.
+"${BOTSTER_PLUGIN_TEST:-botster-plugin-test}" --plugin . test/*_spec.lua
 script/test-cutover

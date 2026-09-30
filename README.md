@@ -326,12 +326,17 @@ diagnostic, such as `github:github_auth`.
 
 ## Local Development
 
-Run the package checks:
+Run the package checks. The behaviour specs in `test/*_spec.lua` run in the
+Botster plugin test kit, which loads this package into a real Hub runtime:
 
 ```sh
+cargo install --locked --git https://github.com/trybotster/botster-hub --rev 54af42daa86bbbd4c9874468e2c0dd0e0f7bbb25 botster-plugin-test-kit
 npm ci
-script/test
+BOTSTER_PLUGIN_TEST=botster-plugin-test script/test
 ```
+
+That Hub commit (the kit and `p:undefined_globals()` are on it) is the one these
+specs were last run against. Raise the pin when a newer Hub commit passes.
 
 `script/test` runs the registry contract assertions and the repository Lua
 harness. It covers all five canonical action envelopes, submit-kind handling,

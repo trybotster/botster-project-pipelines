@@ -1980,7 +1980,7 @@ local function record_question(arguments)
   local subject = run_step and run_step.agent_session_uuid
   if type(subject) == "string" and subject ~= "" then payload.subject = subject end
   pcall(function()
-    events.emit("question.opened", payload)
+    botster.events.emit({ name = "question.opened", payload = payload })
   end)
   return ok({ question = question })
 end
@@ -2280,7 +2280,7 @@ local function link_pr(arguments)
       payload.merge_commit = merge_commit
     end
     pcall(function()
-      events.emit("pr_merged", payload)
+      botster.events.emit({ name = "pr_merged", payload = payload })
     end)
     return ok({
       pr_link = applied.pr_link or link,

@@ -150,9 +150,9 @@ botster = {
   end,
 }
 
-events = {
+botster.events = {
   emit = function()
-    return { status = "accepted" }
+    return { ok = true, value = { status = "accepted" } }
   end,
   on = function()
     error("production plugin.lua must not subscribe")
