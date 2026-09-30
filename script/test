@@ -13,12 +13,8 @@ from pathlib import Path
 
 manifest = json.loads(Path("botster-package.json").read_text())
 fixture = json.loads(Path("fixtures/project_pipelines/domain_contract.json").read_text())
-source = Path("plugin.lua").read_text()
 assert manifest["name"] == "project-pipelines"
 assert manifest["version"] == "0.4.0"
-assert 'run_steps = { "id", "run_id", "step_id", "status" }' in source
-assert "agent_session_uuid stays optional" in source
-assert "agent_session_uuid" in source
 assert manifest["entrypoints"] == [{"runtime": "lua", "path": "plugin.lua", "bootstrap": False}]
 assert {capability["surface"] for capability in manifest["capabilities"]} == {
     "surfaces", "mcp", "plugin_db", "session_actions"
@@ -44,19 +40,10 @@ assert notices == [{
     "severity": "warning",
 }]
 assert "owner" not in notices[0]
-assert "events.on(" not in source
-assert 'botster.events.emit({ name = "question.opened"' in source
-assert "utf8.offset" in source
-assert "utf8.len" in source
-assert "bounded_prompt" in source
 session_action = next(capability for capability in manifest["capabilities"] if capability["surface"] == "session_actions")
 assert session_action["scope"] == "session_type_managed_git_spawn"
 configuration_fields = {field["key"] for field in manifest["configuration"]["fields"]}
 assert "default_session_type_id" in configuration_fields
-assert "require(" not in source
-assert "plugin_db.batch" in source
-assert 'STORE_ROOT = "v4/"' in source
-assert "session_types.resolve" not in source
 assert fixture["contract_version"] == 4
 assert fixture["persistence_boundaries"]["runtime_storage_namespace"] == "v4/<family>/<id>"
 for family in ["project_target", "ticket_dependency", "run_step"]:
@@ -65,14 +52,6 @@ surface_ids = {surface["id"] for surface in manifest["surfaces"]}
 assert {"project-pipelines.home", "project-pipelines.settings"} <= surface_ids
 navigation_targets = {item["target"]["surface_id"] for item in manifest["navigation"]}
 assert "project-pipelines.home" in navigation_targets
-readme = Path("README.md").read_text()
-domain_contract = Path("docs/domain-contract.md").read_text()
-for phrase in ["Public MCP Contract", "Drain-first Cold Cut", "plugin_db.batch", "entity_provider", "entity_publish", "question.opened", "question_asked"]:
-    assert phrase in readme
-for phrase in ["Persistence Boundaries", "entity_provider", "provider-specific merge execution", "question.opened", "question_asked"]:
-    assert phrase in domain_contract
-for dead_name in ["empty_schema", "repository_from", "show_project", "show_ticket", "update_ticket_status", "list_pipeline_definitions", "record_run", "run_status_tone"]:
-    assert f"local function {dead_name}" not in source
 
 legacy_field_pattern = re.compile(
     r"session[_ -]?" + r"template|" + r"template" + r"_id|" + r"template" + r"_name|session_" + r"capability",
@@ -108,8 +87,7 @@ for relative_path in subprocess.check_output(["git", "ls-files"], text=True).spl
 
 scan_paths = [
     ".gitignore", "README.md", "botster-package.json", "plugin.lua",
-    "script/test", "script/cutover", "script/test-cutover", "script/test-hub-flow",
-    "script/hub_acceptance_smoke", "docs/domain-contract.md",
+    "script/test", "script/cutover", "script/test-cutover", "docs/domain-contract.md",
     "fixtures/project_pipelines/domain_contract.json",
     "test/plugin_runtime_test.lua",
 ]

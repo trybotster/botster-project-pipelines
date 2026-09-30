@@ -173,9 +173,7 @@ PTY-backed steps that relied on the device default fail closed with
 `session_type_id_required`; the diagnostic names the field to set, `run.blocked_reason`
 carries it, and the blocked session request appears in the needs-attention queue
 with the same message. No step is silently downgraded and no session type is
-inferred from a retired selector. `script/test-hub-flow` proves that sequence
-against a real Hub: enable without the field, observe the fail-closed diagnostic
-and the empty PTY state, then set the field, reload, and spawn.
+inferred from a retired selector.
 <!-- END retired configuration key upgrade note -->
 
 Every delivery role uses the same exact routing source:
@@ -396,46 +394,18 @@ and observe `ticket_dependencies_unmet` with unchanged current-step and session
 state. After closing or removing the prerequisite, a later explicit activation
 should spawn once and a repeat activation should reuse that request.
 
-For the Hub-owned UI contract flow, build the exact merged Hub and its locked
-Core session worker from a fresh checkout. The second binary is a
-`botster-core` target pinned by that Hub commit's `Cargo.lock`; it does not carry
-the Hub SHA. The worker binary is the `botster-core-daemon` target pinned by that
-lockfile. `script/test-hub-flow` runs both locked build commands itself after
-verifying the checkout revision, so stale target artifacts cannot satisfy the
-proof.
+The live smoke drives the package against a real `botster-hub` process with a
+session worker, only through its socket, as an MCP client does. It needs the
+candidate binaries that the Hub's own gate builds (`script/build-dev-artifacts`):
 
 ```sh
-git clone https://github.com/trybotster/botster-hub.git /private/tmp/botster-hub-ui-contract
-git -C /private/tmp/botster-hub-ui-contract checkout 12e0cc6994be18024e4bdfffb22947526a652204
-cargo build --locked --manifest-path /private/tmp/botster-hub-ui-contract/Cargo.toml
-cargo build --locked --manifest-path /private/tmp/botster-hub-ui-contract/Cargo.toml -p botster-core-daemon --bin botster-session-worker
-BOTSTER_HUB_SOURCE=/private/tmp/botster-hub-ui-contract \
-BOTSTER_HUB_BIN=/private/tmp/botster-hub-ui-contract/target/debug/botster-hub \
-BOTSTER_SESSION_WORKER_BIN=/private/tmp/botster-hub-ui-contract/target/debug/botster-session-worker \
-script/test-hub-flow
+BOTSTER_HUB_BIN=... BOTSTER_SESSION_WORKER_BIN=... BOTSTER_CANDIDATE_MANIFEST=... \
+  BOTSTER_PLUGIN_TEST=botster-plugin-test script/test-e2e
 ```
 
-The harness verifies the Hub checkout SHA and clean worktree, reads the distinct
-Core SHA from its lockfile, rebuilds both executables, confirms they came from
-that checkout's target directory, installs/enables this packaged plugin in an
-isolated data directory, renders the real `project-pipelines.home` entry point,
-reads action IDs from returned nodes, reads workspace identity from a rendered
-row action, opens the rendered dialogs, and dispatches canonical filter, select,
-accepted create, and rejected create requests through the real worker. It asserts
-structured `plugin_action_result` frames, exact identity, a client-authored
-submit envelope, values/payload separation, close/replacement behavior, retained
-normalized values/errors, and the selected-workspace equality binding. It also
-admits a deterministic Git target using the real Workspaces target id, installs a
-test Plan template, activates the production sourced Plan through
-`ensure_worktree_and_spawn`, and waits for that spawned Plan process to inspect
-its managed prompt, resolve `[[botster-workspaces-playbook]]`, and submit the Plan
-artifact, gate, and step advance through the public plugin MCP socket without a
-routing question. Through the running daemon's public tool-list request it also
-proves the exact 63 published names, authored descriptions, nonempty serialized
-schema objects/arrays, and the nested review verdict/finding enums. The harness
-then restarts Hub and rechecks the same durable workflow identity.
-
-`EXPECTED_HUB_COMMIT` in `script/test-hub-flow` records the Hub revision against
-which this plugin contract was proven. Advance that pin deliberately only when
-the package is re-proven against a newer Hub commit, and update the checkout
-command above in the same change.
+It lists the tools, then runs a ticket through a pipeline, a human question and
+a merged PR to a closed run. The UI contract flow (rendering `project-pipelines.home`,
+canonical filter/select/create actions, and durable identity across a Hub
+restart) and the Plan-session spawn through a real worker were proven by the
+removed `script/test-hub-flow` against a Hub commit that predates the modular
+Hub; they are not covered by a current check.

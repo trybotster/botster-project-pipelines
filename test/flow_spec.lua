@@ -20,13 +20,80 @@ local function setup(t)
   return p
 end
 
-kit.test("the Hub lists every tool descriptor the manifest contract names", function(t)
+local TOOL_NAMES = {
+  "add_artifact",
+  "add_checklist_item",
+  "add_project_target",
+  "add_ticket_dependency",
+  "answer_question",
+  "ask_agent",
+  "ask_human",
+  "cancel_run",
+  "checklist_instructions",
+  "claim_question_orchestrator",
+  "close_ticket",
+  "create_checklist",
+  "create_child_run",
+  "create_gate",
+  "create_pipeline",
+  "create_project",
+  "create_step",
+  "create_ticket",
+  "create_vault_checklist",
+  "current_context",
+  "delete_gate",
+  "delete_pipeline",
+  "delete_project",
+  "delete_step",
+  "delete_ticket",
+  "entities",
+  "escalate_question",
+  "get_checklist",
+  "get_pipeline",
+  "get_pr_link",
+  "get_project",
+  "get_ticket",
+  "link_pr",
+  "list_agent_choices",
+  "list_checklists",
+  "list_pipelines",
+  "list_pr_links",
+  "list_projects",
+  "list_ticket_dependencies",
+  "list_tickets",
+  "question_orchestrator_status",
+  "receive_question_answers",
+  "release_question_orchestrator",
+  "remove_project_target",
+  "remove_ticket_dependency",
+  "request_merge",
+  "request_step_advance",
+  "resolve_finding",
+  "resolve_repository_playbook",
+  "retry_step_agent",
+  "search_tickets",
+  "spawn_ticket_session",
+  "start_run",
+  "submit_gate",
+  "submit_review",
+  "update_checklist",
+  "update_checklist_item",
+  "update_gate",
+  "update_pipeline",
+  "update_project",
+  "update_step",
+  "update_step_agent",
+  "update_ticket",
+}
+
+kit.test("the Hub lists exactly the published tool names", function(t)
   local p = t:load(".")
-  local names = {}
-  for _, descriptor in ipairs(p:tools()) do names[#names + 1] = descriptor.name end
-  table.sort(names)
-  t:eq(#names, 63)
-  t:eq(names[1], "project_pipelines.add_artifact")
+  local listed = {}
+  for _, descriptor in ipairs(p:tools()) do listed[#listed + 1] = descriptor.name end
+  table.sort(listed)
+  local expected = {}
+  for _, name in ipairs(TOOL_NAMES) do expected[#expected + 1] = "project_pipelines." .. name end
+  t:eq(listed, expected)
 end)
 
 kit.test("a question is emitted through the Hub's event router and stored", function(t)
