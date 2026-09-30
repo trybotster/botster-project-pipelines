@@ -1206,16 +1206,16 @@ local question = tools["project_pipelines.ask_human"]({ run_id = "run-atomic", t
 assert(question.ok)
 assert(tools["project_pipelines.answer_question"]({ question_id = question.question.id, answer = "Yes" }).ok)
 assert(#tools["project_pipelines.receive_question_answers"]({ all = true }).answers == 1)
-local claim = tools["project_pipelines.claim_question_orchestrator"]({ project_id = "project-one" }, { session_uuid = "orchestrator-one" })
+local claim = tools["project_pipelines.claim_question_orchestrator"]({ project_id = "project-one" }, { caller = { kind = "session", session_id = "orchestrator-one" } })
 assert(claim.ok and #tools["project_pipelines.question_orchestrator_status"]({}).orchestrators == 1)
 local agent_question = tools["project_pipelines.ask_agent"]({
   run_id = "run-atomic", ticket_id = "ticket-blocked", question = "Review?",
-}, { session_uuid = "requester-one" })
+}, { caller = { kind = "session", session_id = "requester-one" } })
 assert(agent_question.ok)
 assert(tools["project_pipelines.escalate_question"]({ question_id = agent_question.question.id }).question.kind == "human")
 assert(tools["project_pipelines.answer_question"]({ question_id = agent_question.question.id, answer = "Reviewed" }).ok)
 assert(#tools["project_pipelines.receive_question_answers"]({ all = true, ticket_id = "ticket-blocked", status = "answered" }).answers == 2)
-assert(tools["project_pipelines.release_question_orchestrator"]({ project_id = "project-one" }, { session_uuid = "orchestrator-one" }).ok)
+assert(tools["project_pipelines.release_question_orchestrator"]({ project_id = "project-one" }, { caller = { kind = "session", session_id = "orchestrator-one" } }).ok)
 assert(#tools["project_pipelines.question_orchestrator_status"]({}).orchestrators == 0)
 local review = tools["project_pipelines.submit_review"]({
   run_id = "run-atomic", run_step_id = started.run_step.id, step_id = "step-one", verdict = "approved",

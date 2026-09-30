@@ -3331,11 +3331,23 @@ local function get_pr_link(arguments)
   return ok({ pr_link = link })
 end
 
+-- The Hub passes the handler's second argument as the request, and
+-- request.caller is the verified caller: { kind = "operator" } or
+-- { kind = "session", session_id, hub_id }. A session caller is the identity; a
+-- session_uuid argument is only a fallback for an operator call.
+local function caller_session(request)
+  local caller = type(request) == "table" and request.caller or nil
+  if type(caller) == "table" and caller.kind == "session" then
+    return string_arg(caller, "session_id")
+  end
+  return nil
+end
+
 local function claim_question_orchestrator(arguments, context)
   arguments = arguments or {}
   local state = load_state()
   local scope = string_arg(arguments, "project_id") and "project" or "global"
-  local session_uuid = string_arg(arguments, "session_uuid") or string_arg(context or {}, "session_uuid") or "current-session"
+  local session_uuid = caller_session(context) or string_arg(arguments, "session_uuid") or "current-session"
   for _, claim in ipairs(state.question_orchestrators) do
     if claim.scope == scope and claim.project_id == arguments.project_id then
       if arguments.replace ~= true and claim.session_uuid ~= session_uuid then return failure("already_claimed", "question orchestrator already claimed") end
@@ -3351,7 +3363,7 @@ end
 local function release_question_orchestrator(arguments, context)
   arguments = arguments or {}
   local state = load_state()
-  local session_uuid = string_arg(arguments, "session_uuid") or string_arg(context or {}, "session_uuid")
+  local session_uuid = caller_session(context) or string_arg(arguments, "session_uuid")
   for index = #state.question_orchestrators, 1, -1 do
     local claim = state.question_orchestrators[index]
     if (not session_uuid or claim.session_uuid == session_uuid) and claim.project_id == arguments.project_id then
@@ -3369,17 +3381,15 @@ end
 local function ask_question(arguments, context, kind)
   arguments = arguments or {}
   arguments.kind = kind
-  arguments.asked_by = arguments.asked_by or string_arg(context or {}, "session_uuid")
+  arguments.asked_by = caller_session(context) or arguments.asked_by
   return record_question(arguments)
 end
 
-local function ask_human(arguments, context) return ask_question(arguments, context, "human") end
-local function ask_agent(arguments, context) return ask_question(arguments, context, "agent") end
 
 local function receive_question_answers(arguments, context)
   arguments = arguments or {}
   local state = load_state()
-  local session_uuid = string_arg(arguments, "session_uuid") or string_arg(context or {}, "session_uuid")
+  local session_uuid = caller_session(context) or string_arg(arguments, "session_uuid")
   local answers = {}
   for _, answer in ipairs(state.answers) do
     local question = find_by_id(state.questions, answer.question_id)
@@ -6348,8 +6358,8 @@ local function authoritative_tools()
     return add_ticket_dependency(arguments)
   end)
   add("answer_question", answer_question)
-  add("ask_agent", ask_agent)
-  add("ask_human", ask_human)
+  add("ask_agent", function(arguments, context) return ask_question(arguments, context, "agent") end)
+  add("ask_human", function(arguments, context) return ask_question(arguments, context, "human") end)
   add("cancel_run", cancel_run)
   add("checklist_instructions", checklist_instructions)
   add("claim_question_orchestrator", claim_question_orchestrator)
